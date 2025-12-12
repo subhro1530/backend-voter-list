@@ -2,7 +2,6 @@ import fs from "fs/promises";
 import path from "path";
 
 const model = process.env.GEMINI_MODEL || "gemini-2.0-pro-exp";
-const apiKey = process.env.GEMINI_API_KEY;
 
 const mimeByExt = {
   ".png": "image/png",
@@ -11,9 +10,12 @@ const mimeByExt = {
   ".pdf": "application/pdf",
 };
 
-export async function callGeminiWithFile(filePath) {
+export async function callGeminiWithFile(filePath, apiKeyFromRequest) {
+  const apiKey = apiKeyFromRequest || process.env.GEMINI_API_KEY;
   if (!apiKey) {
-    throw new Error("GEMINI_API_KEY is missing");
+    throw new Error(
+      "GEMINI_API_KEY is missing (provide in request body as apiKey)"
+    );
   }
 
   const data = await fs.readFile(filePath);

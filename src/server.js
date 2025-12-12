@@ -114,9 +114,16 @@ app.post(
     const sessionId = req.sessionId;
     const pdfPath = req.file?.path;
     const originalName = req.file?.originalname || "upload.pdf";
+    const apiKey = req.body?.apiKey || req.body?.geminiApiKey;
 
     if (!pdfPath) {
       return res.status(400).json({ error: "PDF file is required" });
+    }
+
+    if (!apiKey && !process.env.GEMINI_API_KEY) {
+      return res
+        .status(400)
+        .json({ error: "apiKey is required in form-data (apiKey)" });
     }
 
     try {
@@ -133,7 +140,7 @@ app.post(
       );
 
       for (const [idx, pagePath] of pagePaths.entries()) {
-        const { text } = await callGeminiWithFile(pagePath);
+        const { text } = await callGeminiWithFile(pagePath, apiKey);
         const structured = parseGeminiStructured(text);
         const pageRes = await query(
           "INSERT INTO session_pages (session_id, page_number, page_path, raw_text, structured_json) VALUES ($1, $2, $3, $4, $5) RETURNING id",
