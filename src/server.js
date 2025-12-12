@@ -1,5 +1,6 @@
 import "dotenv/config";
 import express from "express";
+import cors from "cors";
 import multer from "multer";
 import path from "path";
 import fs from "fs-extra";
@@ -13,7 +14,20 @@ const app = express();
 const port = process.env.PORT || 3000;
 const storageRoot = path.join(process.cwd(), "storage");
 const pageDelayMs = Number(process.env.GEMINI_PAGE_DELAY_MS || 2000);
+const allowedOrigins = process.env.CORS_ORIGINS
+  ? process.env.CORS_ORIGINS.split(",")
+      .map((o) => o.trim())
+      .filter(Boolean)
+  : ["*"];
+const corsConfig = {
+  origin: allowedOrigins.includes("*") ? true : allowedOrigins,
+  methods: ["GET", "POST", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Accept"],
+  credentials: false,
+};
 
+app.use(cors(corsConfig));
+app.options("*", cors(corsConfig));
 app.use(express.json({ limit: "1mb" }));
 
 function sessionIdMiddleware(req, _res, next) {
