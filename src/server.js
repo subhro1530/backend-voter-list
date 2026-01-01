@@ -19,16 +19,50 @@ const app = express();
 const port = process.env.PORT || 3000;
 const storageRoot = path.join(process.cwd(), "storage");
 const pageDelayMs = Number(process.env.GEMINI_PAGE_DELAY_MS || 2000);
+
+// Parse CORS origins from environment variable
 const allowedOrigins = process.env.CORS_ORIGINS
   ? process.env.CORS_ORIGINS.split(",")
-      .map((o) => o.trim())
+      .map((o) => o.trim().replace(/\/$/, "")) // Remove trailing slashes
       .filter(Boolean)
-  : ["*"];
+  : [];
+
+// CORS configuration with proper origin validation for production
 const corsConfig = {
-  origin: allowedOrigins.includes("*") ? true : allowedOrigins,
-  methods: ["GET", "POST", "DELETE", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Accept"],
-  credentials: false,
+  origin: function (origin, callback) {
+    // Allow requests with no origin (Postman, curl, server-to-server)
+    if (!origin) {
+      return callback(null, true);
+    }
+
+    // Remove trailing slash from origin for comparison
+    const normalizedOrigin = origin.replace(/\/$/, "");
+
+    // If no origins specified or wildcard, allow all
+    if (allowedOrigins.length === 0 || allowedOrigins.includes("*")) {
+      return callback(null, true);
+    }
+
+    // Check if origin is in allowed list
+    if (allowedOrigins.includes(normalizedOrigin)) {
+      return callback(null, true);
+    }
+
+    // Log blocked origin for debugging
+    console.log(`CORS blocked origin: ${origin}`);
+    console.log(`Allowed origins: ${allowedOrigins.join(", ")}`);
+
+    callback(new Error(`CORS not allowed for origin: ${origin}`));
+  },
+  methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
+  allowedHeaders: [
+    "Content-Type",
+    "Accept",
+    "Authorization",
+    "X-Requested-With",
+  ],
+  credentials: true,
+  optionsSuccessStatus: 200, // Some legacy browsers choke on 204
 };
 
 app.use(cors(corsConfig));
@@ -256,27 +290,23 @@ app.post(
         ["completed", sessionId]
       );
 
-      res
-        .status(201)
-        .json({
-          sessionId,
-          pages: pagePaths.length,
-          status: "completed",
-          keySwitchCount,
-        });
+      res.status(201).json({
+        sessionId,
+        pages: pagePaths.length,
+        status: "completed",
+        keySwitchCount,
+      });
     } catch (err) {
       await query(
         "UPDATE sessions SET status=$1, updated_at=now() WHERE id=$2",
         ["failed", sessionId]
       ).catch(() => {});
       console.error("Session processing failed:", err.message);
-      res
-        .status(500)
-        .json({
-          error: "Processing failed",
-          details: err.message,
-          apiKeyStatus: getApiKeyStatuses(),
-        });
+      res.status(500).json({
+        error: "Processing failed",
+        details: err.message,
+        apiKeyStatus: getApiKeyStatuses(),
+      });
     }
   }
 );
@@ -439,6 +469,15 @@ app.delete("/sessions/:id", async (req, res) => {
 
 app.get("/health", (_req, res) => {
   res.json({ status: "ok" });
+});
+
+// Debug endpoint to check CORS configuration
+app.get("/debug/cors", (req, res) => {
+  res.json({
+    configuredOrigins: allowedOrigins,
+    requestOrigin: req.get("origin") || "none",
+    env: process.env.CORS_ORIGINS || "not set",
+  });
 });
 
 // API Key status endpoint
