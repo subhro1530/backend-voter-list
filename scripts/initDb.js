@@ -40,6 +40,7 @@ CREATE TABLE IF NOT EXISTS session_voters (
   house_number TEXT,
   age INT,
   gender TEXT,
+  religion TEXT DEFAULT 'Other',
   created_at TIMESTAMPTZ DEFAULT now()
 );
 
@@ -70,7 +71,16 @@ BEGIN
   ) THEN
     ALTER TABLE sessions ADD COLUMN processed_pages INT DEFAULT 0;
   END IF;
+
+  IF NOT EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_name = 'session_voters' AND column_name = 'religion'
+  ) THEN
+    ALTER TABLE session_voters ADD COLUMN religion TEXT DEFAULT 'Other';
+  END IF;
 END $$;
+
+CREATE INDEX IF NOT EXISTS idx_session_voters_religion ON session_voters(religion);
 `;
 
 async function main() {

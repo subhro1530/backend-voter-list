@@ -51,7 +51,30 @@ SESSION_ID=<paste-session-id>
 curl -s "$API/sessions/$SESSION_ID/voters?name=kundu&gender=female&minAge=18" | jq
 ```
 
-Available filters: name (contains), voterId, gender, minAge, maxAge, houseNumber, relationType, partNumber, section, assembly, serialNumber.
+Available filters: name (contains), voterId, gender, minAge, maxAge, houseNumber, relationType, partNumber, section, assembly, serialNumber, religion.
+
+### Filter by religion
+
+```sh
+SESSION_ID=<paste-session-id>
+# Get only Muslim voters
+curl -s "$API/sessions/$SESSION_ID/voters?religion=Muslim" | jq
+
+# Get only Hindu voters
+curl -s "$API/sessions/$SESSION_ID/voters?religion=Hindu" | jq
+
+# Combine with other filters
+curl -s "$API/sessions/$SESSION_ID/voters?religion=Muslim&gender=female&minAge=18" | jq
+```
+
+Religion values: Muslim, Hindu, Christian, Sikh, Buddhist, Jain, Other
+
+## Get religion statistics for a session
+
+```sh
+SESSION_ID=<paste-session-id>
+curl -s "$API/sessions/$SESSION_ID/stats/religion" | jq
+```
 
 ## Global voter search (across sessions)
 
@@ -59,7 +82,7 @@ Available filters: name (contains), voterId, gender, minAge, maxAge, houseNumber
 curl -s "$API/voters/search?name=ali&partNumber=1" | jq
 ```
 
-Same filters as above; you can also pass `sessionId` to scope.
+Same filters as above (including religion); you can also pass `sessionId` to scope.
 
 ## Delete a session
 

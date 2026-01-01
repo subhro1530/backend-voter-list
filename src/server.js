@@ -6,7 +6,7 @@ import path from "path";
 import fs from "fs-extra";
 import { v4 as uuidv4 } from "uuid";
 import { splitPdfToPages } from "./pdf.js";
-import { callGeminiWithFile } from "./gemini.js";
+import { callGeminiWithFile, classifyReligionByNames } from "./gemini.js";
 import { parseGeminiStructured } from "./parser.js";
 import { pool, query } from "./db.js";
 
@@ -99,6 +99,7 @@ function buildVoterFilter(params, startIndex = 1) {
   maybeAdd(params.section, "section");
   maybeAdd(params.assembly, "assembly");
   maybeAdd(params.serialNumber, "serial_number");
+  maybeAdd(params.religion, "religion");
 
   if (params.minAge !== undefined && params.minAge !== "") {
     const val = Number(params.minAge);
@@ -169,12 +170,20 @@ app.post(
           ? structured.voters
           : [];
 
-        for (const voter of voters) {
+        // Classify religion for all voters on this page
+        let religions = [];
+        if (voters.length > 0) {
+          religions = await classifyReligionByNames(voters, apiKey);
+        }
+
+        for (let i = 0; i < voters.length; i++) {
+          const voter = voters[i];
+          const religion = religions[i] || "Other";
           const ageValue = voter.age ? Number.parseInt(voter.age, 10) : null;
           const age = Number.isNaN(ageValue) ? null : ageValue;
 
           await query(
-            "INSERT INTO session_voters (session_id, page_id, page_number, assembly, part_number, section, serial_number, voter_id, name, relation_type, relation_name, house_number, age, gender) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
+            "INSERT INTO session_voters (session_id, page_id, page_number, assembly, part_number, section, serial_number, voter_id, name, relation_type, relation_name, house_number, age, gender, religion) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
             [
               sessionId,
               pageId,
@@ -190,6 +199,7 @@ app.post(
               voter.houseNumber || "",
               age,
               voter.gender || "",
+              religion,
             ]
           );
         }
@@ -296,7 +306,7 @@ app.get("/sessions/:id", async (req, res) => {
   );
 
   const voters = await query(
-    "SELECT page_number, assembly, part_number, section, serial_number, voter_id, name, relation_type, relation_name, house_number, age, gender, created_at FROM session_voters WHERE session_id=$1 ORDER BY page_number, serial_number",
+    "SELECT page_number, assembly, part_number, section, serial_number, voter_id, name, relation_type, relation_name, house_number, age, gender, religion, created_at FROM session_voters WHERE session_id=$1 ORDER BY page_number, serial_number",
     [id]
   );
 
@@ -317,7 +327,7 @@ app.get("/sessions/:id/voters", async (req, res) => {
   const { where, values } = buildVoterFilter({ ...req.query, sessionId: id });
   const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : "";
   const sql = `
-    SELECT page_number, assembly, part_number, section, serial_number, voter_id, name, relation_type, relation_name, house_number, age, gender, created_at
+    SELECT page_number, assembly, part_number, section, serial_number, voter_id, name, relation_type, relation_name, house_number, age, gender, religion, created_at
     FROM session_voters
     ${whereSql}
     ORDER BY page_number, serial_number;
@@ -330,7 +340,7 @@ app.get("/voters/search", async (req, res) => {
   const { where, values } = buildVoterFilter({ ...req.query });
   const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : "";
   const sql = `
-    SELECT session_id, page_number, assembly, part_number, section, serial_number, voter_id, name, relation_type, relation_name, house_number, age, gender, created_at
+    SELECT session_id, page_number, assembly, part_number, section, serial_number, voter_id, name, relation_type, relation_name, house_number, age, gender, religion, created_at
     FROM session_voters
     ${whereSql}
     ORDER BY created_at DESC, session_id, page_number, serial_number
@@ -338,6 +348,32 @@ app.get("/voters/search", async (req, res) => {
   `;
   const result = await query(sql, values);
   res.json({ voters: result.rows });
+});
+
+app.get("/sessions/:id/stats/religion", async (req, res) => {
+  const { id } = req.params;
+  const session = await query("SELECT 1 FROM sessions WHERE id=$1", [id]);
+  if (session.rowCount === 0) {
+    return res.status(404).json({ error: "Session not found" });
+  }
+
+  const sql = `
+    SELECT religion, COUNT(*)::int AS count
+    FROM session_voters
+    WHERE session_id = $1
+    GROUP BY religion
+    ORDER BY count DESC;
+  `;
+  const result = await query(sql, [id]);
+
+  const total = result.rows.reduce((sum, row) => sum + row.count, 0);
+  const stats = result.rows.map((row) => ({
+    religion: row.religion,
+    count: row.count,
+    percentage: total > 0 ? ((row.count / total) * 100).toFixed(2) : "0.00",
+  }));
+
+  res.json({ sessionId: id, total, stats });
 });
 
 app.delete("/sessions/:id", async (req, res) => {
