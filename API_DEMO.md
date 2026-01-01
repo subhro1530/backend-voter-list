@@ -12,17 +12,72 @@ API=http://localhost:3000
 curl -s "$API/health" | jq
 ```
 
-## Upload a PDF and create a session (send Gemini key)
+## API Key Management
 
-Replace `sample.pdf` with your file path. Provide your Gemini key via `apiKey` (or `geminiApiKey`). If you keep it in backend env, this field is optional.
+The system has 7 hardcoded API keys with automatic fallback. When one key's quota is exhausted, it automatically switches to the next available key.
+
+### Check API Key Status
 
 ```sh
+curl -s "$API/api-keys/status" | jq
+```
+
+Response shows which keys are active/exhausted:
+
+```json
+{
+  "totalKeys": 7,
+  "activeKeys": 5,
+  "exhaustedKeys": 2,
+  "allExhausted": false,
+  "keys": [
+    { "keyIndex": 1, "keyPreview": "AIzaSyCCAq...FINw", "status": "active" },
+    {
+      "keyIndex": 2,
+      "keyPreview": "AIzaSyB5pQ...T884",
+      "status": "exhausted",
+      "exhaustedAt": "...",
+      "lastError": "..."
+    }
+  ]
+}
+```
+
+### Reset All API Keys (useful after daily quota reset)
+
+```sh
+curl -X POST "$API/api-keys/reset" | jq
+```
+
+## Upload a PDF and create a session
+
+Replace `sample.pdf` with your file path. The `apiKey` is now optional - the system will use hardcoded fallback keys.
+
+```sh
+curl -X POST "$API/sessions" \
+  -F "file=@/path/to/sample.pdf" | jq
+
+# Or with your own API key (optional)
 curl -X POST "$API/sessions" \
   -F "apiKey=$GEMINI_KEY" \
   -F "file=@/path/to/sample.pdf" | jq
 ```
 
-Response contains `sessionId`.
+Response contains `sessionId`. If all keys are exhausted mid-processing, the session will be "paused" and can be resumed later.
+
+## Resume a paused session
+
+If a session was paused due to API key exhaustion, resume it later:
+
+```sh
+SESSION_ID=<paste-session-id>
+curl -X POST "$API/sessions/$SESSION_ID/resume" | jq
+
+# Or with a specific API key
+curl -X POST "$API/sessions/$SESSION_ID/resume" \
+  -H "Content-Type: application/json" \
+  -d '{"apiKey": "your-api-key"}' | jq
+```
 
 ## List sessions
 
@@ -36,6 +91,8 @@ curl -s "$API/sessions" | jq
 SESSION_ID=<paste-session-id>
 curl -s "$API/sessions/$SESSION_ID/status" | jq
 ```
+
+Status values: `processing`, `completed`, `paused` (can be resumed), `failed`
 
 ## Get a specific session (with page data)
 
