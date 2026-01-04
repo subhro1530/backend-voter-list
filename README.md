@@ -22,9 +22,11 @@ Backend API to ingest PDF voter lists, split them into per-page PDFs, send pages
 
    - Copy `.env.example` → `.env` and fill:
      - `DATABASE_URL` (Neon connection string)
-     - `GEMINI_API_KEY`
+     - `GEMINI_API_KEY_1`, `GEMINI_API_KEY_2`, etc. (multiple keys for automatic failover)
      - `GEMINI_MODEL` (default works)
    - `GEMINI_PAGE_DELAY_MS` (optional, default 2000ms) to slow between Gemini calls and avoid timeouts
+
+   **Multiple API Keys**: You can add up to 20 Gemini API keys (`GEMINI_API_KEY_1` through `GEMINI_API_KEY_20`). When one key's quota is exhausted, the system automatically switches to the next available key.
 
 3. **Initialize DB schema**
 
@@ -86,6 +88,9 @@ Backend API to ingest PDF voter lists, split them into per-page PDFs, send pages
 
 ## Notes
 
-- Keep your Gemini key and DB URL out of version control.
-- If you hit Gemini rate limits, add simple retry/backoff in `callGemini`.
+- Keep your Gemini keys and DB URL out of version control (they're in `.gitignore`).
+- The system automatically handles API key rotation when quotas are exhausted.
+- Use `POST /api-keys/reset` to reset all keys to active status (useful after daily quota reset).
+- Use `GET /api-keys/status` to check the status of all API keys.
+- Use `POST /sessions/:id/resume` to resume a paused session from where it stopped.
 - To change parsing heuristics, edit `src/parser.js`.

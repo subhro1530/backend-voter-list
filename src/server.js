@@ -11,6 +11,7 @@ import {
   classifyReligionByNames,
   getApiKeyStatuses,
   resetAllApiKeys,
+  initializeKeyStatus,
 } from "./gemini.js";
 import { parseGeminiStructured } from "./parser.js";
 import { pool, query } from "./db.js";

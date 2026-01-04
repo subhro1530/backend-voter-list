@@ -10,33 +10,60 @@ const mimeByExt = {
   ".pdf": "application/pdf",
 };
 
-// Hardcoded API keys for fallback
-const FALLBACK_API_KEYS = [
-  "AIzaSyCCAqGzF27PTQy7rsFyx0tf9aUFyIAFINw",
-  "AIzaSyB5pQN6soz5eFXzaR9kfxkLgFqKv8_T884",
-  "AIzaSyB8zuU8Ik1Dq_2CjcPq3KyuD46NqjL_Hnk",
-  "AIzaSyCDu2hKo8zB3lt5OeZC6ba5mBfe9cw8vDk",
-  "AIzaSyD4BOIN08XQbSQaoL1Z2UUUzgMK_u-DcAw",
-  "AIzaSyB2RFM5ZzA9WXkyx2ynTMrkqDqxiReV_8E",
-  "AIzaSyB2RFM5ZzA9WXkyx2ynTMrkqDqxiReV_8E",
-];
+/**
+ * Load API keys from environment variables.
+ * Looks for GEMINI_API_KEY_1, GEMINI_API_KEY_2, ... GEMINI_API_KEY_N
+ * Also checks legacy GEMINI_API_KEY as a fallback
+ */
+function loadApiKeysFromEnv() {
+  const keys = [];
+
+  // Load numbered keys: GEMINI_API_KEY_1, GEMINI_API_KEY_2, etc.
+  for (let i = 1; i <= 20; i++) {
+    const key = process.env[`GEMINI_API_KEY_${i}`];
+    if (key && key.trim()) {
+      keys.push(key.trim());
+    }
+  }
+
+  // Also check legacy single key if no numbered keys found
+  if (keys.length === 0 && process.env.GEMINI_API_KEY) {
+    keys.push(process.env.GEMINI_API_KEY.trim());
+  }
+
+  return keys;
+}
+
+// API keys loaded from environment variables
+let API_KEYS = [];
+
+// Current active key index - declare before initializeKeyStatus uses it
+let currentKeyIndex = 0;
 
 // Track API key status - key -> { status: 'active'|'exhausted', exhaustedAt: Date, lastError: string }
 const apiKeyStatus = new Map();
 
-// Initialize all keys as active
-FALLBACK_API_KEYS.forEach((key) => {
-  if (!apiKeyStatus.has(key)) {
+/**
+ * Initialize or reinitialize API key status tracking
+ * Exported so the server can reload keys dynamically if needed
+ */
+export function initializeKeyStatus() {
+  API_KEYS = loadApiKeysFromEnv();
+  apiKeyStatus.clear();
+  API_KEYS.forEach((key) => {
     apiKeyStatus.set(key, {
       status: "active",
       exhaustedAt: null,
       lastError: null,
     });
-  }
-});
+  });
+  currentKeyIndex = 0;
+  console.log(`Loaded ${API_KEYS.length} API keys from environment`);
+  return API_KEYS.length;
+}
 
-// Current active key index
-let currentKeyIndex = 0;
+// Initialize all keys as active on startup
+initializeKeyStatus();
 
 /**
  * Check if an error indicates quota exhaustion
@@ -79,35 +106,52 @@ function markKeyExhausted(apiKey, errorMessage) {
  * Get the next available API key
  */
 function getNextAvailableKey(excludeKey = null) {
-  const availableKeys = FALLBACK_API_KEYS.filter((key) => {
+  // Get all active keys excluding the one that just failed
+  const availableKeys = API_KEYS.filter((key) => {
     const status = apiKeyStatus.get(key);
     return status?.status === "active" && key !== excludeKey;
   });
 
   if (availableKeys.length === 0) {
+    console.log("No available API keys remaining");
     return null;
   }
 
-  // Round-robin through available keys
-  currentKeyIndex = (currentKeyIndex + 1) % FALLBACK_API_KEYS.length;
-  while (
-    apiKeyStatus.get(FALLBACK_API_KEYS[currentKeyIndex])?.status !== "active"
-  ) {
-    currentKeyIndex = (currentKeyIndex + 1) % FALLBACK_API_KEYS.length;
-    // Safety check to prevent infinite loop
-    if (!availableKeys.includes(FALLBACK_API_KEYS[currentKeyIndex])) {
-      return availableKeys[0];
+  // Simply return the first available key (round-robin approach)
+  // Find the next active key starting from current index
+  for (let i = 0; i < API_KEYS.length; i++) {
+    const idx = (currentKeyIndex + 1 + i) % API_KEYS.length;
+    const key = API_KEYS[idx];
+    const status = apiKeyStatus.get(key);
+    if (status?.status === "active" && key !== excludeKey) {
+      currentKeyIndex = idx;
+      console.log(`Switching to API key index ${idx} (${key.slice(0, 10)}...)`);
+      return key;
     }
   }
 
-  return FALLBACK_API_KEYS[currentKeyIndex];
+  // Fallback: return first available key
+  console.log(
+    `Fallback: using first available key (${availableKeys[0].slice(0, 10)}...)`
+  );
+  return availableKeys[0];
 }
 
 /**
  * Get the current active API key (first one that's still active)
  */
 export function getCurrentApiKey() {
-  const activeKey = FALLBACK_API_KEYS.find(
+  // First try to get the key at current index if it's active
+  if (API_KEYS.length > 0 && currentKeyIndex < API_KEYS.length) {
+    const currentKey = API_KEYS[currentKeyIndex];
+    const status = apiKeyStatus.get(currentKey);
+    if (status?.status === "active") {
+      return currentKey;
+    }
+  }
+
+  // Otherwise find the first active key
+  const activeKey = API_KEYS.find(
     (key) => apiKeyStatus.get(key)?.status === "active"
   );
   return activeKey || null;
@@ -117,7 +161,12 @@ export function getCurrentApiKey() {
  * Get status of all API keys
  */
 export function getApiKeyStatuses() {
-  const statuses = FALLBACK_API_KEYS.map((key, index) => {
+  // Reload keys in case env changed
+  if (API_KEYS.length === 0) {
+    initializeKeyStatus();
+  }
+
+  const statuses = API_KEYS.map((key, index) => {
     const status = apiKeyStatus.get(key) || {
       status: "active",
       exhaustedAt: null,
@@ -126,7 +175,7 @@ export function getApiKeyStatuses() {
     return {
       keyIndex: index + 1,
       keyPreview: `${key.slice(0, 10)}...${key.slice(-4)}`,
-      fullKey: key,
+      // Don't expose full key for security
       status: status.status,
       exhaustedAt: status.exhaustedAt,
       lastError: status.lastError,
@@ -139,7 +188,7 @@ export function getApiKeyStatuses() {
   ).length;
 
   return {
-    totalKeys: FALLBACK_API_KEYS.length,
+    totalKeys: API_KEYS.length,
     activeKeys: activeCount,
     exhaustedKeys: exhaustedCount,
     allExhausted: activeCount === 0,
@@ -149,17 +198,14 @@ export function getApiKeyStatuses() {
 
 /**
  * Reset all API keys to active status (useful for daily reset)
+ * Also reloads keys from environment in case they were updated
  */
 export function resetAllApiKeys() {
-  FALLBACK_API_KEYS.forEach((key) => {
-    apiKeyStatus.set(key, {
-      status: "active",
-      exhaustedAt: null,
-      lastError: null,
-    });
-  });
-  currentKeyIndex = 0;
-  console.log("All API keys have been reset to active status");
+  // Reload keys from environment
+  initializeKeyStatus();
+  console.log(
+    `All ${API_KEYS.length} API keys have been reset to active status`
+  );
   return getApiKeyStatuses();
 }
 
@@ -214,7 +260,7 @@ Respond with ONLY the JSON array, no explanation.`;
     ],
   };
 
-  const maxRetries = FALLBACK_API_KEYS.length;
+  const maxRetries = Math.max(API_KEYS.length, 3); // At least 3 retries
   let lastError = null;
 
   for (let attempt = 0; attempt < maxRetries; attempt++) {
@@ -347,7 +393,7 @@ export async function callGeminiWithFile(filePath, apiKeyFromRequest) {
     ],
   };
 
-  const maxRetries = FALLBACK_API_KEYS.length;
+  const maxRetries = Math.max(API_KEYS.length, 3); // At least 3 retries
   let lastError = null;
 
   for (let attempt = 0; attempt < maxRetries; attempt++) {
@@ -355,7 +401,10 @@ export async function callGeminiWithFile(filePath, apiKeyFromRequest) {
       const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKeyToUse}`;
 
       console.log(
-        `OCR attempt ${attempt + 1} with key ${apiKeyToUse.slice(0, 10)}...`
+        `OCR attempt ${attempt + 1}/${maxRetries} with key ${apiKeyToUse.slice(
+          0,
+          10
+        )}...`
       );
 
       const res = await fetch(url, {
