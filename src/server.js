@@ -15,6 +15,12 @@ import {
 } from "./gemini.js";
 import { parseGeminiStructured } from "./parser.js";
 import { pool, query } from "./db.js";
+import { authenticate, adminOnly } from "./auth.js";
+
+// Import route modules
+import authRoutes from "./routes/authRoutes.js";
+import adminRoutes from "./routes/admin.js";
+import userRoutes from "./routes/user.js";
 
 const app = express();
 const port = process.env.PORT || 3000;
@@ -69,6 +75,11 @@ const corsConfig = {
 app.use(cors(corsConfig));
 app.options("*", cors(corsConfig));
 app.use(express.json({ limit: "1mb" }));
+
+// Mount route modules
+app.use("/auth", authRoutes);
+app.use("/admin", adminRoutes);
+app.use("/user", userRoutes);
 
 function sessionIdMiddleware(req, _res, next) {
   req.sessionId = uuidv4();
@@ -161,8 +172,11 @@ function buildVoterFilter(params, startIndex = 1) {
   return { where, values };
 }
 
+// Session upload - Admin only
 app.post(
   "/sessions",
+  authenticate,
+  adminOnly,
   sessionIdMiddleware,
   upload.single("file"),
   async (req, res) => {
@@ -312,7 +326,8 @@ app.post(
   }
 );
 
-app.get("/sessions", async (_req, res) => {
+// Sessions list - Admin only
+app.get("/sessions", authenticate, adminOnly, async (_req, res) => {
   const sql = `
     SELECT s.id, s.original_filename, s.status, s.total_pages, s.processed_pages, s.created_at, s.updated_at,
            COUNT(DISTINCT p.id) AS page_count,
@@ -327,7 +342,8 @@ app.get("/sessions", async (_req, res) => {
   res.json({ sessions: result.rows });
 });
 
-app.get("/sessions/:id/status", async (req, res) => {
+// Session status - Admin only
+app.get("/sessions/:id/status", authenticate, adminOnly, async (req, res) => {
   const { id } = req.params;
   const session = await query(
     "SELECT id, status, total_pages, processed_pages, created_at, updated_at FROM sessions WHERE id=$1",
@@ -370,7 +386,8 @@ app.get("/sessions/:id/status", async (req, res) => {
   });
 });
 
-app.get("/sessions/:id", async (req, res) => {
+// Session detail - Admin only
+app.get("/sessions/:id", authenticate, adminOnly, async (req, res) => {
   const { id } = req.params;
   const session = await query("SELECT * FROM sessions WHERE id=$1", [id]);
   if (session.rowCount === 0) {
@@ -383,7 +400,7 @@ app.get("/sessions/:id", async (req, res) => {
   );
 
   const voters = await query(
-    "SELECT page_number, assembly, part_number, section, serial_number, voter_id, name, relation_type, relation_name, house_number, age, gender, religion, created_at FROM session_voters WHERE session_id=$1 ORDER BY page_number, serial_number",
+    "SELECT id, page_number, assembly, part_number, section, serial_number, voter_id, name, relation_type, relation_name, house_number, age, gender, religion, is_printed, printed_at, created_at FROM session_voters WHERE session_id=$1 ORDER BY page_number, serial_number",
     [id]
   );
 
@@ -394,7 +411,8 @@ app.get("/sessions/:id", async (req, res) => {
   });
 });
 
-app.get("/sessions/:id/voters", async (req, res) => {
+// Session voters - Admin only
+app.get("/sessions/:id/voters", authenticate, adminOnly, async (req, res) => {
   const { id } = req.params;
   const session = await query("SELECT 1 FROM sessions WHERE id=$1", [id]);
   if (session.rowCount === 0) {
@@ -413,11 +431,12 @@ app.get("/sessions/:id/voters", async (req, res) => {
   res.json({ voters: result.rows });
 });
 
-app.get("/voters/search", async (req, res) => {
+// Admin: Global voters search with full filtering
+app.get("/voters/search", authenticate, adminOnly, async (req, res) => {
   const { where, values } = buildVoterFilter({ ...req.query });
   const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : "";
   const sql = `
-    SELECT session_id, page_number, assembly, part_number, section, serial_number, voter_id, name, relation_type, relation_name, house_number, age, gender, religion, created_at
+    SELECT id, session_id, page_number, assembly, part_number, section, serial_number, voter_id, name, relation_type, relation_name, house_number, age, gender, religion, is_printed, created_at
     FROM session_voters
     ${whereSql}
     ORDER BY created_at DESC, session_id, page_number, serial_number
@@ -427,33 +446,40 @@ app.get("/voters/search", async (req, res) => {
   res.json({ voters: result.rows });
 });
 
-app.get("/sessions/:id/stats/religion", async (req, res) => {
-  const { id } = req.params;
-  const session = await query("SELECT 1 FROM sessions WHERE id=$1", [id]);
-  if (session.rowCount === 0) {
-    return res.status(404).json({ error: "Session not found" });
-  }
+// Session religion stats - Admin only
+app.get(
+  "/sessions/:id/stats/religion",
+  authenticate,
+  adminOnly,
+  async (req, res) => {
+    const { id } = req.params;
+    const session = await query("SELECT 1 FROM sessions WHERE id=$1", [id]);
+    if (session.rowCount === 0) {
+      return res.status(404).json({ error: "Session not found" });
+    }
 
-  const sql = `
+    const sql = `
     SELECT religion, COUNT(*)::int AS count
     FROM session_voters
     WHERE session_id = $1
     GROUP BY religion
     ORDER BY count DESC;
   `;
-  const result = await query(sql, [id]);
+    const result = await query(sql, [id]);
 
-  const total = result.rows.reduce((sum, row) => sum + row.count, 0);
-  const stats = result.rows.map((row) => ({
-    religion: row.religion,
-    count: row.count,
-    percentage: total > 0 ? ((row.count / total) * 100).toFixed(2) : "0.00",
-  }));
+    const total = result.rows.reduce((sum, row) => sum + row.count, 0);
+    const stats = result.rows.map((row) => ({
+      religion: row.religion,
+      count: row.count,
+      percentage: total > 0 ? ((row.count / total) * 100).toFixed(2) : "0.00",
+    }));
 
-  res.json({ sessionId: id, total, stats });
-});
+    res.json({ sessionId: id, total, stats });
+  }
+);
 
-app.delete("/sessions/:id", async (req, res) => {
+// Delete session - Admin only
+app.delete("/sessions/:id", authenticate, adminOnly, async (req, res) => {
   const { id } = req.params;
   const deleted = await query("DELETE FROM sessions WHERE id=$1 RETURNING id", [
     id,
@@ -465,7 +491,7 @@ app.delete("/sessions/:id", async (req, res) => {
   const dir = path.join(storageRoot, id);
   await fs.remove(dir);
 
-  res.json({ deleted: id });
+  res.json({ deleted: id, message: "Session and all associated data deleted" });
 });
 
 app.get("/health", (_req, res) => {
@@ -481,20 +507,20 @@ app.get("/debug/cors", (req, res) => {
   });
 });
 
-// API Key status endpoint
-app.get("/api-keys/status", (_req, res) => {
+// API Key status endpoint - Admin only
+app.get("/api-keys/status", authenticate, adminOnly, (_req, res) => {
   const status = getApiKeyStatuses();
   res.json(status);
 });
 
-// Reset all API keys (useful when quota resets daily)
-app.post("/api-keys/reset", (_req, res) => {
+// Reset all API keys (useful when quota resets daily) - Admin only
+app.post("/api-keys/reset", authenticate, adminOnly, (_req, res) => {
   const status = resetAllApiKeys();
   res.json({ message: "All API keys have been reset to active", ...status });
 });
 
-// Resume a paused session
-app.post("/sessions/:id/resume", async (req, res) => {
+// Resume a paused session - Admin only
+app.post("/sessions/:id/resume", authenticate, adminOnly, async (req, res) => {
   const { id } = req.params;
   const apiKey = req.body?.apiKey || req.body?.geminiApiKey;
 

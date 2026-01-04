@@ -141,11 +141,22 @@ function getNextAvailableKey(excludeKey = null) {
  * Get the current active API key (first one that's still active)
  */
 export function getCurrentApiKey() {
+  // Make sure keys are loaded
+  if (API_KEYS.length === 0) {
+    initializeKeyStatus();
+  }
+
   // First try to get the key at current index if it's active
   if (API_KEYS.length > 0 && currentKeyIndex < API_KEYS.length) {
     const currentKey = API_KEYS[currentKeyIndex];
     const status = apiKeyStatus.get(currentKey);
     if (status?.status === "active") {
+      console.log(
+        `Using API key at index ${currentKeyIndex}: ${currentKey.slice(
+          0,
+          10
+        )}...`
+      );
       return currentKey;
     }
   }
@@ -154,6 +165,18 @@ export function getCurrentApiKey() {
   const activeKey = API_KEYS.find(
     (key) => apiKeyStatus.get(key)?.status === "active"
   );
+
+  if (activeKey) {
+    // Update currentKeyIndex to match the found key
+    currentKeyIndex = API_KEYS.indexOf(activeKey);
+    console.log(
+      `Found active API key at index ${currentKeyIndex}: ${activeKey.slice(
+        0,
+        10
+      )}...`
+    );
+  }
+
   return activeKey || null;
 }
 
@@ -212,18 +235,40 @@ export function resetAllApiKeys() {
 /**
  * Classify religion based on names using Gemini API with auto-fallback
  * @param {Array<{name: string, relationName?: string}>} voters - Array of voter objects with names
- * @param {string} apiKey - Gemini API key (optional, will use fallback keys)
+ * @param {string} apiKey - Gemini API key (optional, will be added to pool if not already there)
  * @returns {Promise<{religions: Array<string>, keyUsed: string}>} - Array of religion classifications and key used
  */
 export async function classifyReligionByNames(voters, apiKey) {
   if (!voters || voters.length === 0) return { religions: [], keyUsed: null };
 
-  let apiKeyToUse = apiKey || getCurrentApiKey() || process.env.GEMINI_API_KEY;
+  // If user provided a key that's not in our pool, add it temporarily
+  if (apiKey && apiKey.trim() && !API_KEYS.includes(apiKey.trim())) {
+    const newKey = apiKey.trim();
+    API_KEYS.push(newKey);
+    apiKeyStatus.set(newKey, {
+      status: "active",
+      exhaustedAt: null,
+      lastError: null,
+    });
+    console.log(
+      `Added user-provided API key to pool for religion classification: ${newKey.slice(
+        0,
+        10
+      )}...`
+    );
+  }
+
+  // Always use the system's key rotation - get current active key
+  let apiKeyToUse = getCurrentApiKey();
+
+  // If no keys in system, try user-provided or env fallback
+  if (!apiKeyToUse) {
+    apiKeyToUse = apiKey || process.env.GEMINI_API_KEY;
+  }
+
   if (!apiKeyToUse) {
     throw new Error("No API keys available - all exhausted");
   }
-
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKeyToUse}`;
 
   // Prepare names list for classification
   const namesList = voters
@@ -351,12 +396,35 @@ Respond with ONLY the JSON array, no explanation.`;
 /**
  * Call Gemini API with file for OCR, with auto-fallback to other API keys
  * @param {string} filePath - Path to the file to process
- * @param {string} apiKeyFromRequest - Optional API key from request
+ * @param {string} apiKeyFromRequest - Optional API key from request (used as additional key, not primary)
  * @returns {Promise<{text: string, full: object, keyUsed: string}>}
  */
 export async function callGeminiWithFile(filePath, apiKeyFromRequest) {
-  let apiKeyToUse =
-    apiKeyFromRequest || getCurrentApiKey() || process.env.GEMINI_API_KEY;
+  // If user provided a key that's not in our pool, add it temporarily
+  if (
+    apiKeyFromRequest &&
+    apiKeyFromRequest.trim() &&
+    !API_KEYS.includes(apiKeyFromRequest.trim())
+  ) {
+    const newKey = apiKeyFromRequest.trim();
+    API_KEYS.push(newKey);
+    apiKeyStatus.set(newKey, {
+      status: "active",
+      exhaustedAt: null,
+      lastError: null,
+    });
+    console.log(
+      `Added user-provided API key to pool: ${newKey.slice(0, 10)}...`
+    );
+  }
+
+  // Always use the system's key rotation - get current active key
+  let apiKeyToUse = getCurrentApiKey();
+
+  // If no keys in system, try user-provided or env fallback
+  if (!apiKeyToUse) {
+    apiKeyToUse = apiKeyFromRequest || process.env.GEMINI_API_KEY;
+  }
 
   if (!apiKeyToUse) {
     const keyStatus = getApiKeyStatuses();

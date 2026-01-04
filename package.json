@@ -5,13 +5,16 @@
   "scripts": {
     "dev": "node src/server.js",
     "start": "node scripts/initDb.js && node src/server.js",
-    "db:init": "node scripts/initDb.js"
+    "db:init": "node scripts/initDb.js",
+    "create-admin": "node scripts/createAdmin.js"
   },
   "dependencies": {
+    "bcryptjs": "^3.0.3",
+    "cors": "^2.8.5",
     "dotenv": "^16.3.1",
     "express": "^4.19.2",
     "fs-extra": "^11.2.0",
-    "cors": "^2.8.5",
+    "jsonwebtoken": "^9.0.3",
     "multer": "^1.4.5-lts.1",
     "pdf-lib": "^1.17.1",
     "pg": "^8.11.3",
