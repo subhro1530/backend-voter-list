@@ -1,13 +1,23 @@
 # Voter List OCR Backend (Node.js + Gemini)
 
-Backend API to ingest PDF voter lists, split them into per-page PDFs, send pages to Gemini OCR, store structured voter rows in Neon, and expose session CRUD + search endpoints. Features role-based access control with Admin and User roles.
+**Created by Shaswata Saha** | [ssaha.vercel.app](https://ssaha.vercel.app) | © 2026 All Rights Reserved
+
+Backend API to ingest PDF voter lists, split them into per-page PDFs, process pages with **7 parallel Gemini API engines**, store structured voter rows in Neon, and expose session CRUD + search endpoints. Features role-based access control with Admin and User roles, plus an **intelligent NLP chatbot**.
+
+## ✨ Key Features
+
+- **7 Parallel Processing Engines** - Each API key runs as an independent engine
+- **Automatic Engine Recovery** - Exhausted engines recover after 60 seconds
+- **Never Stops Processing** - A 44-page PDF processes completely with smart batching
+- **Intelligent Chatbot** - Natural language queries with role-based actions
+- **Real-time Engine Status** - Monitor all 7 engines with detailed metrics
 
 ## Stack
 
 - Node.js 18+ (uses built-in `fetch`)
 - Express + Multer for upload
 - pdf-lib (pure JS) for PDF page splitting (no Poppler/ImageMagick)
-- Gemini API for OCR/structuring
+- Gemini API for OCR/structuring (7 parallel engines)
 - Neon (PostgreSQL) for persistence
 - JWT for authentication
 - bcryptjs for password hashing
@@ -24,12 +34,11 @@ Backend API to ingest PDF voter lists, split them into per-page PDFs, send pages
 
    - Copy `.env.example` → `.env` and fill:
      - `DATABASE_URL` (Neon connection string)
-     - `GEMINI_API_KEY_1`, `GEMINI_API_KEY_2`, etc. (multiple keys for automatic failover)
+     - `GEMINI_API_KEY_1` through `GEMINI_API_KEY_7` (7 keys for parallel processing)
      - `GEMINI_MODEL` (default works)
      - `JWT_SECRET` (change this in production!)
-   - `GEMINI_PAGE_DELAY_MS` (optional, default 2000ms) to slow between Gemini calls and avoid timeouts
 
-   **Multiple API Keys**: You can add up to 20 Gemini API keys (`GEMINI_API_KEY_1` through `GEMINI_API_KEY_20`). When one key's quota is exhausted, the system automatically switches to the next available key.
+   **7 Parallel API Engines**: Add 7 Gemini API keys for maximum parallel processing. Each key becomes an independent engine that can process pages simultaneously.
 
 3. **Initialize DB schema**
 
@@ -42,6 +51,49 @@ Backend API to ingest PDF voter lists, split them into per-page PDFs, send pages
    npm run dev
    ```
    Server defaults to `http://localhost:4000`.
+
+## 🤖 Chatbot
+
+The intelligent chatbot understands natural language and executes role-based actions:
+
+### Chat Endpoint
+
+```sh
+curl -X POST "http://localhost:4000/chat" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"message": "Find voters named Kumar"}'
+```
+
+### Example Queries:
+
+- "Search for voter with ID ABC123"
+- "Show me all sessions" (admin only)
+- "What are the religion statistics?"
+- "Check API status"
+- "Show my profile"
+
+## 🚀 API Engine Status
+
+Check the status of all 7 processing engines:
+
+```sh
+curl -s "http://localhost:4000/api-keys/status" \
+  -H "Authorization: Bearer $TOKEN" | jq
+```
+
+Response:
+
+```json
+{
+  "totalEngines": 7,
+  "activeEngines": 7,
+  "exhaustedEngines": 0,
+  "busyEngines": 3,
+  "availableEngines": 4,
+  "engines": [...]
+}
+```
 
 ## Authentication
 
@@ -76,6 +128,12 @@ The API uses JWT-based authentication with two roles:
 - `GET /health` - Health check
 - `GET /debug/cors` - Check CORS configuration
 
+### Chatbot Endpoints
+
+- `POST /chat` - Chat with the intelligent assistant
+- `GET /chat/actions` - Get available chat actions for your role
+- `GET /system/info` - Get system information with author credits
+
 ### User Endpoints (requires authentication)
 
 Users can search across ALL assemblies regardless of which session they were uploaded in.
@@ -92,9 +150,14 @@ Users can search across ALL assemblies regardless of which session they were upl
 
 ### Admin Endpoints (requires admin authentication)
 
+#### Engine Management
+
+- `GET /api-keys/status` - Get status of all 7 engines with metrics
+- `POST /api-keys/reset` - Reset all engines to active
+
 #### Session Management
 
-- `POST /sessions` - Upload PDF (multipart/form-data, field: `file`)
+- `POST /sessions` - Upload PDF (processed with 7 parallel engines!)
 - `GET /sessions` - List all sessions
 - `GET /sessions/:id` - Get session details
 - `GET /sessions/:id/status` - Get session processing status

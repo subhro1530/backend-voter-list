@@ -12,6 +12,9 @@ import {
   getApiKeyStatuses,
   resetAllApiKeys,
   initializeKeyStatus,
+  processPagesBatch,
+  chatWithGemini,
+  getAvailableEngines,
 } from "./gemini.js";
 import { parseGeminiStructured } from "./parser.js";
 import { pool, query } from "./db.js";
@@ -203,101 +206,138 @@ app.post(
         [pagePaths.length, sessionId]
       );
 
-      let lastKeyUsed = null;
+      console.log(
+        `📄 Processing ${pagePaths.length} pages with parallel engines...`
+      );
+
+      // Track progress
+      let processedCount = 0;
+      let errorCount = 0;
       let keySwitchCount = 0;
+      let lastKeyUsed = null;
 
-      for (const [idx, pagePath] of pagePaths.entries()) {
-        try {
-          const { text, keyUsed } = await callGeminiWithFile(pagePath, apiKey);
+      // Process pages and save to database immediately on completion
+      const savePageToDatabase = async (pageIndex, result, pagePath) => {
+        const { text, keyUsed } = result;
 
-          // Track key switches
-          if (lastKeyUsed && keyUsed !== lastKeyUsed) {
-            keySwitchCount++;
-            console.log(
-              `Key switched during processing (switch #${keySwitchCount})`
-            );
-          }
-          lastKeyUsed = keyUsed;
+        if (lastKeyUsed && keyUsed !== lastKeyUsed) {
+          keySwitchCount++;
+        }
+        lastKeyUsed = keyUsed;
 
-          const structured = parseGeminiStructured(text);
-          const pageRes = await query(
-            "INSERT INTO session_pages (session_id, page_number, page_path, raw_text, structured_json) VALUES ($1, $2, $3, $4, $5) RETURNING id",
-            [sessionId, idx + 1, pagePath, text, structured]
-          );
+        const structured = parseGeminiStructured(text);
+        const pageRes = await query(
+          "INSERT INTO session_pages (session_id, page_number, page_path, raw_text, structured_json) VALUES ($1, $2, $3, $4, $5) RETURNING id",
+          [sessionId, pageIndex + 1, pagePath, text, structured]
+        );
 
-          const pageId = pageRes.rows[0].id;
-          const assembly = structured.assembly || "";
-          const partNumber = structured.partNumber || "";
-          const section = structured.section || "";
-          const voters = Array.isArray(structured.voters)
-            ? structured.voters
-            : [];
+        const pageId = pageRes.rows[0].id;
+        const assembly = structured.assembly || "";
+        const partNumber = structured.partNumber || "";
+        const section = structured.section || "";
+        const voters = Array.isArray(structured.voters)
+          ? structured.voters
+          : [];
 
-          // Classify religion for all voters on this page
-          let religions = [];
-          if (voters.length > 0) {
-            const religionResult = await classifyReligionByNames(
-              voters,
-              apiKey
-            );
-            religions = religionResult.religions;
-          }
+        // Classify religion for all voters on this page
+        let religions = [];
+        if (voters.length > 0) {
+          const religionResult = await classifyReligionByNames(voters, apiKey);
+          religions = religionResult.religions;
+        }
 
-          for (let i = 0; i < voters.length; i++) {
-            const voter = voters[i];
-            const religion = religions[i] || "Other";
-            const ageValue = voter.age ? Number.parseInt(voter.age, 10) : null;
-            const age = Number.isNaN(ageValue) ? null : ageValue;
-
-            await query(
-              "INSERT INTO session_voters (session_id, page_id, page_number, assembly, part_number, section, serial_number, voter_id, name, relation_type, relation_name, house_number, age, gender, religion) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
-              [
-                sessionId,
-                pageId,
-                idx + 1,
-                assembly,
-                partNumber,
-                section,
-                voter.serialNumber || "",
-                voter.voterId || "",
-                voter.name || "",
-                voter.relationType || "",
-                voter.relationName || "",
-                voter.houseNumber || "",
-                age,
-                voter.gender || "",
-                religion,
-              ]
-            );
-          }
+        for (let i = 0; i < voters.length; i++) {
+          const voter = voters[i];
+          const religion = religions[i] || "Other";
+          const ageValue = voter.age ? Number.parseInt(voter.age, 10) : null;
+          const age = Number.isNaN(ageValue) ? null : ageValue;
 
           await query(
-            "UPDATE sessions SET processed_pages=$1, updated_at=now() WHERE id=$2",
-            [idx + 1, sessionId]
-          );
-
-          if (pageDelayMs > 0) {
-            await new Promise((resolve) => setTimeout(resolve, pageDelayMs));
-          }
-        } catch (pageErr) {
-          // If all keys exhausted, mark session as paused (can be resumed later)
-          if (pageErr.message.includes("ALL_KEYS_EXHAUSTED")) {
-            await query(
-              "UPDATE sessions SET status=$1, updated_at=now() WHERE id=$2",
-              ["paused", sessionId]
-            );
-            return res.status(429).json({
-              error: "All API keys exhausted",
+            "INSERT INTO session_voters (session_id, page_id, page_number, assembly, part_number, section, serial_number, voter_id, name, relation_type, relation_name, house_number, age, gender, religion) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
+            [
               sessionId,
-              processed_pages: idx,
-              total_pages: pagePaths.length,
-              message:
-                "Session paused. Use POST /sessions/:id/resume to continue when keys are available.",
-              apiKeyStatus: getApiKeyStatuses(),
-            });
-          }
-          throw pageErr;
+              pageId,
+              pageIndex + 1,
+              assembly,
+              partNumber,
+              section,
+              voter.serialNumber || "",
+              voter.voterId || "",
+              voter.name || "",
+              voter.relationType || "",
+              voter.relationName || "",
+              voter.houseNumber || "",
+              age,
+              voter.gender || "",
+              religion,
+            ]
+          );
         }
+
+        processedCount++;
+        await query(
+          "UPDATE sessions SET processed_pages=$1, updated_at=now() WHERE id=$2",
+          [processedCount, sessionId]
+        );
+
+        console.log(
+          `✅ Page ${pageIndex + 1}/${pagePaths.length} saved to database (${
+            voters.length
+          } voters)`
+        );
+      };
+
+      // Use sequential batch processing with immediate database saves
+      const batchResult = await processPagesBatch(
+        pagePaths,
+        0,
+        async (progress) => {
+          if (progress.type === "page_complete" && progress.result) {
+            try {
+              await savePageToDatabase(
+                progress.pageIndex,
+                progress.result,
+                progress.pagePath
+              );
+            } catch (err) {
+              console.error(
+                `Failed to save page ${progress.pageIndex + 1}:`,
+                err.message
+              );
+              errorCount++;
+            }
+          }
+        }
+      );
+
+      // Check final status
+      const finalStatus = await query(
+        "SELECT processed_pages FROM sessions WHERE id=$1",
+        [sessionId]
+      );
+      const finalProcessed = finalStatus.rows[0]?.processed_pages || 0;
+
+      console.log(
+        `📊 Session ${sessionId}: ${finalProcessed}/${pagePaths.length} pages processed, ${errorCount} errors`
+      );
+
+      if (finalProcessed < pagePaths.length || errorCount > 0) {
+        await query(
+          "UPDATE sessions SET status=$1, updated_at=now() WHERE id=$2",
+          ["paused", sessionId]
+        );
+
+        return res.status(207).json({
+          sessionId,
+          pages: pagePaths.length,
+          processedPages: finalProcessed,
+          errorPages: errorCount,
+          status: "paused",
+          message:
+            "Session partially completed. Use POST /sessions/:id/resume to continue.",
+          keySwitchCount,
+          apiKeyStatus: getApiKeyStatuses(),
+        });
       }
 
       await query(
@@ -310,6 +350,7 @@ app.post(
         pages: pagePaths.length,
         status: "completed",
         keySwitchCount,
+        apiKeyStatus: getApiKeyStatuses(),
       });
     } catch (err) {
       await query(
@@ -494,6 +535,31 @@ app.delete("/sessions/:id", authenticate, adminOnly, async (req, res) => {
   res.json({ deleted: id, message: "Session and all associated data deleted" });
 });
 
+// Rename session - Admin only
+app.patch("/sessions/:id/rename", authenticate, adminOnly, async (req, res) => {
+  const { id } = req.params;
+  const { name } = req.body;
+
+  if (!name || typeof name !== "string" || name.trim().length === 0) {
+    return res.status(400).json({ error: "Name is required" });
+  }
+
+  const updated = await query(
+    "UPDATE sessions SET original_filename=$1, updated_at=now() WHERE id=$2 RETURNING id, original_filename",
+    [name.trim(), id]
+  );
+
+  if (updated.rowCount === 0) {
+    return res.status(404).json({ error: "Session not found" });
+  }
+
+  res.json({
+    sessionId: id,
+    name: updated.rows[0].original_filename,
+    message: "Session renamed successfully",
+  });
+});
+
 app.get("/health", (_req, res) => {
   res.json({ status: "ok" });
 });
@@ -517,6 +583,53 @@ app.get("/api-keys/status", authenticate, adminOnly, (_req, res) => {
 app.post("/api-keys/reset", authenticate, adminOnly, (_req, res) => {
   const status = resetAllApiKeys();
   res.json({ message: "All API keys have been reset to active", ...status });
+});
+
+// Stop/Cancel a processing session - Admin only
+app.post("/sessions/:id/stop", authenticate, adminOnly, async (req, res) => {
+  const { id } = req.params;
+
+  try {
+    const sessionRes = await query(
+      "SELECT id, status, total_pages, processed_pages FROM sessions WHERE id=$1",
+      [id]
+    );
+
+    if (sessionRes.rowCount === 0) {
+      return res.status(404).json({ error: "Session not found" });
+    }
+
+    const session = sessionRes.rows[0];
+
+    if (session.status !== "processing") {
+      return res.status(400).json({
+        error: "Session is not currently processing",
+        currentStatus: session.status,
+      });
+    }
+
+    // Update session status to paused
+    await query(
+      "UPDATE sessions SET status='paused', updated_at=now() WHERE id=$1",
+      [id]
+    );
+
+    console.log(`🛑 Session ${id} stopped by user`);
+
+    res.json({
+      message: "Session processing stopped",
+      sessionId: id,
+      status: "paused",
+      processed_pages: session.processed_pages,
+      total_pages: session.total_pages,
+      canResume: true,
+    });
+  } catch (err) {
+    console.error("Stop session failed:", err.message);
+    res
+      .status(500)
+      .json({ error: "Failed to stop session", details: err.message });
+  }
 });
 
 // Resume a paused session - Admin only
@@ -571,7 +684,7 @@ app.post("/sessions/:id/resume", authenticate, adminOnly, async (req, res) => {
     // Get page files from storage
     const pageDir = path.join(storageRoot, id, "pages");
     const pageFiles = await fs.readdir(pageDir);
-    const pagePaths = pageFiles
+    const allPagePaths = pageFiles
       .filter(
         (f) =>
           f.endsWith(".png") ||
@@ -584,7 +697,24 @@ app.post("/sessions/:id/resume", authenticate, adminOnly, async (req, res) => {
         const numB = parseInt(b.match(/\d+/)?.[0] || "0");
         return numA - numB;
       })
-      .map((f) => path.join(pageDir, f));
+      .map((f, idx) => ({ path: path.join(pageDir, f), pageNumber: idx + 1 }));
+
+    // Filter out already processed pages
+    const remainingPages = allPagePaths.filter(
+      (p) => !processedPageNumbers.has(p.pageNumber)
+    );
+
+    if (remainingPages.length === 0) {
+      await query(
+        "UPDATE sessions SET status=$1, updated_at=now() WHERE id=$2",
+        ["completed", id]
+      );
+      return res.json({
+        message: "Session already completed",
+        sessionId: id,
+        status: "completed",
+      });
+    }
 
     // Update session status to processing
     await query("UPDATE sessions SET status=$1, updated_at=now() WHERE id=$2", [
@@ -593,100 +723,121 @@ app.post("/sessions/:id/resume", authenticate, adminOnly, async (req, res) => {
     ]);
 
     let resumedFromPage = session.processed_pages;
+    console.log(
+      `📄 Resuming ${remainingPages.length} remaining pages with parallel engines...`
+    );
+
+    // Use parallel batch processing with IMMEDIATE database saves
+    const pagePaths = remainingPages.map((p) => p.path);
+    const pageNumberMap = new Map(
+      remainingPages.map((p) => [p.path, p.pageNumber])
+    );
+
     let keySwitchCount = 0;
     let lastKeyUsed = null;
+    let processedCount = session.processed_pages || 0;
 
-    // Process remaining pages
-    for (const [idx, pagePath] of pagePaths.entries()) {
-      const pageNumber = idx + 1;
+    // Save page to database immediately when completed
+    const savePageToDatabase = async (pagePath, result) => {
+      const { text, keyUsed } = result;
+      const pageNumber = pageNumberMap.get(pagePath);
 
-      // Skip already processed pages
-      if (processedPageNumbers.has(pageNumber)) {
-        continue;
+      if (lastKeyUsed && keyUsed !== lastKeyUsed) {
+        keySwitchCount++;
+      }
+      lastKeyUsed = keyUsed;
+
+      const structured = parseGeminiStructured(text);
+      const pageRes = await query(
+        "INSERT INTO session_pages (session_id, page_number, page_path, raw_text, structured_json) VALUES ($1, $2, $3, $4, $5) RETURNING id",
+        [id, pageNumber, pagePath, text, structured]
+      );
+
+      const pageId = pageRes.rows[0].id;
+      const assembly = structured.assembly || "";
+      const partNumber = structured.partNumber || "";
+      const section = structured.section || "";
+      const voters = Array.isArray(structured.voters) ? structured.voters : [];
+
+      let religions = [];
+      if (voters.length > 0) {
+        const religionResult = await classifyReligionByNames(voters, apiKey);
+        religions = religionResult.religions;
       }
 
-      try {
-        const { text, keyUsed } = await callGeminiWithFile(pagePath, apiKey);
-
-        if (lastKeyUsed && keyUsed !== lastKeyUsed) {
-          keySwitchCount++;
-        }
-        lastKeyUsed = keyUsed;
-
-        const structured = parseGeminiStructured(text);
-        const pageRes = await query(
-          "INSERT INTO session_pages (session_id, page_number, page_path, raw_text, structured_json) VALUES ($1, $2, $3, $4, $5) RETURNING id",
-          [id, pageNumber, pagePath, text, structured]
-        );
-
-        const pageId = pageRes.rows[0].id;
-        const assembly = structured.assembly || "";
-        const partNumber = structured.partNumber || "";
-        const section = structured.section || "";
-        const voters = Array.isArray(structured.voters)
-          ? structured.voters
-          : [];
-
-        let religions = [];
-        if (voters.length > 0) {
-          const religionResult = await classifyReligionByNames(voters, apiKey);
-          religions = religionResult.religions;
-        }
-
-        for (let i = 0; i < voters.length; i++) {
-          const voter = voters[i];
-          const religion = religions[i] || "Other";
-          const ageValue = voter.age ? Number.parseInt(voter.age, 10) : null;
-          const age = Number.isNaN(ageValue) ? null : ageValue;
-
-          await query(
-            "INSERT INTO session_voters (session_id, page_id, page_number, assembly, part_number, section, serial_number, voter_id, name, relation_type, relation_name, house_number, age, gender, religion) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
-            [
-              id,
-              pageId,
-              pageNumber,
-              assembly,
-              partNumber,
-              section,
-              voter.serialNumber || "",
-              voter.voterId || "",
-              voter.name || "",
-              voter.relationType || "",
-              voter.relationName || "",
-              voter.houseNumber || "",
-              age,
-              voter.gender || "",
-              religion,
-            ]
-          );
-        }
+      for (let i = 0; i < voters.length; i++) {
+        const voter = voters[i];
+        const religion = religions[i] || "Other";
+        const ageValue = voter.age ? Number.parseInt(voter.age, 10) : null;
+        const age = Number.isNaN(ageValue) ? null : ageValue;
 
         await query(
-          "UPDATE sessions SET processed_pages=$1, updated_at=now() WHERE id=$2",
-          [pageNumber, id]
+          "INSERT INTO session_voters (session_id, page_id, page_number, assembly, part_number, section, serial_number, voter_id, name, relation_type, relation_name, house_number, age, gender, religion) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
+          [
+            id,
+            pageId,
+            pageNumber,
+            assembly,
+            partNumber,
+            section,
+            voter.serialNumber || "",
+            voter.voterId || "",
+            voter.name || "",
+            voter.relationType || "",
+            voter.relationName || "",
+            voter.houseNumber || "",
+            age,
+            voter.gender || "",
+            religion,
+          ]
         );
-
-        if (pageDelayMs > 0) {
-          await new Promise((resolve) => setTimeout(resolve, pageDelayMs));
-        }
-      } catch (pageErr) {
-        if (pageErr.message.includes("ALL_KEYS_EXHAUSTED")) {
-          await query(
-            "UPDATE sessions SET status=$1, updated_at=now() WHERE id=$2",
-            ["paused", id]
-          );
-          return res.status(429).json({
-            error: "All API keys exhausted",
-            sessionId: id,
-            processed_pages: pageNumber - 1,
-            total_pages: pagePaths.length,
-            resumed_from: resumedFromPage,
-            message: "Session paused again. Resume when keys are available.",
-            apiKeyStatus: getApiKeyStatuses(),
-          });
-        }
-        throw pageErr;
       }
+
+      processedCount++;
+      await query(
+        "UPDATE sessions SET processed_pages=$1, updated_at=now() WHERE id=$2",
+        [processedCount, id]
+      );
+
+      console.log(
+        `✅ Resume: Page ${pageNumber} saved to DB (${voters.length} voters)`
+      );
+    };
+
+    const batchResult = await processPagesBatch(
+      pagePaths,
+      0,
+      async (progress) => {
+        if (progress.type === "page_complete" && progress.result) {
+          try {
+            await savePageToDatabase(progress.pagePath, progress.result);
+          } catch (err) {
+            console.error(`Failed to save page during resume:`, err.message);
+          }
+        }
+      }
+    );
+
+    // Check for errors
+    if (
+      batchResult.errors.length > 0 &&
+      batchResult.processedCount < remainingPages.length
+    ) {
+      await query(
+        "UPDATE sessions SET status=$1, updated_at=now() WHERE id=$2",
+        ["paused", id]
+      );
+      return res.status(207).json({
+        message: "Session partially resumed",
+        sessionId: id,
+        resumed_from_page: resumedFromPage,
+        processed_in_resume: batchResult.processedCount,
+        errors: batchResult.errors.length,
+        total_remaining: remainingPages.length,
+        status: "paused",
+        keySwitchCount,
+        apiKeyStatus: getApiKeyStatuses(),
+      });
     }
 
     await query("UPDATE sessions SET status=$1, updated_at=now() WHERE id=$2", [
@@ -716,10 +867,456 @@ app.post("/sessions/:id/resume", authenticate, adminOnly, async (req, res) => {
   }
 });
 
-app.listen(port, () => {
+// ============================================
+// CHATBOT ENDPOINT - Agentic NLP Interface
+// ============================================
+
+/**
+ * Intelligent Chatbot - Understands natural language and executes actions
+ * Supports both user and admin actions based on role
+ */
+app.post("/chat", authenticate, async (req, res) => {
+  const { message, conversationHistory = [] } = req.body;
+  const userRole = req.user.role;
+  const isAdmin = userRole === "admin";
+
+  if (!message || typeof message !== "string") {
+    return res.status(400).json({ error: "Message is required" });
+  }
+
+  try {
+    // Get NLP response from Gemini
+    const nlpResponse = await chatWithGemini(message, {
+      userRole,
+      isAdmin,
+      conversationHistory,
+    });
+
+    let actionResult = null;
+    let actionExecuted = false;
+
+    // Execute action based on detected intent
+    if (nlpResponse.action) {
+      try {
+        switch (nlpResponse.action) {
+          case "SEARCH_VOTERS": {
+            const params = nlpResponse.actionParams || {};
+            const where = [];
+            const values = [];
+            let idx = 1;
+
+            if (params.name) {
+              where.push(`LOWER(name) LIKE $${idx}`);
+              values.push(`%${params.name.toLowerCase()}%`);
+              idx++;
+            }
+            if (params.voterId) {
+              where.push(`voter_id = $${idx}`);
+              values.push(params.voterId);
+              idx++;
+            }
+            if (params.assembly) {
+              where.push(`LOWER(assembly) LIKE $${idx}`);
+              values.push(`%${params.assembly.toLowerCase()}%`);
+              idx++;
+            }
+            if (params.partNumber) {
+              where.push(`part_number = $${idx}`);
+              values.push(params.partNumber);
+              idx++;
+            }
+
+            const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : "";
+            const sql = `
+              SELECT id, assembly, part_number, section, serial_number, voter_id, name, 
+                     relation_type, relation_name, house_number, age, gender
+              FROM session_voters
+              ${whereSql}
+              ORDER BY assembly, part_number, serial_number
+              LIMIT 20;
+            `;
+            const result = await query(sql, values);
+            actionResult = {
+              type: "voters",
+              data: result.rows,
+              count: result.rowCount,
+            };
+            actionExecuted = true;
+            break;
+          }
+
+          case "VIEW_SESSIONS": {
+            if (!isAdmin) {
+              actionResult = {
+                type: "error",
+                message: "Admin access required to view sessions",
+              };
+            } else {
+              const sql = `
+                SELECT id, original_filename, status, total_pages, processed_pages, created_at
+                FROM sessions
+                ORDER BY created_at DESC
+                LIMIT 10;
+              `;
+              const result = await query(sql);
+              actionResult = {
+                type: "sessions",
+                data: result.rows,
+                count: result.rowCount,
+              };
+              actionExecuted = true;
+            }
+            break;
+          }
+
+          case "VIEW_STATS": {
+            const statsType = nlpResponse.actionParams?.type || "religion";
+            let sql;
+
+            if (statsType === "gender") {
+              sql = `
+                SELECT gender, COUNT(*)::int AS count
+                FROM session_voters
+                GROUP BY gender
+                ORDER BY count DESC;
+              `;
+            } else {
+              sql = `
+                SELECT religion, COUNT(*)::int AS count
+                FROM session_voters
+                GROUP BY religion
+                ORDER BY count DESC;
+              `;
+            }
+
+            const result = await query(sql);
+            const total = result.rows.reduce((sum, row) => sum + row.count, 0);
+            actionResult = {
+              type: "stats",
+              statsType,
+              data: result.rows.map((row) => ({
+                ...row,
+                percentage:
+                  total > 0 ? ((row.count / total) * 100).toFixed(2) : "0.00",
+              })),
+              total,
+            };
+            actionExecuted = true;
+            break;
+          }
+
+          case "VIEW_API_STATUS": {
+            if (!isAdmin) {
+              actionResult = {
+                type: "error",
+                message: "Admin access required to view API status",
+              };
+            } else {
+              actionResult = {
+                type: "api_status",
+                data: getApiKeyStatuses(),
+              };
+              actionExecuted = true;
+            }
+            break;
+          }
+
+          case "RESET_API_KEYS": {
+            if (!isAdmin) {
+              actionResult = {
+                type: "error",
+                message: "Admin access required to reset API keys",
+              };
+            } else {
+              const status = resetAllApiKeys();
+              actionResult = {
+                type: "api_reset",
+                data: status,
+                message: "All API keys have been reset to active status",
+              };
+              actionExecuted = true;
+            }
+            break;
+          }
+
+          case "VIEW_PROFILE": {
+            const result = await query(
+              "SELECT id, email, name, phone, role, created_at FROM users WHERE id = $1",
+              [req.user.id]
+            );
+            actionResult = {
+              type: "profile",
+              data: result.rows[0],
+            };
+            actionExecuted = true;
+            break;
+          }
+
+          case "VIEW_ASSEMBLIES": {
+            const sql = `
+              SELECT DISTINCT assembly, COUNT(*)::int as voter_count
+              FROM session_voters
+              WHERE assembly IS NOT NULL AND assembly != ''
+              GROUP BY assembly
+              ORDER BY voter_count DESC
+              LIMIT 20;
+            `;
+            const result = await query(sql);
+            actionResult = {
+              type: "assemblies",
+              data: result.rows,
+              count: result.rowCount,
+            };
+            actionExecuted = true;
+            break;
+          }
+
+          default:
+            actionResult = null;
+        }
+      } catch (actionErr) {
+        console.error("Action execution error:", actionErr);
+        actionResult = {
+          type: "error",
+          message: actionErr.message,
+        };
+      }
+    }
+
+    // Format response with markdown tables if we have data
+    let formattedResponse = nlpResponse.response;
+
+    if (
+      actionResult &&
+      actionResult.type === "voters" &&
+      actionResult.data.length > 0
+    ) {
+      formattedResponse += "\n\n**Search Results:**\n\n";
+      formattedResponse +=
+        "| # | Name | Voter ID | Assembly | Part | Age | Gender |\n";
+      formattedResponse +=
+        "|---|------|----------|----------|------|-----|--------|\n";
+      actionResult.data.slice(0, 10).forEach((v, i) => {
+        formattedResponse += `| ${i + 1} | ${v.name || "-"} | ${
+          v.voter_id || "-"
+        } | ${v.assembly || "-"} | ${v.part_number || "-"} | ${
+          v.age || "-"
+        } | ${v.gender || "-"} |\n`;
+      });
+      if (actionResult.count > 10) {
+        formattedResponse += `\n*Showing 10 of ${actionResult.count} results*`;
+      }
+    }
+
+    if (
+      actionResult &&
+      actionResult.type === "sessions" &&
+      actionResult.data.length > 0
+    ) {
+      formattedResponse += "\n\n**Sessions:**\n\n";
+      formattedResponse +=
+        "| Status | Filename | Pages | Progress | Created |\n";
+      formattedResponse +=
+        "|--------|----------|-------|----------|--------|\n";
+      actionResult.data.forEach((s) => {
+        const progress = s.total_pages
+          ? `${s.processed_pages}/${s.total_pages}`
+          : "N/A";
+        const created = new Date(s.created_at).toLocaleDateString();
+        formattedResponse += `| ${s.status} | ${
+          s.original_filename || "Unknown"
+        } | ${s.total_pages || 0} | ${progress} | ${created} |\n`;
+      });
+    }
+
+    if (actionResult && actionResult.type === "stats") {
+      const label = actionResult.statsType === "gender" ? "Gender" : "Religion";
+      formattedResponse += `\n\n**${label} Statistics:**\n\n`;
+      formattedResponse += `| ${label} | Count | Percentage |\n`;
+      formattedResponse += "|----------|-------|------------|\n";
+      actionResult.data.forEach((row) => {
+        const key = row.gender || row.religion || "Unknown";
+        formattedResponse += `| ${key} | ${row.count} | ${row.percentage}% |\n`;
+      });
+      formattedResponse += `\n**Total:** ${actionResult.total}`;
+    }
+
+    if (actionResult && actionResult.type === "api_status") {
+      const status = actionResult.data;
+      formattedResponse += "\n\n**API Engine Status:**\n\n";
+      formattedResponse += `- **Total Engines:** ${status.totalEngines}\n`;
+      formattedResponse += `- **Active:** ${status.activeEngines}\n`;
+      formattedResponse += `- **Exhausted:** ${status.exhaustedEngines}\n`;
+      formattedResponse += `- **Busy:** ${status.busyEngines}\n\n`;
+      formattedResponse += "| Engine | Status | Requests | Success |\n";
+      formattedResponse += "|--------|--------|----------|--------|\n";
+      status.engines.forEach((e) => {
+        const statusIcon = e.status === "active" ? "✅" : "❌";
+        formattedResponse += `| ${e.engineId} | ${statusIcon} ${e.status} | ${e.metrics.totalRequests} | ${e.metrics.successCount} |\n`;
+      });
+    }
+
+    if (actionResult && actionResult.type === "profile") {
+      const p = actionResult.data;
+      formattedResponse += "\n\n**Your Profile:**\n\n";
+      formattedResponse += `- **Name:** ${p.name || "Not set"}\n`;
+      formattedResponse += `- **Email:** ${p.email}\n`;
+      formattedResponse += `- **Phone:** ${p.phone || "Not set"}\n`;
+      formattedResponse += `- **Role:** ${p.role}\n`;
+      formattedResponse += `- **Member since:** ${new Date(
+        p.created_at
+      ).toLocaleDateString()}\n`;
+    }
+
+    if (actionResult && actionResult.type === "assemblies") {
+      formattedResponse += "\n\n**Available Assemblies:**\n\n";
+      formattedResponse += "| Assembly | Voter Count |\n";
+      formattedResponse += "|----------|-------------|\n";
+      actionResult.data.forEach((a) => {
+        formattedResponse += `| ${a.assembly} | ${a.voter_count} |\n`;
+      });
+    }
+
+    res.json({
+      success: true,
+      intent: nlpResponse.intent,
+      action: nlpResponse.action,
+      actionExecuted,
+      response: formattedResponse,
+      suggestions: nlpResponse.suggestions || [],
+      actionResult: actionResult,
+      userRole,
+    });
+  } catch (err) {
+    console.error("Chat error:", err);
+    res.status(500).json({
+      success: false,
+      error: err.message,
+      response:
+        "I apologize, but I encountered an error processing your request. Please try again or rephrase your question.",
+      suggestions: ["Search for a voter", "View statistics", "Help"],
+    });
+  }
+});
+
+/**
+ * Get available chat actions based on user role
+ */
+app.get("/chat/actions", authenticate, (req, res) => {
+  const isAdmin = req.user.role === "admin";
+
+  const userActions = [
+    {
+      action: "SEARCH_VOTERS",
+      description: "Search voters by name, ID, assembly",
+      example: "Find voters named Kumar in assembly 123",
+    },
+    {
+      action: "VIEW_PROFILE",
+      description: "View your profile",
+      example: "Show my profile",
+    },
+    {
+      action: "VIEW_ASSEMBLIES",
+      description: "List all assemblies",
+      example: "What assemblies are available?",
+    },
+    {
+      action: "HELP",
+      description: "Get help with commands",
+      example: "Help me",
+    },
+  ];
+
+  const adminActions = [
+    {
+      action: "VIEW_SESSIONS",
+      description: "View uploaded PDF sessions",
+      example: "Show me all sessions",
+    },
+    {
+      action: "VIEW_STATS",
+      description: "View voter statistics",
+      example: "Show religion statistics",
+    },
+    {
+      action: "VIEW_API_STATUS",
+      description: "Check API engine status",
+      example: "What's the API status?",
+    },
+    {
+      action: "RESET_API_KEYS",
+      description: "Reset exhausted API keys",
+      example: "Reset all API keys",
+    },
+  ];
+
+  res.json({
+    userRole: req.user.role,
+    actions: isAdmin ? [...userActions, ...adminActions] : userActions,
+  });
+});
+
+/**
+ * System info endpoint
+ */
+app.get("/system/info", authenticate, (req, res) => {
+  const isAdmin = req.user.role === "admin";
+
+  res.json({
+    name: "Voter List Management System",
+    version: "2.0.0",
+    author: {
+      name: "Shaswata Saha",
+      website: "https://ssaha.vercel.app",
+    },
+    copyright: `© ${new Date().getFullYear()} Shaswata Saha. All rights reserved.`,
+    features: [
+      "PDF Voter List OCR with 7 parallel API engines",
+      "Automatic API key rotation and recovery",
+      "Intelligent NLP Chatbot",
+      "Religion classification",
+      "Role-based access control",
+    ],
+    apiEngines: isAdmin
+      ? getApiKeyStatuses()
+      : { totalEngines: getApiKeyStatuses().totalEngines },
+  });
+});
+
+const server = app.listen(port, () => {
   console.log(`Server running on port ${port}`);
 });
 
-process.on("SIGINT", () => {
-  pool.end().then(() => process.exit(0));
-});
+// Graceful shutdown - pause all processing sessions
+async function gracefulShutdown(signal) {
+  console.log(`\n⚠️ ${signal} received. Pausing all processing sessions...`);
+
+  try {
+    // Pause all sessions that are currently processing
+    await query(
+      "UPDATE sessions SET status='paused', updated_at=now() WHERE status='processing'"
+    );
+    console.log("✅ All processing sessions paused");
+  } catch (err) {
+    console.error("Failed to pause sessions:", err.message);
+  }
+
+  // Close server gracefully
+  server.close(() => {
+    console.log("🛑 HTTP server closed");
+    pool.end().then(() => {
+      console.log("🗄️ Database pool closed");
+      process.exit(0);
+    });
+  });
+
+  // Force exit after 10 seconds if graceful shutdown fails
+  setTimeout(() => {
+    console.error("⏱️ Forced shutdown after timeout");
+    process.exit(1);
+  }, 10000);
+}
+
+process.on("SIGINT", () => gracefulShutdown("SIGINT"));
+process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
