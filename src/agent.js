@@ -436,11 +436,13 @@ function classifyIntent(queryText) {
  */
 async function callAgentAI(prompt, systemPrompt, maxRetries = 3) {
   if (AGENT_API_KEYS.length === 0) {
-    throw new Error("No agent API keys configured. Set GEMINI_API_KEY or GEMINI_API_KEY_N in .env");
+    throw new Error(
+      "No agent API keys configured. Set GEMINI_API_KEY or GEMINI_API_KEY_N in .env"
+    );
   }
 
   let lastError = null;
-  
+
   for (let attempt = 0; attempt < maxRetries; attempt++) {
     const keyInfo = getNextAvailableKey();
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${AGENT_MODEL}:generateContent?key=${keyInfo.key}`;
@@ -493,20 +495,21 @@ async function callAgentAI(prompt, systemPrompt, maxRetries = 3) {
 
       if (response.status === 503) {
         // Service overloaded - short retry
-        await new Promise(r => setTimeout(r, 2000));
+        await new Promise((r) => setTimeout(r, 2000));
         lastError = new Error("Service temporarily unavailable");
         continue;
       }
 
       if (!response.ok) {
         const errorText = await response.text();
-        throw new Error(`AI API error: ${response.status} - ${errorText.slice(0, 200)}`);
+        throw new Error(
+          `AI API error: ${response.status} - ${errorText.slice(0, 200)}`
+        );
       }
 
       const json = await response.json();
       const text = json?.candidates?.[0]?.content?.parts?.[0]?.text || "";
       return text.trim();
-
     } catch (error) {
       if (error.message.includes("429") || error.message.includes("quota")) {
         markKeyRateLimited(keyInfo.name, 60000);
@@ -981,7 +984,7 @@ export async function processAgentQuery(userQuery, user, options = {}) {
  */
 export function getAgentStatus() {
   const now = Date.now();
-  const availableKeys = AGENT_API_KEYS.filter(k => {
+  const availableKeys = AGENT_API_KEYS.filter((k) => {
     const until = keyRateLimitUntil.get(k.name) || 0;
     return now >= until;
   }).length;
