@@ -19,6 +19,12 @@ import {
 import { parseGeminiStructured } from "./parser.js";
 import { pool, query } from "./db.js";
 import { authenticate, adminOnly } from "./auth.js";
+import {
+  processAgentQuery,
+  getAgentStatus,
+  getQuickSuggestions,
+  getUserPermissions,
+} from "./agent.js";
 
 // Import route modules
 import authRoutes from "./routes/authRoutes.js";
@@ -1255,6 +1261,290 @@ app.get("/chat/actions", authenticate, (req, res) => {
     userRole: req.user.role,
     actions: isAdmin ? [...userActions, ...adminActions] : userActions,
   });
+});
+
+// ============================================================================
+// AI DATABASE AGENT ENDPOINTS
+// ============================================================================
+
+/**
+ * Main agent query endpoint
+ * POST /agent/query
+ *
+ * Process natural language queries about the database
+ */
+app.post("/agent/query", authenticate, async (req, res) => {
+  try {
+    const { message, isConfirmation } = req.body;
+
+    if (!message || typeof message !== "string") {
+      return res.status(400).json({
+        success: false,
+        error: "Please provide a message to query",
+      });
+    }
+
+    const result = await processAgentQuery(message, req.user, {
+      isConfirmation,
+    });
+
+    // Log agent usage for analytics
+    console.log(
+      `🤖 Agent query from ${req.user.email} (${
+        req.user.role
+      }): "${message.slice(0, 50)}..."`
+    );
+
+    res.json(result);
+  } catch (error) {
+    console.error("Agent query error:", error);
+    res.status(500).json({
+      success: false,
+      error: "Failed to process your query",
+      type: "system_error",
+    });
+  }
+});
+
+/**
+ * Agent status and capabilities
+ * GET /agent/status
+ */
+app.get("/agent/status", authenticate, (req, res) => {
+  const status = getAgentStatus();
+  const userPermissions = getUserPermissions(req.user.role);
+
+  res.json({
+    ...status,
+    currentUser: {
+      role: req.user.role,
+      permissions: userPermissions,
+    },
+  });
+});
+
+/**
+ * Get quick suggestions based on user role
+ * GET /agent/suggestions
+ */
+app.get("/agent/suggestions", authenticate, (req, res) => {
+  const suggestions = getQuickSuggestions(req.user.role);
+
+  res.json({
+    suggestions,
+    role: req.user.role,
+  });
+});
+
+/**
+ * Get agent help and documentation
+ * GET /agent/help
+ */
+app.get("/agent/help", authenticate, async (req, res) => {
+  try {
+    const result = await processAgentQuery("help", req.user);
+    res.json(result);
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: "Failed to get help information",
+    });
+  }
+});
+
+/**
+ * Confirm a pending agent query
+ * POST /agent/confirm
+ */
+app.post("/agent/confirm", authenticate, async (req, res) => {
+  try {
+    const { confirm } = req.body;
+    const message = confirm ? "yes" : "no";
+
+    const result = await processAgentQuery(message, req.user, {
+      isConfirmation: true,
+    });
+    res.json(result);
+  } catch (error) {
+    console.error("Agent confirm error:", error);
+    res.status(500).json({
+      success: false,
+      error: "Failed to process confirmation",
+    });
+  }
+});
+
+/**
+ * Get predefined query templates
+ * GET /agent/templates
+ */
+app.get("/agent/templates", authenticate, (req, res) => {
+  const isAdmin = req.user.role === "admin";
+
+  const templates = {
+    statistics: [
+      { label: "Total Voters", query: "How many voters are in the database?" },
+      {
+        label: "Voters by Assembly",
+        query: "Show voter count grouped by assembly",
+      },
+      {
+        label: "Gender Distribution",
+        query: "What is the gender distribution of voters?",
+      },
+      { label: "Religion Breakdown", query: "Show voter count by religion" },
+      {
+        label: "Age Statistics",
+        query: "What is the average, minimum, and maximum age of voters?",
+      },
+    ],
+    sessions: [
+      {
+        label: "Total Sessions",
+        query: "How many sessions have been created?",
+      },
+      { label: "Session Status", query: "Show session count by status" },
+      {
+        label: "Total Pages",
+        query: "How many pages have been processed in total?",
+      },
+    ],
+    demographics: [
+      { label: "Young Voters", query: "How many voters are aged 18 to 25?" },
+      {
+        label: "Senior Voters",
+        query: "How many voters are 60 years or older?",
+      },
+      { label: "Age Groups", query: "Show voter distribution by age groups" },
+    ],
+  };
+
+  if (isAdmin) {
+    templates.admin = [
+      {
+        label: "Top Assemblies",
+        query: "Show top 10 assemblies by voter count",
+      },
+      {
+        label: "Unprinted Slips",
+        query: "How many voter slips have not been printed?",
+      },
+      {
+        label: "Recent Voters",
+        query: "Show the 10 most recently added voters",
+      },
+      {
+        label: "All Assemblies",
+        query: "List all unique assemblies in the database",
+      },
+    ];
+  }
+
+  res.json({
+    templates,
+    role: req.user.role,
+  });
+});
+
+/**
+ * Execute a predefined safe query (no AI, direct database)
+ * GET /agent/quick/:queryType
+ */
+app.get("/agent/quick/:queryType", authenticate, async (req, res) => {
+  const { queryType } = req.params;
+  const isAdmin = req.user.role === "admin";
+
+  // Predefined safe queries - no user input, no SQL injection possible
+  const quickQueries = {
+    "total-voters": {
+      sql: "SELECT COUNT(*) as total FROM session_voters",
+      label: "Total Voters",
+    },
+    "voters-by-gender": {
+      sql: "SELECT gender, COUNT(*) as count FROM session_voters GROUP BY gender ORDER BY count DESC",
+      label: "Voters by Gender",
+    },
+    "voters-by-religion": {
+      sql: "SELECT religion, COUNT(*) as count FROM session_voters GROUP BY religion ORDER BY count DESC",
+      label: "Voters by Religion",
+    },
+    "voters-by-assembly": {
+      sql: "SELECT assembly, COUNT(*) as count FROM session_voters GROUP BY assembly ORDER BY count DESC LIMIT 20",
+      label: "Top 20 Assemblies",
+    },
+    "age-stats": {
+      sql: "SELECT MIN(age) as min_age, MAX(age) as max_age, ROUND(AVG(age))::INT as avg_age FROM session_voters WHERE age IS NOT NULL",
+      label: "Age Statistics",
+    },
+    "session-summary": {
+      sql: "SELECT status, COUNT(*) as count, SUM(total_pages) as total_pages, SUM(processed_pages) as processed_pages FROM sessions GROUP BY status",
+      label: "Session Summary",
+    },
+    "total-sessions": {
+      sql: "SELECT COUNT(*) as total FROM sessions",
+      label: "Total Sessions",
+    },
+    "age-distribution": {
+      sql: `SELECT 
+        CASE 
+          WHEN age BETWEEN 18 AND 25 THEN '18-25'
+          WHEN age BETWEEN 26 AND 35 THEN '26-35'
+          WHEN age BETWEEN 36 AND 45 THEN '36-45'
+          WHEN age BETWEEN 46 AND 55 THEN '46-55'
+          WHEN age BETWEEN 56 AND 65 THEN '56-65'
+          WHEN age > 65 THEN '65+'
+          ELSE 'Unknown'
+        END as age_group,
+        COUNT(*) as count
+      FROM session_voters
+      WHERE age IS NOT NULL
+      GROUP BY 1
+      ORDER BY 1`,
+      label: "Age Distribution",
+    },
+  };
+
+  // Admin-only queries
+  const adminQueries = {
+    "unprinted-count": {
+      sql: "SELECT COUNT(*) as unprinted FROM session_voters WHERE is_printed = FALSE OR is_printed IS NULL",
+      label: "Unprinted Slips",
+    },
+    "all-assemblies": {
+      sql: "SELECT DISTINCT assembly, COUNT(*) as voter_count FROM session_voters WHERE assembly IS NOT NULL AND assembly != '' GROUP BY assembly ORDER BY voter_count DESC",
+      label: "All Assemblies",
+    },
+  };
+
+  const allQueries = isAdmin
+    ? { ...quickQueries, ...adminQueries }
+    : quickQueries;
+
+  if (!allQueries[queryType]) {
+    return res.status(404).json({
+      success: false,
+      error: `Unknown query type: ${queryType}`,
+      available: Object.keys(allQueries),
+    });
+  }
+
+  try {
+    const queryConfig = allQueries[queryType];
+    const result = await query(queryConfig.sql);
+
+    res.json({
+      success: true,
+      label: queryConfig.label,
+      data: result.rows,
+      rowCount: result.rowCount,
+    });
+  } catch (error) {
+    console.error(`Quick query error (${queryType}):`, error);
+    res.status(500).json({
+      success: false,
+      error: "Query execution failed",
+    });
+  }
 });
 
 /**
