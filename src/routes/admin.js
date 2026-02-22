@@ -22,7 +22,7 @@ router.use(adminOnly);
 router.get("/sessions", async (_req, res) => {
   try {
     const sql = `
-      SELECT s.id, s.original_filename, s.status, s.total_pages, s.processed_pages, s.created_at, s.updated_at,
+      SELECT s.id, s.original_filename, s.status, s.total_pages, s.processed_pages, s.booth_name, s.created_at, s.updated_at,
              COUNT(DISTINCT p.id) AS page_count,
              COUNT(v.id) AS voter_count,
              COUNT(CASE WHEN v.is_printed = true THEN 1 END) AS printed_count
@@ -52,7 +52,7 @@ router.get("/sessions/:id", async (req, res) => {
 
     const pages = await query(
       "SELECT page_number, page_path, raw_text, structured_json, created_at FROM session_pages WHERE session_id=$1 ORDER BY page_number ASC",
-      [id]
+      [id],
     );
 
     const voters = await query(
@@ -60,7 +60,7 @@ router.get("/sessions/:id", async (req, res) => {
               relation_type, relation_name, house_number, age, gender, religion, is_printed, 
               printed_at, created_at 
        FROM session_voters WHERE session_id=$1 ORDER BY page_number, serial_number`,
-      [id]
+      [id],
     );
 
     res.json({
@@ -83,7 +83,7 @@ router.delete("/sessions/:id", async (req, res) => {
 
     const deleted = await query(
       "DELETE FROM sessions WHERE id=$1 RETURNING id",
-      [id]
+      [id],
     );
     if (deleted.rowCount === 0) {
       return res.status(404).json({ error: "Session not found" });
@@ -113,8 +113,8 @@ router.get("/voters", async (req, res) => {
     const sql = `
       SELECT v.id, v.session_id, v.page_number, v.assembly, v.part_number, v.section, 
              v.serial_number, v.voter_id, v.name, v.relation_type, v.relation_name, 
-             v.house_number, v.age, v.gender, v.religion, v.is_printed, v.printed_at, v.created_at,
-             s.original_filename as source_file
+             v.house_number, v.age, v.gender, v.religion, v.photo_url, v.is_printed, v.printed_at, v.created_at,
+             s.original_filename as source_file, s.booth_name
       FROM session_voters v
       LEFT JOIN sessions s ON s.id = v.session_id
       ${whereSql}
@@ -135,12 +135,12 @@ router.get("/voters/:id", async (req, res) => {
   try {
     const { id } = req.params;
     const result = await query(
-      `SELECT v.*, s.original_filename as source_file, u.name as printed_by_name, u.email as printed_by_email
+      `SELECT v.*, s.original_filename as source_file, s.booth_name, u.name as printed_by_name, u.email as printed_by_email
        FROM session_voters v
        LEFT JOIN sessions s ON s.id = v.session_id
        LEFT JOIN users u ON u.id = v.printed_by
        WHERE v.id = $1`,
-      [id]
+      [id],
     );
 
     if (result.rowCount === 0) {

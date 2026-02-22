@@ -39,7 +39,7 @@ function loadApiKeysFromEnv() {
   }
 
   console.log(
-    `🔑 Loaded ${keys.length} unique Gemini API keys from environment`
+    `🔑 Loaded ${keys.length} unique Gemini API keys from environment`,
   );
   return keys;
 }
@@ -85,7 +85,7 @@ export function initializeKeyStatus() {
   });
 
   console.log(
-    `🚀 Initialized ${API_KEYS.length} API engines for parallel processing`
+    `🚀 Initialized ${API_KEYS.length} API engines for parallel processing`,
   );
   return API_KEYS.length;
 }
@@ -159,8 +159,8 @@ function markKeyRateLimited(apiKey, errorMessage, isPermanent = false) {
       console.log(
         `❌ API Key ${apiKey.slice(
           0,
-          10
-        )}... PERMANENTLY EXHAUSTED (daily quota reached)`
+          10,
+        )}... PERMANENTLY EXHAUSTED (daily quota reached)`,
       );
     } else {
       // Temporary rate limit - recover after 15 seconds (shorter for different projects)
@@ -175,8 +175,8 @@ function markKeyRateLimited(apiKey, errorMessage, isPermanent = false) {
       console.log(
         `⏳ API Key ${apiKey.slice(
           0,
-          10
-        )}... rate limited (will retry after 15s)`
+          10,
+        )}... rate limited (will retry after 15s)`,
       );
     }
   }
@@ -207,7 +207,7 @@ function tryRecoverExhaustedKeys() {
           recoveryTime: null,
         });
         console.log(
-          `✅ API Key ${key.slice(0, 10)}... recovered from rate limit`
+          `✅ API Key ${key.slice(0, 10)}... recovered from rate limit`,
         );
         recoveredCount++;
       }
@@ -293,7 +293,7 @@ export function getCurrentApiKey() {
   tryRecoverExhaustedKeys();
 
   const activeKey = API_KEYS.find(
-    (key) => apiKeyStatus.get(key)?.status === "active"
+    (key) => apiKeyStatus.get(key)?.status === "active",
   );
   return activeKey || null;
 }
@@ -342,10 +342,10 @@ export function getApiKeyStatuses() {
 
   const activeCount = statuses.filter((s) => s.status === "active").length;
   const rateLimitedCount = statuses.filter(
-    (s) => s.status === "rate_limited"
+    (s) => s.status === "rate_limited",
   ).length;
   const exhaustedCount = statuses.filter(
-    (s) => s.status === "exhausted"
+    (s) => s.status === "exhausted",
   ).length;
   const busyCount = statuses.filter((s) => s.busy).length;
 
@@ -367,7 +367,7 @@ export function getApiKeyStatuses() {
 export function resetAllApiKeys() {
   initializeKeyStatus();
   console.log(
-    `🔄 All ${API_KEYS.length} API engines have been reset to active status`
+    `🔄 All ${API_KEYS.length} API engines have been reset to active status`,
   );
   return getApiKeyStatuses();
 }
@@ -404,7 +404,31 @@ async function processWithEngine(engineIndex, filePath, retryCount = 0) {
         {
           parts: [
             {
-              text: "You are parsing an Indian voter list page. Return only JSON with fields {assembly, partNumber, section, voters:[{serialNumber, voterId, name, relationType (father|mother|husband|guardian), relationName, houseNumber, age, gender}]}. No prose.",
+              text: `You are parsing an Indian voter list page. Return only JSON with fields:
+{
+  "assembly": "assembly/constituency name",
+  "partNumber": "part number",
+  "section": "section name/number",
+  "boothName": "booth name or polling station name if visible at the top of the page (e.g. 'XYZ Primary School', 'ABC Community Hall'). Look for it near Part No. or Section header. If not visible, return empty string.",
+  "voters": [
+    {
+      "serialNumber": "serial number",
+      "voterId": "voter ID",
+      "name": "voter name",
+      "relationType": "father|mother|husband|guardian",
+      "relationName": "relation name",
+      "houseNumber": "house number",
+      "age": "age",
+      "gender": "male|female",
+      "hasPhoto": true or false (whether this voter entry has a photograph/image visible)
+    }
+  ]
+}
+
+IMPORTANT:
+1. For each voter, check if there is a passport-size photograph/image next to their details. Set "hasPhoto" to true if yes, false if no photo is visible.
+2. The "boothName" is typically the name of the building/location used as the polling booth, often found near the top of the first page after "Part No." section.
+3. No prose - ONLY valid JSON.`,
             },
             {
               inline_data: {
@@ -427,7 +451,7 @@ async function processWithEngine(engineIndex, filePath, retryCount = 0) {
     });
 
     console.log(
-      `🔧 Engine ${engineIndex + 1} processing: ${path.basename(filePath)}`
+      `🔧 Engine ${engineIndex + 1} processing: ${path.basename(filePath)}`,
     );
 
     const res = await fetch(url, {
@@ -444,20 +468,20 @@ async function processWithEngine(engineIndex, filePath, retryCount = 0) {
         // Permanent quota exhaustion - mark as exhausted
         markKeyExhausted(
           apiKey,
-          `Status ${res.status}: ${errorText.slice(0, 200)}`
+          `Status ${res.status}: ${errorText.slice(0, 200)}`,
         );
         throw new Error(
-          `ENGINE_EXHAUSTED: Engine ${engineIndex} permanently exhausted`
+          `ENGINE_EXHAUSTED: Engine ${engineIndex} permanently exhausted`,
         );
       } else if (quotaError.temporary) {
         // Temporary rate limit - mark as rate limited (short recovery)
         markKeyRateLimited(
           apiKey,
           `Status ${res.status}: ${errorText.slice(0, 200)}`,
-          false
+          false,
         );
         throw new Error(
-          `ENGINE_RATE_LIMITED: Engine ${engineIndex} temporarily rate limited`
+          `ENGINE_RATE_LIMITED: Engine ${engineIndex} temporarily rate limited`,
         );
       }
 
@@ -505,12 +529,12 @@ async function processWithEngine(engineIndex, filePath, retryCount = 0) {
     if (quotaError.permanent) {
       markKeyExhausted(apiKey, err.message.slice(0, 200));
       throw new Error(
-        `ENGINE_EXHAUSTED: Engine ${engineIndex} permanently exhausted`
+        `ENGINE_EXHAUSTED: Engine ${engineIndex} permanently exhausted`,
       );
     } else if (quotaError.temporary) {
       markKeyRateLimited(apiKey, err.message.slice(0, 200), false);
       throw new Error(
-        `ENGINE_RATE_LIMITED: Engine ${engineIndex} temporarily rate limited`
+        `ENGINE_RATE_LIMITED: Engine ${engineIndex} temporarily rate limited`,
       );
     }
 
@@ -526,7 +550,7 @@ async function processWithEngine(engineIndex, filePath, retryCount = 0) {
 export async function processPagesBatch(
   pagePaths,
   startIndex = 0,
-  onProgress = null
+  onProgress = null,
 ) {
   const results = [];
   const errors = [];
@@ -540,12 +564,12 @@ export async function processPagesBatch(
   // Get number of available engines
   const totalEngines = engines.size;
   console.log(
-    `🚀 Starting PARALLEL processing of ${pagePaths.length} pages with ${totalEngines} engines...`
+    `🚀 Starting PARALLEL processing of ${pagePaths.length} pages with ${totalEngines} engines...`,
   );
   console.log(
     `⚡ Using ${
       PER_ENGINE_DELAY / 1000
-    }s delay per engine (independent project quotas)`
+    }s delay per engine (independent project quotas)`,
   );
 
   // Process pages in batches equal to number of engines (TRUE PARALLEL)
@@ -562,7 +586,7 @@ export async function processPagesBatch(
     console.log(
       `\n📦 Processing batch ${Math.floor(batchStart / batchSize) + 1}: pages ${
         batchStart + 1
-      }-${batchEnd}/${pagePaths.length}`
+      }-${batchEnd}/${pagePaths.length}`,
     );
 
     // Process this batch in parallel
@@ -580,7 +604,7 @@ export async function processPagesBatch(
         // Find an available engine (try assigned first, then any available)
         let useEngineIndex = engineIndex;
         const assignedStatus = apiKeyStatus.get(
-          engines.get(useEngineIndex)?.apiKey
+          engines.get(useEngineIndex)?.apiKey,
         );
 
         // If assigned engine is exhausted, find another
@@ -606,13 +630,13 @@ export async function processPagesBatch(
         if (keyStatus?.status === "rate_limited" && keyStatus.recoveryTime) {
           const waitTime = Math.max(
             0,
-            new Date(keyStatus.recoveryTime) - new Date()
+            new Date(keyStatus.recoveryTime) - new Date(),
           );
           if (waitTime > 0) {
             console.log(
               `⏳ Engine ${
                 useEngineIndex + 1
-              } rate limited, waiting ${Math.ceil(waitTime / 1000)}s...`
+              } rate limited, waiting ${Math.ceil(waitTime / 1000)}s...`,
             );
             await staggeredDelay(waitTime + 2000);
             tryRecoverExhaustedKeys();
@@ -623,7 +647,7 @@ export async function processPagesBatch(
           console.log(
             `🔧 Engine ${useEngineIndex + 1} → page-${
               pageIndex + 1
-            }.pdf (attempt ${retries + 1})`
+            }.pdf (attempt ${retries + 1})`,
           );
 
           const result = await processWithEngine(useEngineIndex, pagePath);
@@ -631,7 +655,7 @@ export async function processPagesBatch(
           console.log(
             `✅ Page ${pageIndex + 1}/${pagePaths.length} DONE by Engine ${
               useEngineIndex + 1
-            }`
+            }`,
           );
 
           // Notify progress immediately
@@ -661,17 +685,17 @@ export async function processPagesBatch(
             console.log(
               `⚠️ Engine ${useEngineIndex + 1} rate limited, waiting ${
                 RATE_LIMIT_WAIT / 1000
-              }s...`
+              }s...`,
             );
             await staggeredDelay(RATE_LIMIT_WAIT);
           } else if (err.message.includes("ENGINE_EXHAUSTED")) {
             console.log(
-              `❌ Engine ${useEngineIndex + 1} exhausted, trying another...`
+              `❌ Engine ${useEngineIndex + 1} exhausted, trying another...`,
             );
             await staggeredDelay(1000);
           } else {
             console.error(
-              `❌ Page ${pageIndex + 1} error: ${err.message.slice(0, 80)}`
+              `❌ Page ${pageIndex + 1} error: ${err.message.slice(0, 80)}`,
             );
             await staggeredDelay(3000);
           }
@@ -680,7 +704,7 @@ export async function processPagesBatch(
 
       // Failed after all retries
       console.log(
-        `❌ Page ${pageIndex + 1} FAILED after ${MAX_RETRIES_PER_PAGE} attempts`
+        `❌ Page ${pageIndex + 1} FAILED after ${MAX_RETRIES_PER_PAGE} attempts`,
       );
 
       if (onProgress) {
@@ -714,14 +738,14 @@ export async function processPagesBatch(
     // Brief delay between batches to be nice to APIs
     if (batchEnd < pagePaths.length) {
       console.log(
-        `⏰ Short delay (${PER_ENGINE_DELAY / 1000}s) before next batch...`
+        `⏰ Short delay (${PER_ENGINE_DELAY / 1000}s) before next batch...`,
       );
       await staggeredDelay(PER_ENGINE_DELAY);
     }
   }
 
   console.log(
-    `\n📊 Processing complete: ${results.length} success, ${errors.length} errors`
+    `\n📊 Processing complete: ${results.length} success, ${errors.length} errors`,
   );
 
   return {
@@ -748,7 +772,7 @@ export async function classifyReligionByNames(voters, apiKeyFromRequest) {
 
   if (!apiKeyToUse) {
     console.log(
-      "No API keys available for religion classification, using 'Other'"
+      "No API keys available for religion classification, using 'Other'",
     );
     return { religions: voters.map(() => "Other"), keyUsed: null };
   }
@@ -805,7 +829,7 @@ Respond with ONLY the JSON array, no explanation.`;
         if (isQuotaExhaustedError(res.status, errorText)) {
           markKeyExhausted(
             apiKeyToUse,
-            `Status ${res.status}: ${errorText.slice(0, 200)}`
+            `Status ${res.status}: ${errorText.slice(0, 200)}`,
           );
           const nextKey = getCurrentApiKey();
 
@@ -885,7 +909,7 @@ export async function callGeminiWithFile(filePath, apiKeyFromRequest) {
         }
         // All engines exhausted
         throw new Error(
-          "ALL_KEYS_EXHAUSTED: All API engines have been exhausted"
+          "ALL_KEYS_EXHAUSTED: All API engines have been exhausted",
         );
       }
       throw err;
@@ -910,7 +934,27 @@ export async function callGeminiWithFile(filePath, apiKeyFromRequest) {
       {
         parts: [
           {
-            text: "You are parsing an Indian voter list page. Return only JSON with fields {assembly, partNumber, section, voters:[{serialNumber, voterId, name, relationType (father|mother|husband|guardian), relationName, houseNumber, age, gender}]}. No prose.",
+            text: `You are parsing an Indian voter list page. Return only JSON with fields:
+{
+  "assembly": "assembly/constituency name",
+  "partNumber": "part number",
+  "section": "section name/number",
+  "boothName": "booth/polling station name if visible at the top of the page, else empty string",
+  "voters": [
+    {
+      "serialNumber": "serial number",
+      "voterId": "voter ID",
+      "name": "voter name",
+      "relationType": "father|mother|husband|guardian",
+      "relationName": "relation name",
+      "houseNumber": "house number",
+      "age": "age",
+      "gender": "male|female",
+      "hasPhoto": true or false
+    }
+  ]
+}
+No prose - ONLY valid JSON.`,
           },
           {
             inline_data: {
@@ -936,7 +980,7 @@ export async function callGeminiWithFile(filePath, apiKeyFromRequest) {
     if (isQuotaExhaustedError(res.status, errorText)) {
       markKeyExhausted(
         apiKeyToUse,
-        `Status ${res.status}: ${errorText.slice(0, 200)}`
+        `Status ${res.status}: ${errorText.slice(0, 200)}`,
       );
       throw new Error("ALL_KEYS_EXHAUSTED: API key exhausted");
     }

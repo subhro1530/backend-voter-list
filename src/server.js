@@ -30,6 +30,8 @@ import {
 import authRoutes from "./routes/authRoutes.js";
 import adminRoutes from "./routes/admin.js";
 import userRoutes from "./routes/user.js";
+import electionResultRoutes from "./routes/electionResults.js";
+import { isCloudinaryConfigured, uploadBase64Image } from "./cloudinary.js";
 
 const app = express();
 const port = process.env.PORT || 3000;
@@ -89,6 +91,7 @@ app.use(express.json({ limit: "1mb" }));
 app.use("/auth", authRoutes);
 app.use("/admin", adminRoutes);
 app.use("/user", userRoutes);
+app.use("/election-results", electionResultRoutes);
 
 function sessionIdMiddleware(req, _res, next) {
   req.sessionId = uuidv4();
@@ -151,7 +154,7 @@ function buildVoterFilter(params, startIndex = 1) {
   maybeAdd(
     params.gender ? params.gender.toLowerCase() : undefined,
     "LOWER(gender)",
-    "="
+    "=",
   );
   maybeAdd(params.houseNumber, "house_number");
   maybeAdd(params.relationType, "relation_type");
@@ -202,18 +205,18 @@ app.post(
     try {
       await query(
         "INSERT INTO sessions (id, original_filename, status, processed_pages) VALUES ($1, $2, $3, $4)",
-        [sessionId, originalName, "processing", 0]
+        [sessionId, originalName, "processing", 0],
       );
 
       const pageDir = path.join(storageRoot, sessionId, "pages");
       const pagePaths = await splitPdfToPages(pdfPath, pageDir);
       await query(
         "UPDATE sessions SET total_pages=$1, processed_pages=0, updated_at=now() WHERE id=$2",
-        [pagePaths.length, sessionId]
+        [pagePaths.length, sessionId],
       );
 
       console.log(
-        `📄 Processing ${pagePaths.length} pages with parallel engines...`
+        `📄 Processing ${pagePaths.length} pages with parallel engines...`,
       );
 
       // Track progress
@@ -232,9 +235,19 @@ app.post(
         lastKeyUsed = keyUsed;
 
         const structured = parseGeminiStructured(text);
+
+        // Extract booth name from the first page and save to session
+        if (pageIndex === 0 && structured.boothName) {
+          await query(
+            "UPDATE sessions SET booth_name=$1, updated_at=now() WHERE id=$2",
+            [structured.boothName, sessionId],
+          );
+          console.log(`🏫 Booth name detected: ${structured.boothName}`);
+        }
+
         const pageRes = await query(
           "INSERT INTO session_pages (session_id, page_number, page_path, raw_text, structured_json) VALUES ($1, $2, $3, $4, $5) RETURNING id",
-          [sessionId, pageIndex + 1, pagePath, text, structured]
+          [sessionId, pageIndex + 1, pagePath, text, structured],
         );
 
         const pageId = pageRes.rows[0].id;
@@ -258,8 +271,27 @@ app.post(
           const ageValue = voter.age ? Number.parseInt(voter.age, 10) : null;
           const age = Number.isNaN(ageValue) ? null : ageValue;
 
+          // Upload voter photo to Cloudinary if available
+          let photoUrl = null;
+          if (voter.hasPhoto && voter.photoBase64 && isCloudinaryConfigured()) {
+            try {
+              const cloudResult = await uploadBase64Image(voter.photoBase64, {
+                folder: `voter-list/${sessionId}`,
+                publicId: `voter_${voter.voterId || voter.serialNumber || i}`,
+              });
+              photoUrl = cloudResult?.secure_url || null;
+              console.log(
+                `📸 Voter photo uploaded: ${voter.name || voter.serialNumber}`,
+              );
+            } catch (photoErr) {
+              console.warn(
+                `⚠️ Photo upload failed for voter ${voter.name}: ${photoErr.message}`,
+              );
+            }
+          }
+
           await query(
-            "INSERT INTO session_voters (session_id, page_id, page_number, assembly, part_number, section, serial_number, voter_id, name, relation_type, relation_name, house_number, age, gender, religion) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
+            "INSERT INTO session_voters (session_id, page_id, page_number, assembly, part_number, section, serial_number, voter_id, name, relation_type, relation_name, house_number, age, gender, religion, photo_url) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)",
             [
               sessionId,
               pageId,
@@ -276,20 +308,21 @@ app.post(
               age,
               voter.gender || "",
               religion,
-            ]
+              photoUrl,
+            ],
           );
         }
 
         processedCount++;
         await query(
           "UPDATE sessions SET processed_pages=$1, updated_at=now() WHERE id=$2",
-          [processedCount, sessionId]
+          [processedCount, sessionId],
         );
 
         console.log(
           `✅ Page ${pageIndex + 1}/${pagePaths.length} saved to database (${
             voters.length
-          } voters)`
+          } voters)`,
         );
       };
 
@@ -303,34 +336,34 @@ app.post(
               await savePageToDatabase(
                 progress.pageIndex,
                 progress.result,
-                progress.pagePath
+                progress.pagePath,
               );
             } catch (err) {
               console.error(
                 `Failed to save page ${progress.pageIndex + 1}:`,
-                err.message
+                err.message,
               );
               errorCount++;
             }
           }
-        }
+        },
       );
 
       // Check final status
       const finalStatus = await query(
         "SELECT processed_pages FROM sessions WHERE id=$1",
-        [sessionId]
+        [sessionId],
       );
       const finalProcessed = finalStatus.rows[0]?.processed_pages || 0;
 
       console.log(
-        `📊 Session ${sessionId}: ${finalProcessed}/${pagePaths.length} pages processed, ${errorCount} errors`
+        `📊 Session ${sessionId}: ${finalProcessed}/${pagePaths.length} pages processed, ${errorCount} errors`,
       );
 
       if (finalProcessed < pagePaths.length || errorCount > 0) {
         await query(
           "UPDATE sessions SET status=$1, updated_at=now() WHERE id=$2",
-          ["paused", sessionId]
+          ["paused", sessionId],
         );
 
         return res.status(207).json({
@@ -348,7 +381,7 @@ app.post(
 
       await query(
         "UPDATE sessions SET status=$1, updated_at=now() WHERE id=$2",
-        ["completed", sessionId]
+        ["completed", sessionId],
       );
 
       res.status(201).json({
@@ -361,7 +394,7 @@ app.post(
     } catch (err) {
       await query(
         "UPDATE sessions SET status=$1, updated_at=now() WHERE id=$2",
-        ["failed", sessionId]
+        ["failed", sessionId],
       ).catch(() => {});
       console.error("Session processing failed:", err.message);
       res.status(500).json({
@@ -370,7 +403,7 @@ app.post(
         apiKeyStatus: getApiKeyStatuses(),
       });
     }
-  }
+  },
 );
 
 // Sessions list - Admin only
@@ -394,7 +427,7 @@ app.get("/sessions/:id/status", authenticate, adminOnly, async (req, res) => {
   const { id } = req.params;
   const session = await query(
     "SELECT id, status, total_pages, processed_pages, created_at, updated_at FROM sessions WHERE id=$1",
-    [id]
+    [id],
   );
   if (session.rowCount === 0) {
     return res.status(404).json({ error: "Session not found" });
@@ -402,11 +435,11 @@ app.get("/sessions/:id/status", authenticate, adminOnly, async (req, res) => {
 
   const pages = await query(
     "SELECT COUNT(*)::int AS pages_done, COALESCE(MAX(page_number), 0) AS last_page FROM session_pages WHERE session_id=$1",
-    [id]
+    [id],
   );
   const voters = await query(
     "SELECT COUNT(*)::int AS voter_count FROM session_voters WHERE session_id=$1",
-    [id]
+    [id],
   );
 
   const { status, total_pages, processed_pages, created_at, updated_at } =
@@ -443,12 +476,12 @@ app.get("/sessions/:id", authenticate, adminOnly, async (req, res) => {
 
   const pages = await query(
     "SELECT page_number, page_path, raw_text, structured_json, created_at FROM session_pages WHERE session_id=$1 ORDER BY page_number ASC",
-    [id]
+    [id],
   );
 
   const voters = await query(
-    "SELECT id, page_number, assembly, part_number, section, serial_number, voter_id, name, relation_type, relation_name, house_number, age, gender, religion, is_printed, printed_at, created_at FROM session_voters WHERE session_id=$1 ORDER BY page_number, serial_number",
-    [id]
+    "SELECT id, page_number, assembly, part_number, section, serial_number, voter_id, name, relation_type, relation_name, house_number, age, gender, religion, photo_url, is_printed, printed_at, created_at FROM session_voters WHERE session_id=$1 ORDER BY page_number, serial_number",
+    [id],
   );
 
   res.json({
@@ -469,7 +502,7 @@ app.get("/sessions/:id/voters", authenticate, adminOnly, async (req, res) => {
   const { where, values } = buildVoterFilter({ ...req.query, sessionId: id });
   const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : "";
   const sql = `
-    SELECT page_number, assembly, part_number, section, serial_number, voter_id, name, relation_type, relation_name, house_number, age, gender, religion, created_at
+    SELECT page_number, assembly, part_number, section, serial_number, voter_id, name, relation_type, relation_name, house_number, age, gender, religion, photo_url, created_at
     FROM session_voters
     ${whereSql}
     ORDER BY page_number, serial_number;
@@ -522,7 +555,7 @@ app.get(
     }));
 
     res.json({ sessionId: id, total, stats });
-  }
+  },
 );
 
 // Delete session - Admin only
@@ -552,7 +585,7 @@ app.patch("/sessions/:id/rename", authenticate, adminOnly, async (req, res) => {
 
   const updated = await query(
     "UPDATE sessions SET original_filename=$1, updated_at=now() WHERE id=$2 RETURNING id, original_filename",
-    [name.trim(), id]
+    [name.trim(), id],
   );
 
   if (updated.rowCount === 0) {
@@ -598,7 +631,7 @@ app.post("/sessions/:id/stop", authenticate, adminOnly, async (req, res) => {
   try {
     const sessionRes = await query(
       "SELECT id, status, total_pages, processed_pages FROM sessions WHERE id=$1",
-      [id]
+      [id],
     );
 
     if (sessionRes.rowCount === 0) {
@@ -617,7 +650,7 @@ app.post("/sessions/:id/stop", authenticate, adminOnly, async (req, res) => {
     // Update session status to paused
     await query(
       "UPDATE sessions SET status='paused', updated_at=now() WHERE id=$1",
-      [id]
+      [id],
     );
 
     console.log(`🛑 Session ${id} stopped by user`);
@@ -647,7 +680,7 @@ app.post("/sessions/:id/resume", authenticate, adminOnly, async (req, res) => {
     // Check if session exists and is paused or failed
     const sessionRes = await query(
       "SELECT id, status, total_pages, processed_pages, original_filename FROM sessions WHERE id=$1",
-      [id]
+      [id],
     );
 
     if (sessionRes.rowCount === 0) {
@@ -681,10 +714,10 @@ app.post("/sessions/:id/resume", authenticate, adminOnly, async (req, res) => {
     // Get already processed page numbers
     const processedPagesRes = await query(
       "SELECT page_number FROM session_pages WHERE session_id=$1",
-      [id]
+      [id],
     );
     const processedPageNumbers = new Set(
-      processedPagesRes.rows.map((r) => r.page_number)
+      processedPagesRes.rows.map((r) => r.page_number),
     );
 
     // Get page files from storage
@@ -696,7 +729,7 @@ app.post("/sessions/:id/resume", authenticate, adminOnly, async (req, res) => {
           f.endsWith(".png") ||
           f.endsWith(".jpg") ||
           f.endsWith(".jpeg") ||
-          f.endsWith(".pdf")
+          f.endsWith(".pdf"),
       )
       .sort((a, b) => {
         const numA = parseInt(a.match(/\d+/)?.[0] || "0");
@@ -707,13 +740,13 @@ app.post("/sessions/:id/resume", authenticate, adminOnly, async (req, res) => {
 
     // Filter out already processed pages
     const remainingPages = allPagePaths.filter(
-      (p) => !processedPageNumbers.has(p.pageNumber)
+      (p) => !processedPageNumbers.has(p.pageNumber),
     );
 
     if (remainingPages.length === 0) {
       await query(
         "UPDATE sessions SET status=$1, updated_at=now() WHERE id=$2",
-        ["completed", id]
+        ["completed", id],
       );
       return res.json({
         message: "Session already completed",
@@ -730,13 +763,13 @@ app.post("/sessions/:id/resume", authenticate, adminOnly, async (req, res) => {
 
     let resumedFromPage = session.processed_pages;
     console.log(
-      `📄 Resuming ${remainingPages.length} remaining pages with parallel engines...`
+      `📄 Resuming ${remainingPages.length} remaining pages with parallel engines...`,
     );
 
     // Use parallel batch processing with IMMEDIATE database saves
     const pagePaths = remainingPages.map((p) => p.path);
     const pageNumberMap = new Map(
-      remainingPages.map((p) => [p.path, p.pageNumber])
+      remainingPages.map((p) => [p.path, p.pageNumber]),
     );
 
     let keySwitchCount = 0;
@@ -754,9 +787,19 @@ app.post("/sessions/:id/resume", authenticate, adminOnly, async (req, res) => {
       lastKeyUsed = keyUsed;
 
       const structured = parseGeminiStructured(text);
+
+      // Extract booth name from the first page and save to session
+      if (pageNumber === 1 && structured.boothName) {
+        await query(
+          "UPDATE sessions SET booth_name=$1, updated_at=now() WHERE id=$2",
+          [structured.boothName, id],
+        );
+        console.log(`🏫 Booth name detected: ${structured.boothName}`);
+      }
+
       const pageRes = await query(
         "INSERT INTO session_pages (session_id, page_number, page_path, raw_text, structured_json) VALUES ($1, $2, $3, $4, $5) RETURNING id",
-        [id, pageNumber, pagePath, text, structured]
+        [id, pageNumber, pagePath, text, structured],
       );
 
       const pageId = pageRes.rows[0].id;
@@ -777,8 +820,22 @@ app.post("/sessions/:id/resume", authenticate, adminOnly, async (req, res) => {
         const ageValue = voter.age ? Number.parseInt(voter.age, 10) : null;
         const age = Number.isNaN(ageValue) ? null : ageValue;
 
+        // Upload voter photo to Cloudinary if available
+        let photoUrl = null;
+        if (voter.hasPhoto && voter.photoBase64 && isCloudinaryConfigured()) {
+          try {
+            const cloudResult = await uploadBase64Image(voter.photoBase64, {
+              folder: `voter-list/${id}`,
+              publicId: `voter_${voter.voterId || voter.serialNumber || i}`,
+            });
+            photoUrl = cloudResult?.secure_url || null;
+          } catch (photoErr) {
+            console.warn(`⚠️ Photo upload failed: ${photoErr.message}`);
+          }
+        }
+
         await query(
-          "INSERT INTO session_voters (session_id, page_id, page_number, assembly, part_number, section, serial_number, voter_id, name, relation_type, relation_name, house_number, age, gender, religion) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
+          "INSERT INTO session_voters (session_id, page_id, page_number, assembly, part_number, section, serial_number, voter_id, name, relation_type, relation_name, house_number, age, gender, religion, photo_url) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)",
           [
             id,
             pageId,
@@ -795,18 +852,19 @@ app.post("/sessions/:id/resume", authenticate, adminOnly, async (req, res) => {
             age,
             voter.gender || "",
             religion,
-          ]
+            photoUrl,
+          ],
         );
       }
 
       processedCount++;
       await query(
         "UPDATE sessions SET processed_pages=$1, updated_at=now() WHERE id=$2",
-        [processedCount, id]
+        [processedCount, id],
       );
 
       console.log(
-        `✅ Resume: Page ${pageNumber} saved to DB (${voters.length} voters)`
+        `✅ Resume: Page ${pageNumber} saved to DB (${voters.length} voters)`,
       );
     };
 
@@ -821,7 +879,7 @@ app.post("/sessions/:id/resume", authenticate, adminOnly, async (req, res) => {
             console.error(`Failed to save page during resume:`, err.message);
           }
         }
-      }
+      },
     );
 
     // Check for errors
@@ -831,7 +889,7 @@ app.post("/sessions/:id/resume", authenticate, adminOnly, async (req, res) => {
     ) {
       await query(
         "UPDATE sessions SET status=$1, updated_at=now() WHERE id=$2",
-        ["paused", id]
+        ["paused", id],
       );
       return res.status(207).json({
         message: "Session partially resumed",
@@ -1048,7 +1106,7 @@ app.post("/chat", authenticate, async (req, res) => {
           case "VIEW_PROFILE": {
             const result = await query(
               "SELECT id, email, name, phone, role, created_at FROM users WHERE id = $1",
-              [req.user.id]
+              [req.user.id],
             );
             actionResult = {
               type: "profile",
@@ -1170,7 +1228,7 @@ app.post("/chat", authenticate, async (req, res) => {
       formattedResponse += `- **Phone:** ${p.phone || "Not set"}\n`;
       formattedResponse += `- **Role:** ${p.role}\n`;
       formattedResponse += `- **Member since:** ${new Date(
-        p.created_at
+        p.created_at,
       ).toLocaleDateString()}\n`;
     }
 
@@ -1292,7 +1350,7 @@ app.post("/agent/query", authenticate, async (req, res) => {
     console.log(
       `🤖 Agent query from ${req.user.email} (${
         req.user.role
-      }): "${message.slice(0, 50)}..."`
+      }): "${message.slice(0, 50)}..."`,
     );
 
     res.json(result);
@@ -1585,7 +1643,7 @@ async function gracefulShutdown(signal) {
   try {
     // Pause all sessions that are currently processing
     await query(
-      "UPDATE sessions SET status='paused', updated_at=now() WHERE status='processing'"
+      "UPDATE sessions SET status='paused', updated_at=now() WHERE status='processing'",
     );
     console.log("✅ All processing sessions paused");
   } catch (err) {

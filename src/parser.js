@@ -54,17 +54,25 @@ function parseFromPlainText(text) {
   const assembly = pullValue(/Assembly Constituency[^:]*:\s*(.+)/i, text);
   const partNumber = pullValue(/Part No\.?\s*:\s*(.+)/i, text);
   const section = pullValue(/Section[^:]*:\s*(.+)/i, text);
+  const boothName = pullValue(/(?:Polling Station|Booth)[^:]*:\s*(.+)/i, text);
 
   const blocks = parseBlocks(text);
   const voters = blocks
     .map(parseVoterBlock)
     .filter((v) => v.name || v.voterId || v.serialNumber);
 
-  return { assembly, partNumber, section, voters };
+  return { assembly, partNumber, section, boothName, voters };
 }
 
 export function parseGeminiStructured(text) {
-  if (!text) return { assembly: "", partNumber: "", section: "", voters: [] };
+  if (!text)
+    return {
+      assembly: "",
+      partNumber: "",
+      section: "",
+      boothName: "",
+      voters: [],
+    };
 
   const cleaned = cleanJsonText(text);
   try {
@@ -73,6 +81,8 @@ export function parseGeminiStructured(text) {
       assembly: parsed.assembly || parsed.constituency || "",
       partNumber: parsed.partNumber || parsed.part || "",
       section: parsed.section || "",
+      boothName:
+        parsed.boothName || parsed.booth_name || parsed.pollingStation || "",
       voters: Array.isArray(parsed.voters) ? parsed.voters : [],
     };
   } catch (err) {

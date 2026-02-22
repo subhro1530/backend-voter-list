@@ -224,6 +224,7 @@ DATABASE SCHEMA:
    - status (TEXT) - 'processing', 'completed', 'paused', 'failed'
    - total_pages (INT) - Total number of pages in the PDF
    - processed_pages (INT) - Number of pages processed so far
+   - booth_name (TEXT) - Name of the polling station / booth detected from PDF
    - created_at (TIMESTAMP) - When the session was created
    - updated_at (TIMESTAMP) - Last update time
 
@@ -253,6 +254,7 @@ DATABASE SCHEMA:
    - age (INT) - Voter's age
    - gender (TEXT) - 'male', 'female', 'other'
    - religion (TEXT) - 'Hindu', 'Muslim', 'Christian', 'Sikh', 'Buddhist', 'Jain', 'Other'
+   - photo_url (TEXT) - Cloudinary URL of the voter's photograph (nullable)
    - is_printed (BOOLEAN) - Whether voter slip has been printed
    - printed_at (TIMESTAMP) - When the slip was printed
    - printed_by (BIGINT, FK → users.id) - Who printed the slip
@@ -265,11 +267,70 @@ DATABASE SCHEMA:
    - role (TEXT) - 'user' or 'admin'
    - created_at (TIMESTAMP) - When the user was created
 
+5. TABLE: election_sessions
+   - id (UUID, PRIMARY KEY) - Unique election result session identifier
+   - original_filename (TEXT) - Name of uploaded Form 20 PDF file
+   - constituency (TEXT) - Constituency name extracted from OCR
+   - total_electors (INT) - Total number of electors in the constituency
+   - status (TEXT) - 'processing', 'completed', 'failed'
+   - total_pages (INT) - Total pages in the PDF
+   - processed_pages (INT) - Pages processed so far
+   - created_at (TIMESTAMP) - When the session was created
+   - updated_at (TIMESTAMP) - Last update time
+
+6. TABLE: election_pages
+   - id (BIGSERIAL, PRIMARY KEY)
+   - session_id (UUID, FK → election_sessions.id)
+   - page_number (INT)
+   - page_path (TEXT)
+   - raw_text (TEXT)
+   - structured_json (JSONB)
+   - created_at (TIMESTAMP)
+
+7. TABLE: election_candidates
+   - id (BIGSERIAL, PRIMARY KEY)
+   - session_id (UUID, FK → election_sessions.id)
+   - candidate_name (TEXT) - Name of the candidate
+   - candidate_index (INT) - Order/column index in the result table
+   - created_at (TIMESTAMP)
+   - UNIQUE(session_id, candidate_name)
+
+8. TABLE: election_booth_results
+   - id (BIGSERIAL, PRIMARY KEY)
+   - session_id (UUID, FK → election_sessions.id)
+   - page_id (BIGINT, FK → election_pages.id)
+   - serial_no (INT) - Serial number of the booth row
+   - booth_no (TEXT) - Booth/polling station number
+   - candidate_votes (JSONB) - { "Candidate A": 312, "Candidate B": 287 }
+   - total_valid_votes (INT)
+   - rejected_votes (INT)
+   - nota (INT) - NOTA votes
+   - total_votes (INT)
+   - tendered_votes (INT)
+   - created_at (TIMESTAMP)
+
+9. TABLE: election_totals
+   - id (BIGSERIAL, PRIMARY KEY)
+   - session_id (UUID, FK → election_sessions.id)
+   - total_type (TEXT) - 'evm', 'postal', or 'total' (CHECK constraint)
+   - candidate_votes (JSONB) - Total votes per candidate
+   - total_valid_votes (INT)
+   - rejected_votes (INT)
+   - nota (INT)
+   - total_votes (INT)
+   - tendered_votes (INT)
+   - created_at (TIMESTAMP)
+   - UNIQUE(session_id, total_type)
+
 RELATIONSHIPS:
 - sessions → session_pages (one-to-many via session_id)
 - sessions → session_voters (one-to-many via session_id)
 - session_pages → session_voters (one-to-many via page_id)
 - users → session_voters (one-to-many via printed_by)
+- election_sessions → election_pages (one-to-many via session_id)
+- election_sessions → election_candidates (one-to-many via session_id)
+- election_sessions → election_booth_results (one-to-many via session_id)
+- election_sessions → election_totals (one-to-many via session_id)
 
 COMMON QUERIES:
 - Count voters: SELECT COUNT(*) FROM session_voters
@@ -278,6 +339,10 @@ COMMON QUERIES:
 - Count by gender: SELECT gender, COUNT(*) FROM session_voters GROUP BY gender
 - Age statistics: SELECT MIN(age), MAX(age), AVG(age)::INT FROM session_voters WHERE age IS NOT NULL
 - Sessions summary: SELECT COUNT(*), SUM(total_pages), SUM(processed_pages) FROM sessions
+- Voters with photos: SELECT COUNT(*) FROM session_voters WHERE photo_url IS NOT NULL
+- Sessions by booth: SELECT booth_name, COUNT(*) FROM sessions WHERE booth_name IS NOT NULL GROUP BY booth_name
+- Election results: SELECT * FROM election_booth_results WHERE session_id = $1 ORDER BY serial_no
+- Candidate totals: SELECT ec.candidate_name, et.candidate_votes FROM election_candidates ec JOIN election_totals et ON ec.session_id = et.session_id WHERE ec.session_id = $1
 `;
 
 // ============================================================================
@@ -412,7 +477,7 @@ function classifyIntent(queryText) {
 
   for (const [intent, config] of Object.entries(INTENT_CATEGORIES)) {
     const matchCount = config.keywords.filter((kw) =>
-      lowerQuery.includes(kw)
+      lowerQuery.includes(kw),
     ).length;
     if (matchCount > 0) {
       matchedIntents.push({ intent, matchCount, ...config });
@@ -437,7 +502,7 @@ function classifyIntent(queryText) {
 async function callAgentAI(prompt, systemPrompt, maxRetries = 3) {
   if (AGENT_API_KEYS.length === 0) {
     throw new Error(
-      "No agent API keys configured. Set GEMINI_API_KEY or GEMINI_API_KEY_N in .env"
+      "No agent API keys configured. Set GEMINI_API_KEY or GEMINI_API_KEY_N in .env",
     );
   }
 
@@ -503,7 +568,7 @@ async function callAgentAI(prompt, systemPrompt, maxRetries = 3) {
       if (!response.ok) {
         const errorText = await response.text();
         throw new Error(
-          `AI API error: ${response.status} - ${errorText.slice(0, 200)}`
+          `AI API error: ${response.status} - ${errorText.slice(0, 200)}`,
         );
       }
 
@@ -632,7 +697,7 @@ Provide a natural language summary of these results that directly answers the us
     } results. Here's the data:\n\`\`\`json\n${JSON.stringify(
       results.slice(0, 10),
       null,
-      2
+      2,
     )}\n\`\`\``;
   }
 }
@@ -777,8 +842,8 @@ export async function processAgentQuery(userQuery, user, options = {}) {
     console.warn(
       `⚠️ Prompt injection attempt from user ${userId}: ${sanitizedQuery.slice(
         0,
-        100
-      )}`
+        100,
+      )}`,
     );
     return {
       success: false,
@@ -816,12 +881,12 @@ export async function processAgentQuery(userQuery, user, options = {}) {
         const formattedResponse = await formatResults(
           pending.originalQuery,
           result.rows,
-          pending.explanation
+          pending.explanation,
         );
 
         conversation.history.push(
           { role: "user", content: pending.originalQuery },
-          { role: "assistant", content: formattedResponse }
+          { role: "assistant", content: formattedResponse },
         );
 
         return {
@@ -946,13 +1011,13 @@ export async function processAgentQuery(userQuery, user, options = {}) {
     const formattedResponse = await formatResults(
       sanitizedQuery,
       result.rows,
-      aiResponse.explanation
+      aiResponse.explanation,
     );
 
     // Update conversation history
     conversation.history.push(
       { role: "user", content: sanitizedQuery },
-      { role: "assistant", content: formattedResponse }
+      { role: "assistant", content: formattedResponse },
     );
 
     return {
@@ -1034,7 +1099,7 @@ export function getQuickSuggestions(role) {
     suggestions.push(
       "Find voters aged 18-25",
       "Show top 10 assemblies by voter count",
-      "List voters in assembly [name]"
+      "List voters in assembly [name]",
     );
   }
 
