@@ -413,7 +413,7 @@ async function processWithEngine(engineIndex, filePath, retryCount = 0) {
   "voters": [
     {
       "serialNumber": "serial number",
-      "voterId": "voter ID",
+      "voterId": "EPIC number (the alphanumeric voter ID like XFB2313997, ABC1234567 etc.)",
       "name": "voter name",
       "relationType": "father|mother|husband|guardian",
       "relationName": "relation name",
@@ -428,7 +428,8 @@ async function processWithEngine(engineIndex, filePath, retryCount = 0) {
 IMPORTANT:
 1. For each voter, check if there is a passport-size photograph/image next to their details. Set "hasPhoto" to true if yes, false if no photo is visible.
 2. The "boothName" is typically the name of the building/location used as the polling booth, often found near the top of the first page after "Part No." section.
-3. No prose - ONLY valid JSON.`,
+3. "voterId" MUST be the EPIC number (e.g. XFB2313997, ABC1234567). It is printed below or near the voter's photo. Do NOT use location codes like "WB/01/003/000070" — those are NOT voter IDs. If the EPIC number is not clearly readable, return an empty string "".
+4. No prose - ONLY valid JSON.`,
             },
             {
               inline_data: {
@@ -943,7 +944,7 @@ export async function callGeminiWithFile(filePath, apiKeyFromRequest) {
   "voters": [
     {
       "serialNumber": "serial number",
-      "voterId": "voter ID",
+      "voterId": "EPIC number (alphanumeric voter ID like XFB2313997)",
       "name": "voter name",
       "relationType": "father|mother|husband|guardian",
       "relationName": "relation name",
@@ -954,6 +955,7 @@ export async function callGeminiWithFile(filePath, apiKeyFromRequest) {
     }
   ]
 }
+IMPORTANT: "voterId" MUST be the EPIC number (e.g. XFB2313997, ABC1234567) printed below the voter photo. Do NOT use location codes like "WB/01/003/000070". If EPIC number is not readable, return empty string.
 No prose - ONLY valid JSON.`,
           },
           {

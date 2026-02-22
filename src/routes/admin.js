@@ -130,17 +130,24 @@ router.get("/voters", async (req, res) => {
 
 /**
  * Get voter by ID with full details (Admin only)
+ * Accepts numeric DB id or alphanumeric voter_id
  */
-router.get("/voters/:id", async (req, res) => {
+router.get("/voters/:id(*)", async (req, res) => {
   try {
-    const { id } = req.params;
+    const idParam = req.params.id || req.params[0];
+    // Detect numeric (DB id) vs alphanumeric (voter_id)
+    const isNumeric = /^\d+$/.test(idParam);
+    const whereCol = isNumeric ? "v.id" : "v.voter_id";
+
     const result = await query(
       `SELECT v.*, s.original_filename as source_file, s.booth_name, u.name as printed_by_name, u.email as printed_by_email
        FROM session_voters v
        LEFT JOIN sessions s ON s.id = v.session_id
        LEFT JOIN users u ON u.id = v.printed_by
-       WHERE v.id = $1`,
-      [id],
+       WHERE ${whereCol} = $1
+       ORDER BY v.created_at DESC
+       LIMIT 1`,
+      [idParam],
     );
 
     if (result.rowCount === 0) {

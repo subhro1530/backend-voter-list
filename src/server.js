@@ -31,7 +31,24 @@ import authRoutes from "./routes/authRoutes.js";
 import adminRoutes from "./routes/admin.js";
 import userRoutes from "./routes/user.js";
 import electionResultRoutes from "./routes/electionResults.js";
-import { isCloudinaryConfigured, uploadBase64Image } from "./cloudinary.js";
+import {
+  isCloudinaryConfigured,
+  uploadBase64Image,
+  extractVoterPhotosFromPage,
+} from "./cloudinary.js";
+
+/**
+ * Sanitize voter ID: if it contains slashes (like WB/01/003/000070) it's
+ * a location code, not a real EPIC number. Replace it with empty string
+ * so the voter is stored without a fake ID.
+ */
+function sanitizeVoterId(rawId) {
+  if (!rawId) return "";
+  const trimmed = rawId.trim();
+  // EPIC numbers are alphanumeric without slashes (e.g. XFB2313997)
+  if (trimmed.includes("/")) return "";
+  return trimmed;
+}
 
 const app = express();
 const port = process.env.PORT || 3000;
@@ -265,30 +282,51 @@ app.post(
           religions = religionResult.religions;
         }
 
+        // Extract voter photos from the page PDF via Cloudinary
+        let photoMap = new Map();
+        if (isCloudinaryConfigured() && voters.some((v) => v.hasPhoto)) {
+          try {
+            photoMap = await extractVoterPhotosFromPage(
+              pagePath,
+              voters,
+              sessionId,
+              pageIndex + 1,
+            );
+          } catch (photoErr) {
+            console.warn(
+              `⚠️ Photo extraction failed for page ${pageIndex + 1}: ${photoErr.message}`,
+            );
+          }
+        }
+
         for (let i = 0; i < voters.length; i++) {
           const voter = voters[i];
           const religion = religions[i] || "Other";
           const ageValue = voter.age ? Number.parseInt(voter.age, 10) : null;
           const age = Number.isNaN(ageValue) ? null : ageValue;
 
-          // Upload voter photo to Cloudinary if available
-          let photoUrl = null;
-          if (voter.hasPhoto && voter.photoBase64 && isCloudinaryConfigured()) {
+          // Get photo URL from extraction (or fallback to base64 upload if somehow available)
+          let photoUrl = photoMap.get(i) || null;
+          if (
+            !photoUrl &&
+            voter.hasPhoto &&
+            voter.photoBase64 &&
+            isCloudinaryConfigured()
+          ) {
             try {
               const cloudResult = await uploadBase64Image(voter.photoBase64, {
                 folder: `voter-list/${sessionId}`,
                 publicId: `voter_${voter.voterId || voter.serialNumber || i}`,
               });
               photoUrl = cloudResult?.secure_url || null;
-              console.log(
-                `📸 Voter photo uploaded: ${voter.name || voter.serialNumber}`,
-              );
             } catch (photoErr) {
               console.warn(
                 `⚠️ Photo upload failed for voter ${voter.name}: ${photoErr.message}`,
               );
             }
           }
+
+          const cleanVoterId = sanitizeVoterId(voter.voterId);
 
           await query(
             "INSERT INTO session_voters (session_id, page_id, page_number, assembly, part_number, section, serial_number, voter_id, name, relation_type, relation_name, house_number, age, gender, religion, photo_url) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)",
@@ -300,7 +338,7 @@ app.post(
               partNumber,
               section,
               voter.serialNumber || "",
-              voter.voterId || "",
+              cleanVoterId,
               voter.name || "",
               voter.relationType || "",
               voter.relationName || "",
@@ -814,15 +852,37 @@ app.post("/sessions/:id/resume", authenticate, adminOnly, async (req, res) => {
         religions = religionResult.religions;
       }
 
+      // Extract voter photos from the page PDF via Cloudinary
+      let photoMap = new Map();
+      if (isCloudinaryConfigured() && voters.some((v) => v.hasPhoto)) {
+        try {
+          photoMap = await extractVoterPhotosFromPage(
+            pagePath,
+            voters,
+            id,
+            pageNumber,
+          );
+        } catch (photoErr) {
+          console.warn(
+            `⚠️ Photo extraction failed for page ${pageNumber}: ${photoErr.message}`,
+          );
+        }
+      }
+
       for (let i = 0; i < voters.length; i++) {
         const voter = voters[i];
         const religion = religions[i] || "Other";
         const ageValue = voter.age ? Number.parseInt(voter.age, 10) : null;
         const age = Number.isNaN(ageValue) ? null : ageValue;
 
-        // Upload voter photo to Cloudinary if available
-        let photoUrl = null;
-        if (voter.hasPhoto && voter.photoBase64 && isCloudinaryConfigured()) {
+        // Get photo URL from extraction
+        let photoUrl = photoMap.get(i) || null;
+        if (
+          !photoUrl &&
+          voter.hasPhoto &&
+          voter.photoBase64 &&
+          isCloudinaryConfigured()
+        ) {
           try {
             const cloudResult = await uploadBase64Image(voter.photoBase64, {
               folder: `voter-list/${id}`,
@@ -834,6 +894,8 @@ app.post("/sessions/:id/resume", authenticate, adminOnly, async (req, res) => {
           }
         }
 
+        const cleanVoterId = sanitizeVoterId(voter.voterId);
+
         await query(
           "INSERT INTO session_voters (session_id, page_id, page_number, assembly, part_number, section, serial_number, voter_id, name, relation_type, relation_name, house_number, age, gender, religion, photo_url) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)",
           [
@@ -844,7 +906,7 @@ app.post("/sessions/:id/resume", authenticate, adminOnly, async (req, res) => {
             partNumber,
             section,
             voter.serialNumber || "",
-            voter.voterId || "",
+            cleanVoterId,
             voter.name || "",
             voter.relationType || "",
             voter.relationName || "",
