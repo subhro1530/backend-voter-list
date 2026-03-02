@@ -139,7 +139,7 @@ const upload = multer({
       cb(null, true);
     }
   },
-  limits: { fileSize: 25 * 1024 * 1024 },
+  limits: { fileSize: 50 * 1024 * 1024 },
 });
 
 function buildVoterFilter(params, startIndex = 1) {
