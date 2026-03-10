@@ -225,6 +225,74 @@ END $$;
 -- Create indexes after columns are ensured to exist
 CREATE INDEX IF NOT EXISTS idx_session_voters_religion ON session_voters(religion);
 CREATE INDEX IF NOT EXISTS idx_session_voters_is_printed ON session_voters(is_printed);
+
+-- ============================================
+-- AFFIDAVIT / NOMINATION PAPER TABLES
+-- ============================================
+
+-- Affidavit sessions (one per uploaded PDF)
+CREATE TABLE IF NOT EXISTS affidavit_sessions (
+  id UUID PRIMARY KEY,
+  original_filename TEXT,
+  candidate_name TEXT,
+  party TEXT,
+  constituency TEXT,
+  state TEXT,
+  status TEXT DEFAULT 'processing',
+  total_pages INT DEFAULT 0,
+  processed_pages INT DEFAULT 0,
+  created_at TIMESTAMPTZ DEFAULT now(),
+  updated_at TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_affidavit_sessions_candidate ON affidavit_sessions(candidate_name);
+CREATE INDEX IF NOT EXISTS idx_affidavit_sessions_party ON affidavit_sessions(party);
+CREATE INDEX IF NOT EXISTS idx_affidavit_sessions_constituency ON affidavit_sessions(constituency);
+
+-- Affidavit pages (one per PDF page)
+CREATE TABLE IF NOT EXISTS affidavit_pages (
+  id BIGSERIAL PRIMARY KEY,
+  session_id UUID REFERENCES affidavit_sessions(id) ON DELETE CASCADE,
+  page_number INT NOT NULL,
+  page_path TEXT NOT NULL,
+  raw_text TEXT,
+  structured_json JSONB,
+  created_at TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_affidavit_pages_session_id ON affidavit_pages(session_id);
+
+-- Dynamic affidavit entries (key-value pairs extracted from OCR)
+-- This allows any field from any affidavit format to be stored
+CREATE TABLE IF NOT EXISTS affidavit_entries (
+  id BIGSERIAL PRIMARY KEY,
+  session_id UUID REFERENCES affidavit_sessions(id) ON DELETE CASCADE,
+  page_id BIGINT REFERENCES affidavit_pages(id) ON DELETE CASCADE,
+  page_number INT,
+  field_name TEXT NOT NULL,
+  field_value TEXT,
+  field_category TEXT DEFAULT 'general',
+  created_at TIMESTAMPTZ DEFAULT now(),
+  UNIQUE(session_id, field_name)
+);
+
+CREATE INDEX IF NOT EXISTS idx_affidavit_entries_session_id ON affidavit_entries(session_id);
+CREATE INDEX IF NOT EXISTS idx_affidavit_entries_category ON affidavit_entries(field_category);
+CREATE INDEX IF NOT EXISTS idx_affidavit_entries_field_name ON affidavit_entries(field_name);
+
+-- Affidavit tables (proposer lists, asset tables, etc.)
+CREATE TABLE IF NOT EXISTS affidavit_tables (
+  id BIGSERIAL PRIMARY KEY,
+  session_id UUID REFERENCES affidavit_sessions(id) ON DELETE CASCADE,
+  page_id BIGINT REFERENCES affidavit_pages(id) ON DELETE CASCADE,
+  page_number INT,
+  table_title TEXT,
+  headers JSONB DEFAULT '[]',
+  rows_data JSONB DEFAULT '[]',
+  created_at TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_affidavit_tables_session_id ON affidavit_tables(session_id);
 `;
 
 async function main() {

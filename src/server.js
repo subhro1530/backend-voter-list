@@ -31,6 +31,7 @@ import authRoutes from "./routes/authRoutes.js";
 import adminRoutes from "./routes/admin.js";
 import userRoutes from "./routes/user.js";
 import electionResultRoutes from "./routes/electionResults.js";
+import affidavitRoutes from "./routes/affidavit.js";
 import {
   isCloudinaryConfigured,
   uploadBase64Image,
@@ -109,6 +110,7 @@ app.use("/auth", authRoutes);
 app.use("/admin", adminRoutes);
 app.use("/user", userRoutes);
 app.use("/election-results", electionResultRoutes);
+app.use("/affidavits", affidavitRoutes);
 
 function sessionIdMiddleware(req, _res, next) {
   req.sessionId = uuidv4();
