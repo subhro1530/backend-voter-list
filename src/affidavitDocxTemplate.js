@@ -275,6 +275,43 @@ function escapeXml(str) {
     .replace(/'/g, "&apos;");
 }
 
+/**
+ * Replace trailing dot patterns after a context marker (no contextAfter needed).
+ */
+function replaceDotsAfter(xml, contextBefore, value) {
+  if (!value) return xml;
+
+  const escBefore = contextBefore.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const dotChars = `[…\\.]+`;
+  const xmlGap = `(?:</w:t></w:r>(?:<w:proofErr[^/]*/?>)*<w:r>(?:<w:rPr>(?:[^<]|<(?!/w:rPr>))*</w:rPr>)?<w:t[^>]*>)?`;
+
+  const pattern = new RegExp(
+    `(${escBefore})((?:${dotChars}${xmlGap})*${dotChars})`,
+    "s",
+  );
+
+  const match = xml.match(pattern);
+  if (match) {
+    if (match[2].includes("</w:t>")) {
+      let dotsSection = match[2];
+      let firstRun = true;
+      dotsSection = dotsSection.replace(
+        /(<w:t[^>]*>)?([…\\.]+)(<\/w:t>)?/g,
+        (m, openTag, dots, closeTag) => {
+          if (firstRun) {
+            firstRun = false;
+            return (openTag || "") + escapeXml(value) + (closeTag || "");
+          }
+          return (openTag || "") + (closeTag || "");
+        },
+      );
+      return xml.replace(match[0], match[1] + dotsSection);
+    }
+    return xml.replace(match[0], `${match[1]}${escapeXml(value)}`);
+  }
+  return xml;
+}
+
 // ─────────────────────────────────────────────
 // MAIN: TEXT PLACEHOLDER REPLACEMENT
 // ─────────────────────────────────────────────
