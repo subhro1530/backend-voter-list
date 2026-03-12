@@ -1,0 +1,1667 @@
+/**
+ * Affidavit / Nomination Paper Routes — OCR, Database Storage, DOCX Export
+ *
+ * Full pipeline:
+ *   1. Upload affidavit PDF → split into pages
+ *   2. OCR each page via Gemini (parallel engines)
+ *   3. Parse structured data and store in PostgreSQL
+ *   4. Export as styled DOCX with tables, borders, and formatting
+ *
+ * Created by: Shaswata Saha | ssaha.vercel.app
+ */
+
+import express from "express";
+import path from "path";
+import fs from "fs-extra";
+import fsPromises from "fs/promises";
+import multer from "multer";
+import { v4 as uuidv4 } from "uuid";
+import {
+  Document,
+  Packer,
+  Paragraph,
+  TextRun,
+  Table,
+  TableRow,
+  TableCell,
+  WidthType,
+  AlignmentType,
+  BorderStyle,
+  HeadingLevel,
+  PageBreak,
+  ImageRun,
+  Header,
+  Footer,
+} from "docx";
+import { query } from "../db.js";
+import { authenticate, adminOnly } from "../auth.js";
+import { splitPdfToPages } from "../pdf.js";
+import {
+  getAffidavitOCRPrompt,
+  parseAffidavitResult,
+  mergeAffidavitPages,
+} from "../affidavitParser.js";
+import {
+  fillAffidavitTemplate,
+  templateExists,
+} from "../affidavitDocxTemplate.js";
+
+const router = express.Router();
+
+// All affidavit routes require authentication + admin
+router.use(authenticate);
+router.use(adminOnly);
+
+const storageRoot = path.join(process.cwd(), "storage", "affidavits");
+
+// Track active processing sessions
+const activeAffidavitSessions = new Map();
+
+// Prevent duplicate uploads
+const recentUploads = new Map();
+
+// ============================================
+// GEMINI ENGINE (affidavit-specific)
+// ============================================
+
+const geminiModel = process.env.GEMINI_MODEL || "gemini-2.0-pro-exp";
+
+const mimeByExt = {
+  ".png": "image/png",
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".pdf": "application/pdf",
+};
+
+function classifyGeminiError(statusCode, errorText) {
+  const lower = (errorText || "").toLowerCase();
+  if (
+    statusCode === 403 &&
+    ["quota exceeded", "daily limit", "billing", "payment required"].some((p) =>
+      lower.includes(p),
+    )
+  )
+    return "permanent";
+  if (
+    statusCode === 429 ||
+    ["rate limit", "too many requests", "resource_exhausted", "retry"].some(
+      (p) => lower.includes(p),
+    )
+  )
+    return "temporary";
+  return "other";
+}
+
+async function callGeminiForAffidavit(filePath, apiKey, pageNumber, label) {
+  const data = await fsPromises.readFile(filePath);
+  const base64 = data.toString("base64");
+  const ext = path.extname(filePath).toLowerCase();
+  const mime = mimeByExt[ext] || "application/octet-stream";
+
+  const prompt = getAffidavitOCRPrompt(pageNumber);
+
+  const payload = {
+    contents: [
+      {
+        parts: [
+          { text: prompt },
+          { inline_data: { mime_type: mime, data: base64 } },
+        ],
+      },
+    ],
+    generationConfig: {
+      temperature: 0.1,
+      topP: 0.8,
+      maxOutputTokens: 32768,
+    },
+  };
+
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${geminiModel}:generateContent?key=${apiKey}`;
+
+  console.log(`📋 ${label} sending affidavit OCR (page ${pageNumber})...`);
+
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+
+  if (!res.ok) {
+    const errorText = await res.text();
+    const errType = classifyGeminiError(res.status, errorText);
+    const err = new Error(
+      `GEMINI_${errType === "permanent" ? "EXHAUSTED" : errType === "temporary" ? "RATE_LIMITED" : "ERROR"}: ${res.status} - ${errorText.slice(0, 300)}`,
+    );
+    err.geminiErrorType = errType;
+    throw err;
+  }
+
+  const json = await res.json();
+  const parts = json?.candidates?.[0]?.content?.parts || [];
+  const combinedText = parts
+    .map((p) => (p.text ? p.text : ""))
+    .join("\n")
+    .trim();
+
+  return { text: combinedText, keyUsed: apiKey };
+}
+
+function staggeredDelay(ms) {
+  const jitter = Math.floor(Math.random() * 1500);
+  return new Promise((r) => setTimeout(r, ms + jitter));
+}
+
+// ============================================
+// PARALLEL PROCESSING ENGINE
+// ============================================
+
+async function processAffidavitPagesParallel(pagePaths, sessionId, onPageDone) {
+  const actualKeys = [];
+  const seen = new Set();
+  for (const [key, value] of Object.entries(process.env)) {
+    if (key.startsWith("GEMINI_API_KEY_") && value && value.trim()) {
+      const trimmed = value.trim();
+      if (!seen.has(trimmed)) {
+        actualKeys.push(trimmed);
+        seen.add(trimmed);
+      }
+    }
+  }
+  if (actualKeys.length === 0 && process.env.GEMINI_API_KEY) {
+    actualKeys.push(process.env.GEMINI_API_KEY.trim());
+  }
+  if (actualKeys.length === 0) {
+    throw new Error("No Gemini API keys available");
+  }
+
+  const totalKeys = actualKeys.length;
+  const RATE_LIMIT_WAIT = 20000;
+  const MAX_RETRIES = 10;
+  const STAGGER_DELAY = 1500;
+  const MAX_CONCURRENT = Math.min(
+    parseInt(process.env.AFFIDAVIT_MAX_CONCURRENT) || 3,
+    totalKeys,
+  );
+
+  const keyCooldownUntil = new Map();
+  const keyExhausted = new Set();
+
+  console.log(
+    `📋 Affidavit processing: ${pagePaths.length} pages, ${totalKeys} keys, concurrency=${MAX_CONCURRENT}`,
+  );
+
+  function pickKey(preferSlot) {
+    const now = Date.now();
+    const pref = actualKeys[preferSlot % totalKeys];
+    if (!keyExhausted.has(pref) && (keyCooldownUntil.get(pref) || 0) <= now)
+      return { key: pref, waitMs: 0 };
+
+    const offset = Math.floor(Math.random() * totalKeys);
+    for (let i = 0; i < totalKeys; i++) {
+      const k = actualKeys[(offset + i) % totalKeys];
+      if (!keyExhausted.has(k) && (keyCooldownUntil.get(k) || 0) <= now)
+        return { key: k, waitMs: 0 };
+    }
+
+    let soonest = Infinity;
+    let soonestKey = actualKeys[0];
+    for (const k of actualKeys) {
+      if (keyExhausted.has(k)) continue;
+      const until = keyCooldownUntil.get(k) || 0;
+      if (until < soonest) {
+        soonest = until;
+        soonestKey = k;
+      }
+    }
+    if (keyExhausted.size >= totalKeys)
+      return { key: actualKeys[0], waitMs: 0 };
+    return {
+      key: soonestKey,
+      waitMs: Math.max(0, soonest - Date.now()) + 2000,
+    };
+  }
+
+  async function processOnePage(pageIndex, pagePath, keySlot) {
+    let retries = 0;
+    let lastError = null;
+
+    while (retries < MAX_RETRIES) {
+      const sessionState = activeAffidavitSessions.get(sessionId);
+      if (sessionState?.stopped)
+        return { success: false, pageIndex, error: "Stopped by user" };
+
+      const { key, waitMs } = pickKey(keySlot + retries);
+      if (waitMs > 0) {
+        console.log(
+          `⏳ Affidavit page ${pageIndex + 1}: waiting ${Math.ceil(waitMs / 1000)}s...`,
+        );
+        await staggeredDelay(waitMs);
+      }
+
+      try {
+        const engineLabel = `Key-${(actualKeys.indexOf(key) % totalKeys) + 1}`;
+        const result = await callGeminiForAffidavit(
+          pagePath,
+          key,
+          pageIndex + 1,
+          engineLabel,
+        );
+        const parsed = parseAffidavitResult(result.text);
+
+        console.log(
+          `✅ Affidavit page ${pageIndex + 1}/${pagePaths.length} done`,
+        );
+
+        if (onPageDone) {
+          await onPageDone(pageIndex, pagePath, parsed, result.text);
+        }
+        return { success: true, pageIndex, parsed, rawText: result.text };
+      } catch (err) {
+        lastError = err.message;
+        retries++;
+
+        if (err.geminiErrorType === "permanent") {
+          keyExhausted.add(key);
+          await staggeredDelay(500);
+        } else if (err.geminiErrorType === "temporary") {
+          keyCooldownUntil.set(key, Date.now() + RATE_LIMIT_WAIT);
+          await staggeredDelay(RATE_LIMIT_WAIT);
+        } else {
+          await staggeredDelay(3000);
+        }
+      }
+    }
+    return {
+      success: false,
+      pageIndex,
+      error: lastError || "Max retries exceeded",
+    };
+  }
+
+  const results = [];
+  const errors = [];
+
+  // Process pages in controlled parallel batches
+  for (
+    let batchStart = 0;
+    batchStart < pagePaths.length;
+    batchStart += MAX_CONCURRENT
+  ) {
+    const sessionState = activeAffidavitSessions.get(sessionId);
+    if (sessionState?.stopped) break;
+
+    const batchEnd = Math.min(batchStart + MAX_CONCURRENT, pagePaths.length);
+    const batchPaths = pagePaths.slice(batchStart, batchEnd);
+
+    const batchPromises = batchPaths.map(async (pagePath, idx) => {
+      if (idx > 0) await new Promise((r) => setTimeout(r, STAGGER_DELAY * idx));
+      return processOnePage(batchStart + idx, pagePath, idx);
+    });
+
+    const batchResults = await Promise.all(batchPromises);
+    for (const r of batchResults) {
+      if (r.success) results.push(r);
+      else errors.push(r);
+    }
+
+    if (batchEnd < pagePaths.length) await staggeredDelay(3000);
+  }
+
+  return { results, errors };
+}
+
+// ============================================
+// DOCX GENERATION
+// ============================================
+
+/**
+ * Generate a styled DOCX from merged affidavit data.
+ * Replicates tables with proper borders, styling, headings.
+ */
+function generateAffidavitDocx(merged, rawPages, { skipRawOcr = false } = {}) {
+  const children = [];
+
+  // Title
+  children.push(
+    new Paragraph({
+      alignment: AlignmentType.CENTER,
+      spacing: { after: 100 },
+      children: [
+        new TextRun({
+          text: merged.formType || "FORM 2B",
+          bold: true,
+          size: 28,
+          font: "Times New Roman",
+        }),
+      ],
+    }),
+  );
+
+  children.push(
+    new Paragraph({
+      alignment: AlignmentType.CENTER,
+      spacing: { after: 50 },
+      children: [
+        new TextRun({
+          text: "(See rule 4)",
+          size: 20,
+          font: "Times New Roman",
+        }),
+      ],
+    }),
+  );
+
+  children.push(
+    new Paragraph({
+      alignment: AlignmentType.CENTER,
+      spacing: { after: 200 },
+      children: [
+        new TextRun({
+          text: merged.documentTitle || "NOMINATION PAPER",
+          bold: true,
+          size: 24,
+          font: "Times New Roman",
+        }),
+      ],
+    }),
+  );
+
+  // State and constituency line
+  if (merged.state || merged.constituency) {
+    children.push(
+      new Paragraph({
+        alignment: AlignmentType.CENTER,
+        spacing: { after: 200 },
+        children: [
+          new TextRun({
+            text: `Election to the Legislative Assembly of `,
+            size: 22,
+            font: "Times New Roman",
+          }),
+          new TextRun({
+            text: merged.state || "___________",
+            bold: true,
+            underline: {},
+            size: 22,
+            font: "Times New Roman",
+          }),
+          new TextRun({
+            text: " (State)",
+            size: 22,
+            font: "Times New Roman",
+          }),
+        ],
+      }),
+    );
+  }
+
+  // Sections
+  for (const section of merged.sections || []) {
+    children.push(
+      new Paragraph({
+        alignment: AlignmentType.CENTER,
+        spacing: { before: 300, after: 150 },
+        children: [
+          new TextRun({
+            text: section.sectionTitle || "",
+            bold: true,
+            size: 24,
+            font: "Times New Roman",
+          }),
+        ],
+      }),
+    );
+
+    for (const item of section.content || []) {
+      if (item.type === "text" || item.type === "field") {
+        const runs = [];
+        if (item.label) {
+          runs.push(
+            new TextRun({
+              text: `${item.label}: `,
+              bold: true,
+              size: 22,
+              font: "Times New Roman",
+            }),
+          );
+        }
+        runs.push(
+          new TextRun({
+            text: item.value || "",
+            size: 22,
+            font: "Times New Roman",
+            italics: item.handwritten || false,
+            strike: item.strikethrough || false,
+          }),
+        );
+        children.push(
+          new Paragraph({
+            spacing: { after: 100 },
+            children: runs,
+          }),
+        );
+      }
+    }
+  }
+
+  // Candidate info fields
+  const fields = merged.fields || {};
+  const fieldPairs = [
+    ["Candidate Name", fields.candidateName],
+    ["Father's/Mother's/Husband's Name", fields.fatherMotherHusbandName],
+    ["Postal Address", fields.postalAddress],
+    ["Assembly Constituency", fields.assemblyConstituency],
+    ["Serial Number", fields.serialNumber],
+    ["Part Number", fields.partNumber],
+    ["Political Party", fields.party],
+    ["Age", fields.age],
+    ["Date", fields.date],
+    ["Proposer Name", fields.proposerName],
+    ["Proposer Serial No.", fields.proposerSerialNo],
+    ["Proposer Part No.", fields.proposerPartNo],
+    ["Language", fields.language],
+  ];
+
+  const visibleFields = fieldPairs.filter(([, v]) => v);
+  if (visibleFields.length > 0) {
+    children.push(
+      new Paragraph({
+        spacing: { before: 300, after: 150 },
+        children: [
+          new TextRun({
+            text: "CANDIDATE DETAILS",
+            bold: true,
+            size: 24,
+            font: "Times New Roman",
+          }),
+        ],
+      }),
+    );
+
+    // Build a 2-column details table
+    const detailRows = visibleFields.map(
+      ([label, value]) =>
+        new TableRow({
+          children: [
+            new TableCell({
+              width: { size: 3500, type: WidthType.DXA },
+              children: [
+                new Paragraph({
+                  children: [
+                    new TextRun({
+                      text: label,
+                      bold: true,
+                      size: 20,
+                      font: "Times New Roman",
+                    }),
+                  ],
+                }),
+              ],
+            }),
+            new TableCell({
+              width: { size: 6000, type: WidthType.DXA },
+              children: [
+                new Paragraph({
+                  children: [
+                    new TextRun({
+                      text: String(value),
+                      size: 20,
+                      font: "Times New Roman",
+                    }),
+                  ],
+                }),
+              ],
+            }),
+          ],
+        }),
+    );
+
+    children.push(
+      new Table({
+        rows: detailRows,
+        width: { size: 9500, type: WidthType.DXA },
+      }),
+    );
+  }
+
+  // Tables from OCR
+  for (const table of merged.tables || []) {
+    if (table.tableTitle) {
+      children.push(
+        new Paragraph({
+          spacing: { before: 300, after: 100 },
+          children: [
+            new TextRun({
+              text: table.tableTitle,
+              bold: true,
+              size: 22,
+              font: "Times New Roman",
+            }),
+          ],
+        }),
+      );
+    }
+
+    const tableBorders = {
+      top: { style: BorderStyle.SINGLE, size: 1, color: "000000" },
+      bottom: { style: BorderStyle.SINGLE, size: 1, color: "000000" },
+      left: { style: BorderStyle.SINGLE, size: 1, color: "000000" },
+      right: { style: BorderStyle.SINGLE, size: 1, color: "000000" },
+    };
+
+    const allRows = [];
+
+    // Header row
+    if (table.headers && table.headers.length > 0) {
+      allRows.push(
+        new TableRow({
+          tableHeader: true,
+          children: table.headers.map(
+            (h) =>
+              new TableCell({
+                borders: tableBorders,
+                children: [
+                  new Paragraph({
+                    alignment: AlignmentType.CENTER,
+                    children: [
+                      new TextRun({
+                        text: h || "",
+                        bold: true,
+                        size: 18,
+                        font: "Times New Roman",
+                      }),
+                    ],
+                  }),
+                ],
+              }),
+          ),
+        }),
+      );
+    }
+
+    // Data rows
+    for (const row of table.rows || []) {
+      const cells = (Array.isArray(row) ? row : []).map(
+        (cellVal) =>
+          new TableCell({
+            borders: tableBorders,
+            children: [
+              new Paragraph({
+                alignment: AlignmentType.CENTER,
+                children: [
+                  new TextRun({
+                    text: String(cellVal ?? ""),
+                    size: 18,
+                    font: "Times New Roman",
+                  }),
+                ],
+              }),
+            ],
+          }),
+      );
+
+      if (cells.length > 0) {
+        allRows.push(new TableRow({ children: cells }));
+      }
+    }
+
+    if (allRows.length > 0) {
+      children.push(
+        new Table({
+          rows: allRows,
+          width: { size: 9500, type: WidthType.DXA },
+        }),
+      );
+    }
+  }
+
+  // Criminal record section
+  const cr = merged.criminalRecord || {};
+  const crEntries = Object.entries(cr).filter(([, v]) => v);
+  if (crEntries.length > 0) {
+    children.push(
+      new Paragraph({
+        spacing: { before: 300, after: 150 },
+        children: [
+          new TextRun({
+            text: "CRIMINAL RECORD DECLARATION",
+            bold: true,
+            size: 24,
+            font: "Times New Roman",
+          }),
+        ],
+      }),
+    );
+
+    for (const [key, value] of crEntries) {
+      const label = key
+        .replace(/([A-Z])/g, " $1")
+        .replace(/^./, (c) => c.toUpperCase())
+        .trim();
+      children.push(
+        new Paragraph({
+          spacing: { after: 50 },
+          children: [
+            new TextRun({
+              text: `${label}: `,
+              bold: true,
+              size: 20,
+              font: "Times New Roman",
+            }),
+            new TextRun({
+              text: String(value),
+              size: 20,
+              font: "Times New Roman",
+            }),
+          ],
+        }),
+      );
+    }
+  }
+
+  // Other declaration sections
+  const declarationSections = [
+    { key: "officeOfProfit", title: "OFFICE OF PROFIT" },
+    { key: "insolvency", title: "INSOLVENCY" },
+    { key: "foreignAllegiance", title: "FOREIGN ALLEGIANCE" },
+    { key: "disqualification", title: "DISQUALIFICATION" },
+    {
+      key: "dismissalForCorruption",
+      title: "DISMISSAL FOR CORRUPTION/DISLOYALTY",
+    },
+    { key: "governmentContracts", title: "GOVERNMENT CONTRACTS" },
+  ];
+
+  for (const { key, title } of declarationSections) {
+    const entries = Object.entries(merged[key] || {}).filter(([, v]) => v);
+    if (entries.length > 0) {
+      children.push(
+        new Paragraph({
+          spacing: { before: 200, after: 100 },
+          children: [
+            new TextRun({
+              text: title,
+              bold: true,
+              size: 22,
+              font: "Times New Roman",
+            }),
+          ],
+        }),
+      );
+      for (const [k, v] of entries) {
+        const label = k
+          .replace(/([A-Z])/g, " $1")
+          .replace(/^./, (c) => c.toUpperCase())
+          .trim();
+        children.push(
+          new Paragraph({
+            spacing: { after: 50 },
+            children: [
+              new TextRun({
+                text: `${label}: `,
+                bold: true,
+                size: 20,
+                font: "Times New Roman",
+              }),
+              new TextRun({
+                text: String(v),
+                size: 20,
+                font: "Times New Roman",
+              }),
+            ],
+          }),
+        );
+      }
+    }
+  }
+
+  // Assets section
+  const assets = merged.assets || {};
+  const movableEntries = Object.entries(assets.movable || {}).filter(
+    ([, v]) => v,
+  );
+  const immovableEntries = Object.entries(assets.immovable || {}).filter(
+    ([, v]) => v,
+  );
+
+  if (movableEntries.length > 0 || immovableEntries.length > 0) {
+    children.push(
+      new Paragraph({
+        spacing: { before: 300, after: 150 },
+        children: [
+          new TextRun({
+            text: "ASSETS",
+            bold: true,
+            size: 24,
+            font: "Times New Roman",
+          }),
+        ],
+      }),
+    );
+
+    if (movableEntries.length > 0) {
+      children.push(
+        new Paragraph({
+          spacing: { after: 100 },
+          children: [
+            new TextRun({
+              text: "Movable Assets:",
+              bold: true,
+              size: 22,
+              font: "Times New Roman",
+            }),
+          ],
+        }),
+      );
+      for (const [k, v] of movableEntries) {
+        const label = k
+          .replace(/([A-Z])/g, " $1")
+          .replace(/^./, (c) => c.toUpperCase())
+          .trim();
+        children.push(
+          new Paragraph({
+            indent: { left: 400 },
+            spacing: { after: 50 },
+            children: [
+              new TextRun({
+                text: `${label}: `,
+                bold: true,
+                size: 20,
+                font: "Times New Roman",
+              }),
+              new TextRun({
+                text: String(v),
+                size: 20,
+                font: "Times New Roman",
+              }),
+            ],
+          }),
+        );
+      }
+    }
+
+    if (immovableEntries.length > 0) {
+      children.push(
+        new Paragraph({
+          spacing: { after: 100 },
+          children: [
+            new TextRun({
+              text: "Immovable Assets:",
+              bold: true,
+              size: 22,
+              font: "Times New Roman",
+            }),
+          ],
+        }),
+      );
+      for (const [k, v] of immovableEntries) {
+        const label = k
+          .replace(/([A-Z])/g, " $1")
+          .replace(/^./, (c) => c.toUpperCase())
+          .trim();
+        children.push(
+          new Paragraph({
+            indent: { left: 400 },
+            spacing: { after: 50 },
+            children: [
+              new TextRun({
+                text: `${label}: `,
+                bold: true,
+                size: 20,
+                font: "Times New Roman",
+              }),
+              new TextRun({
+                text: String(v),
+                size: 20,
+                font: "Times New Roman",
+              }),
+            ],
+          }),
+        );
+      }
+    }
+  }
+
+  // Liabilities section
+  const liabEntries = Object.entries(merged.liabilities || {}).filter(
+    ([, v]) => v,
+  );
+  if (liabEntries.length > 0) {
+    children.push(
+      new Paragraph({
+        spacing: { before: 300, after: 150 },
+        children: [
+          new TextRun({
+            text: "LIABILITIES",
+            bold: true,
+            size: 24,
+            font: "Times New Roman",
+          }),
+        ],
+      }),
+    );
+    for (const [k, v] of liabEntries) {
+      const label = k
+        .replace(/([A-Z])/g, " $1")
+        .replace(/^./, (c) => c.toUpperCase())
+        .trim();
+      children.push(
+        new Paragraph({
+          spacing: { after: 50 },
+          children: [
+            new TextRun({
+              text: `${label}: `,
+              bold: true,
+              size: 20,
+              font: "Times New Roman",
+            }),
+            new TextRun({ text: String(v), size: 20, font: "Times New Roman" }),
+          ],
+        }),
+      );
+    }
+  }
+
+  // Raw text pages as appendix
+  if (rawPages && rawPages.length > 0 && !skipRawOcr) {
+    children.push(
+      new Paragraph({
+        spacing: { before: 400, after: 200 },
+        children: [
+          new TextRun({ break: 1 }),
+          new TextRun({
+            text: "─── RAW OCR TEXT (APPENDIX) ───",
+            bold: true,
+            size: 22,
+            font: "Times New Roman",
+            color: "666666",
+          }),
+        ],
+      }),
+    );
+
+    for (const page of rawPages) {
+      children.push(
+        new Paragraph({
+          spacing: { before: 200, after: 100 },
+          children: [
+            new TextRun({
+              text: `Page ${page.pageNumber}:`,
+              bold: true,
+              size: 20,
+              font: "Times New Roman",
+              color: "333333",
+            }),
+          ],
+        }),
+      );
+
+      const rawText =
+        page.structured_json?.rawText || page.raw_text || "(no text)";
+      const lines = rawText.split("\n");
+      for (const line of lines) {
+        children.push(
+          new Paragraph({
+            spacing: { after: 30 },
+            children: [
+              new TextRun({
+                text: line,
+                size: 18,
+                font: "Courier New",
+                color: "444444",
+              }),
+            ],
+          }),
+        );
+      }
+    }
+  }
+
+  const doc = new Document({
+    sections: [
+      {
+        properties: {
+          page: {
+            margin: {
+              top: 720, // 0.5 inch
+              bottom: 720,
+              left: 1080, // 0.75 inch
+              right: 1080,
+            },
+          },
+        },
+        children,
+      },
+    ],
+  });
+
+  return doc;
+}
+
+// ============================================
+// MULTER CONFIG
+// ============================================
+
+const affidavitUpload = multer({
+  storage: multer.diskStorage({
+    destination: (req, _file, cb) => {
+      const sessionId = req.affidavitSessionId || uuidv4();
+      req.affidavitSessionId = sessionId;
+      const dest = path.join(storageRoot, sessionId, "pdf");
+      try {
+        fs.ensureDirSync(dest);
+        cb(null, dest);
+      } catch (err) {
+        cb(err);
+      }
+    },
+    filename: (_req, file, cb) => {
+      cb(null, file.originalname || "affidavit.pdf");
+    },
+  }),
+  fileFilter: (_req, file, cb) => {
+    if (file.mimetype !== "application/pdf") {
+      cb(new Error("Only PDF uploads are allowed"));
+    } else {
+      cb(null, true);
+    }
+  },
+  limits: { fileSize: 50 * 1024 * 1024 },
+});
+
+// ============================================
+// UPLOAD & PROCESS
+// ============================================
+
+router.post(
+  "/upload",
+  (req, _res, next) => {
+    req.affidavitSessionId = uuidv4();
+    next();
+  },
+  affidavitUpload.single("file"),
+  async (req, res) => {
+    const sessionId = req.affidavitSessionId;
+    const pdfPath = req.file?.path;
+    const originalName = req.file?.originalname || "affidavit.pdf";
+
+    if (!pdfPath) {
+      return res.status(400).json({ error: "PDF file is required" });
+    }
+
+    // Prevent rapid duplicate uploads
+    const lastUpload = recentUploads.get(originalName);
+    if (lastUpload && Date.now() - lastUpload < 30000) {
+      return res.status(429).json({
+        error:
+          "This file was just uploaded. Please wait before uploading again.",
+      });
+    }
+    recentUploads.set(originalName, Date.now());
+    for (const [name, ts] of recentUploads) {
+      if (Date.now() - ts > 60000) recentUploads.delete(name);
+    }
+
+    try {
+      // Create session
+      await query(
+        `INSERT INTO affidavit_sessions
+         (id, original_filename, status, processed_pages, total_pages)
+         VALUES ($1, $2, 'processing', 0, 0)`,
+        [sessionId, originalName],
+      );
+
+      // Split PDF
+      const pageDir = path.join(storageRoot, sessionId, "pages");
+      const pagePaths = await splitPdfToPages(pdfPath, pageDir);
+
+      await query(
+        "UPDATE affidavit_sessions SET total_pages=$1, updated_at=now() WHERE id=$2",
+        [pagePaths.length, sessionId],
+      );
+
+      // Return immediately
+      res.status(201).json({
+        sessionId,
+        originalFilename: originalName,
+        totalPages: pagePaths.length,
+        status: "processing",
+        message: `Processing ${pagePaths.length} pages in background`,
+      });
+
+      // ---- Background processing ----
+      activeAffidavitSessions.set(sessionId, { stopped: false });
+
+      let processedCount = 0;
+      const allPageResults = [];
+
+      const onPageDone = async (pageIndex, pagePath, parsed, rawText) => {
+        try {
+          const pageRes = await query(
+            `INSERT INTO affidavit_pages
+             (session_id, page_number, page_path, raw_text, structured_json)
+             VALUES ($1, $2, $3, $4, $5) RETURNING id`,
+            [
+              sessionId,
+              pageIndex + 1,
+              pagePath,
+              rawText,
+              JSON.stringify(parsed),
+            ],
+          );
+          const pageId = pageRes.rows[0].id;
+
+          // Extract and save dynamic field entries
+          const allFields = {};
+
+          // Gather from fields
+          if (parsed.fields) {
+            for (const [k, v] of Object.entries(parsed.fields)) {
+              if (v !== undefined && v !== null && v !== "")
+                allFields[k] = String(v);
+            }
+          }
+
+          // Gather from criminal record
+          if (parsed.criminalRecord) {
+            for (const [k, v] of Object.entries(parsed.criminalRecord)) {
+              if (v) allFields[`criminal_${k}`] = String(v);
+            }
+          }
+
+          // Gather from other declaration sections
+          const sections = [
+            "officeOfProfit",
+            "insolvency",
+            "foreignAllegiance",
+            "disqualification",
+            "dismissalForCorruption",
+            "governmentContracts",
+          ];
+          for (const sec of sections) {
+            if (parsed[sec]) {
+              for (const [k, v] of Object.entries(parsed[sec])) {
+                if (v) allFields[`${sec}_${k}`] = String(v);
+              }
+            }
+          }
+
+          // Gather assets
+          if (parsed.assets) {
+            if (parsed.assets.movable) {
+              for (const [k, v] of Object.entries(parsed.assets.movable)) {
+                if (v) allFields[`asset_movable_${k}`] = String(v);
+              }
+            }
+            if (parsed.assets.immovable) {
+              for (const [k, v] of Object.entries(parsed.assets.immovable)) {
+                if (v) allFields[`asset_immovable_${k}`] = String(v);
+              }
+            }
+          }
+
+          // Gather liabilities
+          if (parsed.liabilities) {
+            for (const [k, v] of Object.entries(parsed.liabilities)) {
+              if (v) allFields[`liability_${k}`] = String(v);
+            }
+          }
+
+          // Save all fields dynamically
+          for (const [fieldName, fieldValue] of Object.entries(allFields)) {
+            await query(
+              `INSERT INTO affidavit_entries
+               (session_id, page_id, page_number, field_name, field_value, field_category)
+               VALUES ($1, $2, $3, $4, $5, $6)
+               ON CONFLICT (session_id, field_name) DO UPDATE SET
+                 field_value = EXCLUDED.field_value,
+                 page_id = EXCLUDED.page_id,
+                 page_number = EXCLUDED.page_number`,
+              [
+                sessionId,
+                pageId,
+                pageIndex + 1,
+                fieldName,
+                fieldValue,
+                categorizeField(fieldName),
+              ],
+            );
+          }
+
+          // Save tables as JSONB
+          if (parsed.tables && parsed.tables.length > 0) {
+            for (const table of parsed.tables) {
+              await query(
+                `INSERT INTO affidavit_tables
+                 (session_id, page_id, page_number, table_title, headers, rows_data)
+                 VALUES ($1, $2, $3, $4, $5, $6)`,
+                [
+                  sessionId,
+                  pageId,
+                  pageIndex + 1,
+                  table.tableTitle || "",
+                  JSON.stringify(table.headers || []),
+                  JSON.stringify(table.rows || []),
+                ],
+              );
+            }
+          }
+
+          // Update session metadata from first meaningful page
+          if (parsed.fields) {
+            const updates = [];
+            const vals = [];
+            let idx = 1;
+
+            if (parsed.fields.candidateName) {
+              updates.push(
+                `candidate_name = COALESCE(NULLIF(candidate_name,''), $${idx})`,
+              );
+              vals.push(parsed.fields.candidateName);
+              idx++;
+            }
+            if (parsed.fields.party) {
+              updates.push(`party = COALESCE(NULLIF(party,''), $${idx})`);
+              vals.push(parsed.fields.party);
+              idx++;
+            }
+            if (parsed.constituency || parsed.fields.assemblyConstituency) {
+              updates.push(
+                `constituency = COALESCE(NULLIF(constituency,''), $${idx})`,
+              );
+              vals.push(
+                parsed.fields.assemblyConstituency || parsed.constituency || "",
+              );
+              idx++;
+            }
+            if (parsed.state) {
+              updates.push(`state = COALESCE(NULLIF(state,''), $${idx})`);
+              vals.push(parsed.state);
+              idx++;
+            }
+
+            if (updates.length > 0) {
+              vals.push(sessionId);
+              await query(
+                `UPDATE affidavit_sessions SET ${updates.join(", ")}, updated_at=now() WHERE id=$${idx}`,
+                vals,
+              );
+            }
+          }
+
+          processedCount++;
+          allPageResults[pageIndex] = parsed;
+
+          await query(
+            "UPDATE affidavit_sessions SET processed_pages=$1, updated_at=now() WHERE id=$2",
+            [processedCount, sessionId],
+          );
+
+          console.log(
+            `✅ Affidavit page ${pageIndex + 1} saved (${Object.keys(allFields).length} fields)`,
+          );
+        } catch (dbErr) {
+          console.error(
+            `❌ DB save error for affidavit page ${pageIndex + 1}:`,
+            dbErr.message,
+          );
+        }
+      };
+
+      const { results, errors } = await processAffidavitPagesParallel(
+        pagePaths,
+        sessionId,
+        onPageDone,
+      );
+
+      // Merge all pages
+      const validResults = allPageResults.filter(Boolean);
+      const merged = mergeAffidavitPages(validResults);
+
+      let finalStatus = "completed";
+      if (results.length === 0 && errors.length > 0) finalStatus = "failed";
+      else if (errors.length > 0) finalStatus = "partial";
+
+      await query(
+        `UPDATE affidavit_sessions
+         SET status=$1, processed_pages=$2, updated_at=now()
+         WHERE id=$3`,
+        [finalStatus, processedCount, sessionId],
+      );
+
+      activeAffidavitSessions.delete(sessionId);
+      console.log(
+        `📋 Affidavit session ${sessionId} done [${finalStatus}] — ${results.length}/${pagePaths.length} pages OK`,
+      );
+    } catch (err) {
+      activeAffidavitSessions.delete(sessionId);
+      await query(
+        "UPDATE affidavit_sessions SET status='failed', updated_at=now() WHERE id=$1",
+        [sessionId],
+      ).catch(() => {});
+      console.error("Affidavit processing failed:", err.message);
+    }
+  },
+);
+
+// ============================================
+// STOP PROCESSING
+// ============================================
+
+router.post("/sessions/:id/stop", async (req, res) => {
+  const { id } = req.params;
+  const sessionState = activeAffidavitSessions.get(id);
+  if (!sessionState) {
+    return res
+      .status(404)
+      .json({ error: "No active processing for this session" });
+  }
+  sessionState.stopped = true;
+  await query(
+    "UPDATE affidavit_sessions SET status='paused', updated_at=now() WHERE id=$1",
+    [id],
+  );
+  res.json({ message: "Processing stopped", sessionId: id });
+});
+
+// ============================================
+// LIST SESSIONS
+// ============================================
+
+router.get("/sessions", async (_req, res) => {
+  try {
+    const sql = `
+      SELECT s.id, s.original_filename, s.candidate_name, s.party,
+             s.constituency, s.state, s.status,
+             s.total_pages, s.processed_pages,
+             s.created_at, s.updated_at,
+             COUNT(DISTINCT e.id) AS field_count,
+             COUNT(DISTINCT t.id) AS table_count
+      FROM affidavit_sessions s
+      LEFT JOIN affidavit_entries e ON e.session_id = s.id
+      LEFT JOIN affidavit_tables t ON t.session_id = s.id
+      GROUP BY s.id
+      ORDER BY s.created_at DESC;
+    `;
+    const result = await query(sql);
+    res.json({ sessions: result.rows });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ============================================
+// SESSION DETAIL
+// ============================================
+
+router.get("/sessions/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const session = await query(
+      "SELECT * FROM affidavit_sessions WHERE id=$1",
+      [id],
+    );
+    if (session.rowCount === 0)
+      return res.status(404).json({ error: "Session not found" });
+
+    const pages = await query(
+      `SELECT id, page_number, page_path, raw_text, structured_json, created_at
+       FROM affidavit_pages WHERE session_id=$1
+       ORDER BY page_number`,
+      [id],
+    );
+
+    const entries = await query(
+      `SELECT id, page_number, field_name, field_value, field_category, created_at
+       FROM affidavit_entries WHERE session_id=$1 ORDER BY field_category, field_name`,
+      [id],
+    );
+
+    const tables = await query(
+      `SELECT id, page_number, table_title, headers, rows_data, created_at
+       FROM affidavit_tables WHERE session_id=$1 ORDER BY page_number`,
+      [id],
+    );
+
+    // Group entries by category
+    const entriesByCategory = {};
+    for (const entry of entries.rows) {
+      const cat = entry.field_category || "general";
+      if (!entriesByCategory[cat]) entriesByCategory[cat] = [];
+      entriesByCategory[cat].push(entry);
+    }
+
+    res.json({
+      session: session.rows[0],
+      pages: pages.rows,
+      entries: entries.rows,
+      entriesByCategory,
+      tables: tables.rows,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ============================================
+// DELETE SESSION
+// ============================================
+
+router.delete("/sessions/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const sessionState = activeAffidavitSessions.get(id);
+    if (sessionState) sessionState.stopped = true;
+
+    const deleted = await query(
+      "DELETE FROM affidavit_sessions WHERE id=$1 RETURNING id",
+      [id],
+    );
+    if (deleted.rowCount === 0)
+      return res.status(404).json({ error: "Session not found" });
+
+    const dir = path.join(storageRoot, id);
+    await fs.remove(dir).catch(() => {});
+
+    res.json({ deleted: id, message: "Affidavit session deleted" });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ============================================
+// RENAME SESSION
+// ============================================
+
+router.patch("/sessions/:id/rename", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { name } = req.body;
+    if (!name || !name.trim())
+      return res.status(400).json({ error: "Name is required" });
+
+    const updated = await query(
+      "UPDATE affidavit_sessions SET original_filename=$1, updated_at=now() WHERE id=$2 RETURNING id, original_filename",
+      [name.trim(), id],
+    );
+    if (updated.rowCount === 0)
+      return res.status(404).json({ error: "Session not found" });
+
+    res.json({
+      sessionId: id,
+      name: updated.rows[0].original_filename,
+      message: "Renamed successfully",
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ============================================
+// EXPORT AS DOCX
+// ============================================
+
+router.get("/sessions/:id/export/docx", async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const session = await query(
+      "SELECT * FROM affidavit_sessions WHERE id=$1",
+      [id],
+    );
+    if (session.rowCount === 0)
+      return res.status(404).json({ error: "Session not found" });
+
+    const pages = await query(
+      `SELECT page_number, raw_text, structured_json
+       FROM affidavit_pages WHERE session_id=$1
+       ORDER BY page_number`,
+      [id],
+    );
+
+    const entries = await query(
+      `SELECT field_name, field_value, field_category
+       FROM affidavit_entries WHERE session_id=$1
+       ORDER BY field_category, field_name`,
+      [id],
+    );
+
+    const tables = await query(
+      `SELECT table_title, headers, rows_data, page_number
+       FROM affidavit_tables WHERE session_id=$1
+       ORDER BY page_number`,
+      [id],
+    );
+
+    // Build merged data for DOCX generation
+    const parsedPages = pages.rows.map((p) => {
+      const json =
+        typeof p.structured_json === "string"
+          ? JSON.parse(p.structured_json)
+          : p.structured_json || {};
+      return json;
+    });
+
+    const merged = mergeAffidavitPages(parsedPages);
+
+    // If merged has no tables from parsing, use DB tables
+    if (
+      (!merged.tables || merged.tables.length === 0) &&
+      tables.rows.length > 0
+    ) {
+      merged.tables = tables.rows.map((t) => ({
+        tableTitle: t.table_title,
+        headers:
+          typeof t.headers === "string" ? JSON.parse(t.headers) : t.headers,
+        rows:
+          typeof t.rows_data === "string"
+            ? JSON.parse(t.rows_data)
+            : t.rows_data,
+      }));
+    }
+
+    // If merged has no fields, reconstruct from entries
+    if (
+      Object.keys(merged.fields || {}).length === 0 &&
+      entries.rows.length > 0
+    ) {
+      merged.fields = {};
+      for (const entry of entries.rows) {
+        merged.fields[entry.field_name] = entry.field_value;
+      }
+    }
+
+    const useTemplate = req.query.legacy !== "true" && templateExists();
+    let buffer;
+
+    if (useTemplate) {
+      // Template-based export: fills the original Form 26 DOCX template
+      // Preserves all original formatting, borders, fonts, and layout
+      console.log("📋 Using template-based DOCX export");
+      buffer = await fillAffidavitTemplate(merged);
+    } else {
+      // Legacy: build DOCX from scratch using docx library
+      const skipRawOcr = req.query.skipRawOcr === "true";
+      const doc = generateAffidavitDocx(merged, pages.rows, { skipRawOcr });
+      buffer = await Packer.toBuffer(doc);
+    }
+
+    const filename = session.rows[0].candidate_name
+      ? `Affidavit_${session.rows[0].candidate_name.replace(/[^a-zA-Z0-9]/g, "_")}.docx`
+      : `Affidavit_${id.slice(0, 8)}.docx`;
+
+    res.setHeader(
+      "Content-Type",
+      "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    );
+    res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+    res.send(buffer);
+  } catch (err) {
+    console.error("DOCX export error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ============================================
+// SESSION STATUS (for polling progress)
+// ============================================
+
+router.get("/sessions/:id/status", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const session = await query(
+      `SELECT id, status, total_pages, processed_pages, candidate_name, party,
+              constituency, state, created_at, updated_at
+       FROM affidavit_sessions WHERE id=$1`,
+      [id],
+    );
+    if (session.rowCount === 0)
+      return res.status(404).json({ error: "Session not found" });
+
+    const fieldCount = await query(
+      "SELECT COUNT(*)::int AS count FROM affidavit_entries WHERE session_id=$1",
+      [id],
+    );
+
+    const s = session.rows[0];
+    res.json({
+      sessionId: id,
+      status: s.status,
+      totalPages: s.total_pages,
+      processedPages: s.processed_pages,
+      candidateName: s.candidate_name,
+      party: s.party,
+      constituency: s.constituency,
+      state: s.state,
+      fieldCount: fieldCount.rows[0].count,
+      isProcessing: activeAffidavitSessions.has(id),
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ============================================
+// SEARCH ACROSS ALL AFFIDAVITS
+// ============================================
+
+router.get("/search", async (req, res) => {
+  try {
+    const { candidate, party, constituency, state } = req.query;
+    const where = [];
+    const values = [];
+    let idx = 1;
+
+    if (candidate) {
+      where.push(`LOWER(candidate_name) LIKE $${idx}`);
+      values.push(`%${candidate.toLowerCase()}%`);
+      idx++;
+    }
+    if (party) {
+      where.push(`LOWER(party) LIKE $${idx}`);
+      values.push(`%${party.toLowerCase()}%`);
+      idx++;
+    }
+    if (constituency) {
+      where.push(`LOWER(constituency) LIKE $${idx}`);
+      values.push(`%${constituency.toLowerCase()}%`);
+      idx++;
+    }
+    if (state) {
+      where.push(`LOWER(state) LIKE $${idx}`);
+      values.push(`%${state.toLowerCase()}%`);
+      idx++;
+    }
+
+    const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : "";
+    const sql = `
+      SELECT id, original_filename, candidate_name, party,
+             constituency, state, status,
+             total_pages, processed_pages, created_at
+      FROM affidavit_sessions
+      ${whereSql}
+      ORDER BY created_at DESC
+      LIMIT 100;
+    `;
+    const result = await query(sql, values);
+    res.json({ sessions: result.rows });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ============================================
+// GET ENTRIES FOR A SESSION (dynamic columns)
+// ============================================
+
+router.get("/sessions/:id/entries", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { category } = req.query;
+
+    let sql = `SELECT * FROM affidavit_entries WHERE session_id=$1`;
+    const values = [id];
+
+    if (category) {
+      sql += ` AND field_category=$2`;
+      values.push(category);
+    }
+
+    sql += ` ORDER BY field_category, field_name`;
+
+    const result = await query(sql, values);
+
+    // Get unique categories
+    const categories = [...new Set(result.rows.map((r) => r.field_category))];
+
+    res.json({
+      entries: result.rows,
+      categories,
+      total: result.rowCount,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ============================================
+// HELPER: Categorize field names
+// ============================================
+
+function categorizeField(fieldName) {
+  if (fieldName.startsWith("criminal_")) return "criminal_record";
+  if (fieldName.startsWith("officeOfProfit_")) return "office_of_profit";
+  if (fieldName.startsWith("insolvency_")) return "insolvency";
+  if (fieldName.startsWith("foreignAllegiance_")) return "foreign_allegiance";
+  if (fieldName.startsWith("disqualification_")) return "disqualification";
+  if (fieldName.startsWith("dismissalForCorruption_"))
+    return "dismissal_corruption";
+  if (fieldName.startsWith("governmentContracts_"))
+    return "government_contracts";
+  if (fieldName.startsWith("asset_movable_")) return "assets_movable";
+  if (fieldName.startsWith("asset_immovable_")) return "assets_immovable";
+  if (fieldName.startsWith("liability_")) return "liabilities";
+  if (
+    [
+      "candidateName",
+      "fatherMotherHusbandName",
+      "postalAddress",
+      "serialNumber",
+      "partNumber",
+      "assemblyConstituency",
+      "party",
+      "age",
+      "date",
+      "language",
+    ].includes(fieldName)
+  )
+    return "candidate_info";
+  if (
+    ["proposerName", "proposerSerialNo", "proposerPartNo"].includes(fieldName)
+  )
+    return "proposer_info";
+  return "general";
+}
+
+export default router;

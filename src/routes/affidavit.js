@@ -1,46 +1,22 @@
 /**
- * Affidavit / Nomination Paper Routes — OCR, Database Storage, DOCX Export
+ * Affidavit Routes — Manual Entry, Database Storage, DOCX Export
  *
- * Full pipeline:
- *   1. Upload affidavit PDF → split into pages
- *   2. OCR each page via Gemini (parallel engines)
- *   3. Parse structured data and store in PostgreSQL
- *   4. Export as styled DOCX with tables, borders, and formatting
+ * Admin-only endpoints for:
+ *   1. Manual entry of all affidavit (Form 26) fields
+ *   2. Store structured data in PostgreSQL
+ *   3. Export as DOCX using the original template with exact formatting
  *
  * Created by: Shaswata Saha | ssaha.vercel.app
  */
 
 import express from "express";
-import path from "path";
-import fs from "fs-extra";
-import fsPromises from "fs/promises";
-import multer from "multer";
 import { v4 as uuidv4 } from "uuid";
-import {
-  Document,
-  Packer,
-  Paragraph,
-  TextRun,
-  Table,
-  TableRow,
-  TableCell,
-  WidthType,
-  AlignmentType,
-  BorderStyle,
-  HeadingLevel,
-  PageBreak,
-  ImageRun,
-  Header,
-  Footer,
-} from "docx";
 import { query } from "../db.js";
 import { authenticate, adminOnly } from "../auth.js";
-import { splitPdfToPages } from "../pdf.js";
 import {
-  getAffidavitOCRPrompt,
-  parseAffidavitResult,
-  mergeAffidavitPages,
-} from "../affidavitParser.js";
+  fillAffidavitTemplate,
+  templateExists,
+} from "../affidavitDocxTemplate.js";
 
 const router = express.Router();
 
@@ -48,1216 +24,123 @@ const router = express.Router();
 router.use(authenticate);
 router.use(adminOnly);
 
-const storageRoot = path.join(process.cwd(), "storage", "affidavits");
-
-// Track active processing sessions
-const activeAffidavitSessions = new Map();
-
-// Prevent duplicate uploads
-const recentUploads = new Map();
-
 // ============================================
-// GEMINI ENGINE (affidavit-specific)
+// MANUAL ENTRY — Create / Update Affidavit
 // ============================================
 
-const geminiModel = process.env.GEMINI_MODEL || "gemini-2.0-pro-exp";
+router.post("/manual-entry", async (req, res) => {
+  try {
+    const data = req.body || {};
+    const sessionId = data.sessionId || uuidv4();
+    const isUpdate = !!data.sessionId;
 
-const mimeByExt = {
-  ".png": "image/png",
-  ".jpg": "image/jpeg",
-  ".jpeg": "image/jpeg",
-  ".pdf": "application/pdf",
-};
+    const candidateName = data.candidateName || "";
+    const party = data.party || "";
+    const constituency = data.constituency || data.assemblyConstituency || "";
+    const state = data.state || "";
 
-function classifyGeminiError(statusCode, errorText) {
-  const lower = (errorText || "").toLowerCase();
-  if (
-    statusCode === 403 &&
-    ["quota exceeded", "daily limit", "billing", "payment required"].some((p) =>
-      lower.includes(p),
-    )
-  )
-    return "permanent";
-  if (
-    statusCode === 429 ||
-    ["rate limit", "too many requests", "resource_exhausted", "retry"].some(
-      (p) => lower.includes(p),
-    )
-  )
-    return "temporary";
-  return "other";
-}
+    const formData = buildAffidavitFormData(data);
 
-async function callGeminiForAffidavit(filePath, apiKey, pageNumber, label) {
-  const data = await fsPromises.readFile(filePath);
-  const base64 = data.toString("base64");
-  const ext = path.extname(filePath).toLowerCase();
-  const mime = mimeByExt[ext] || "application/octet-stream";
-
-  const prompt = getAffidavitOCRPrompt(pageNumber);
-
-  const payload = {
-    contents: [
-      {
-        parts: [
-          { text: prompt },
-          { inline_data: { mime_type: mime, data: base64 } },
-        ],
-      },
-    ],
-    generationConfig: {
-      temperature: 0.1,
-      topP: 0.8,
-      maxOutputTokens: 32768,
-    },
-  };
-
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${geminiModel}:generateContent?key=${apiKey}`;
-
-  console.log(`📋 ${label} sending affidavit OCR (page ${pageNumber})...`);
-
-  const res = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  });
-
-  if (!res.ok) {
-    const errorText = await res.text();
-    const errType = classifyGeminiError(res.status, errorText);
-    const err = new Error(
-      `GEMINI_${errType === "permanent" ? "EXHAUSTED" : errType === "temporary" ? "RATE_LIMITED" : "ERROR"}: ${res.status} - ${errorText.slice(0, 300)}`,
-    );
-    err.geminiErrorType = errType;
-    throw err;
-  }
-
-  const json = await res.json();
-  const parts = json?.candidates?.[0]?.content?.parts || [];
-  const combinedText = parts
-    .map((p) => (p.text ? p.text : ""))
-    .join("\n")
-    .trim();
-
-  return { text: combinedText, keyUsed: apiKey };
-}
-
-function staggeredDelay(ms) {
-  const jitter = Math.floor(Math.random() * 1500);
-  return new Promise((r) => setTimeout(r, ms + jitter));
-}
-
-// ============================================
-// PARALLEL PROCESSING ENGINE
-// ============================================
-
-async function processAffidavitPagesParallel(pagePaths, sessionId, onPageDone) {
-  const actualKeys = [];
-  const seen = new Set();
-  for (const [key, value] of Object.entries(process.env)) {
-    if (key.startsWith("GEMINI_API_KEY_") && value && value.trim()) {
-      const trimmed = value.trim();
-      if (!seen.has(trimmed)) {
-        actualKeys.push(trimmed);
-        seen.add(trimmed);
+    if (isUpdate) {
+      const existing = await query(
+        "SELECT id FROM affidavit_sessions WHERE id=$1",
+        [sessionId],
+      );
+      if (existing.rowCount === 0) {
+        return res.status(404).json({ error: "Session not found" });
       }
-    }
-  }
-  if (actualKeys.length === 0 && process.env.GEMINI_API_KEY) {
-    actualKeys.push(process.env.GEMINI_API_KEY.trim());
-  }
-  if (actualKeys.length === 0) {
-    throw new Error("No Gemini API keys available");
-  }
-
-  const totalKeys = actualKeys.length;
-  const RATE_LIMIT_WAIT = 20000;
-  const MAX_RETRIES = 10;
-  const STAGGER_DELAY = 1500;
-  const MAX_CONCURRENT = Math.min(
-    parseInt(process.env.AFFIDAVIT_MAX_CONCURRENT) || 3,
-    totalKeys,
-  );
-
-  const keyCooldownUntil = new Map();
-  const keyExhausted = new Set();
-
-  console.log(
-    `📋 Affidavit processing: ${pagePaths.length} pages, ${totalKeys} keys, concurrency=${MAX_CONCURRENT}`,
-  );
-
-  function pickKey(preferSlot) {
-    const now = Date.now();
-    const pref = actualKeys[preferSlot % totalKeys];
-    if (!keyExhausted.has(pref) && (keyCooldownUntil.get(pref) || 0) <= now)
-      return { key: pref, waitMs: 0 };
-
-    const offset = Math.floor(Math.random() * totalKeys);
-    for (let i = 0; i < totalKeys; i++) {
-      const k = actualKeys[(offset + i) % totalKeys];
-      if (!keyExhausted.has(k) && (keyCooldownUntil.get(k) || 0) <= now)
-        return { key: k, waitMs: 0 };
-    }
-
-    let soonest = Infinity;
-    let soonestKey = actualKeys[0];
-    for (const k of actualKeys) {
-      if (keyExhausted.has(k)) continue;
-      const until = keyCooldownUntil.get(k) || 0;
-      if (until < soonest) {
-        soonest = until;
-        soonestKey = k;
-      }
-    }
-    if (keyExhausted.size >= totalKeys)
-      return { key: actualKeys[0], waitMs: 0 };
-    return {
-      key: soonestKey,
-      waitMs: Math.max(0, soonest - Date.now()) + 2000,
-    };
-  }
-
-  async function processOnePage(pageIndex, pagePath, keySlot) {
-    let retries = 0;
-    let lastError = null;
-
-    while (retries < MAX_RETRIES) {
-      const sessionState = activeAffidavitSessions.get(sessionId);
-      if (sessionState?.stopped)
-        return { success: false, pageIndex, error: "Stopped by user" };
-
-      const { key, waitMs } = pickKey(keySlot + retries);
-      if (waitMs > 0) {
-        console.log(
-          `⏳ Affidavit page ${pageIndex + 1}: waiting ${Math.ceil(waitMs / 1000)}s...`,
-        );
-        await staggeredDelay(waitMs);
-      }
-
-      try {
-        const engineLabel = `Key-${(actualKeys.indexOf(key) % totalKeys) + 1}`;
-        const result = await callGeminiForAffidavit(
-          pagePath,
-          key,
-          pageIndex + 1,
-          engineLabel,
-        );
-        const parsed = parseAffidavitResult(result.text);
-
-        console.log(
-          `✅ Affidavit page ${pageIndex + 1}/${pagePaths.length} done`,
-        );
-
-        if (onPageDone) {
-          await onPageDone(pageIndex, pagePath, parsed, result.text);
-        }
-        return { success: true, pageIndex, parsed, rawText: result.text };
-      } catch (err) {
-        lastError = err.message;
-        retries++;
-
-        if (err.geminiErrorType === "permanent") {
-          keyExhausted.add(key);
-          await staggeredDelay(500);
-        } else if (err.geminiErrorType === "temporary") {
-          keyCooldownUntil.set(key, Date.now() + RATE_LIMIT_WAIT);
-          await staggeredDelay(RATE_LIMIT_WAIT);
-        } else {
-          await staggeredDelay(3000);
-        }
-      }
-    }
-    return {
-      success: false,
-      pageIndex,
-      error: lastError || "Max retries exceeded",
-    };
-  }
-
-  const results = [];
-  const errors = [];
-
-  // Process pages in controlled parallel batches
-  for (
-    let batchStart = 0;
-    batchStart < pagePaths.length;
-    batchStart += MAX_CONCURRENT
-  ) {
-    const sessionState = activeAffidavitSessions.get(sessionId);
-    if (sessionState?.stopped) break;
-
-    const batchEnd = Math.min(batchStart + MAX_CONCURRENT, pagePaths.length);
-    const batchPaths = pagePaths.slice(batchStart, batchEnd);
-
-    const batchPromises = batchPaths.map(async (pagePath, idx) => {
-      if (idx > 0) await new Promise((r) => setTimeout(r, STAGGER_DELAY * idx));
-      return processOnePage(batchStart + idx, pagePath, idx);
-    });
-
-    const batchResults = await Promise.all(batchPromises);
-    for (const r of batchResults) {
-      if (r.success) results.push(r);
-      else errors.push(r);
-    }
-
-    if (batchEnd < pagePaths.length) await staggeredDelay(3000);
-  }
-
-  return { results, errors };
-}
-
-// ============================================
-// DOCX GENERATION
-// ============================================
-
-/**
- * Generate a styled DOCX from merged affidavit data.
- * Replicates tables with proper borders, styling, headings.
- */
-function generateAffidavitDocx(merged, rawPages, { skipRawOcr = false } = {}) {
-  const children = [];
-
-  // Title
-  children.push(
-    new Paragraph({
-      alignment: AlignmentType.CENTER,
-      spacing: { after: 100 },
-      children: [
-        new TextRun({
-          text: merged.formType || "FORM 2B",
-          bold: true,
-          size: 28,
-          font: "Times New Roman",
-        }),
-      ],
-    }),
-  );
-
-  children.push(
-    new Paragraph({
-      alignment: AlignmentType.CENTER,
-      spacing: { after: 50 },
-      children: [
-        new TextRun({
-          text: "(See rule 4)",
-          size: 20,
-          font: "Times New Roman",
-        }),
-      ],
-    }),
-  );
-
-  children.push(
-    new Paragraph({
-      alignment: AlignmentType.CENTER,
-      spacing: { after: 200 },
-      children: [
-        new TextRun({
-          text: merged.documentTitle || "NOMINATION PAPER",
-          bold: true,
-          size: 24,
-          font: "Times New Roman",
-        }),
-      ],
-    }),
-  );
-
-  // State and constituency line
-  if (merged.state || merged.constituency) {
-    children.push(
-      new Paragraph({
-        alignment: AlignmentType.CENTER,
-        spacing: { after: 200 },
-        children: [
-          new TextRun({
-            text: `Election to the Legislative Assembly of `,
-            size: 22,
-            font: "Times New Roman",
-          }),
-          new TextRun({
-            text: merged.state || "___________",
-            bold: true,
-            underline: {},
-            size: 22,
-            font: "Times New Roman",
-          }),
-          new TextRun({
-            text: " (State)",
-            size: 22,
-            font: "Times New Roman",
-          }),
-        ],
-      }),
-    );
-  }
-
-  // Sections
-  for (const section of merged.sections || []) {
-    children.push(
-      new Paragraph({
-        alignment: AlignmentType.CENTER,
-        spacing: { before: 300, after: 150 },
-        children: [
-          new TextRun({
-            text: section.sectionTitle || "",
-            bold: true,
-            size: 24,
-            font: "Times New Roman",
-          }),
-        ],
-      }),
-    );
-
-    for (const item of section.content || []) {
-      if (item.type === "text" || item.type === "field") {
-        const runs = [];
-        if (item.label) {
-          runs.push(
-            new TextRun({
-              text: `${item.label}: `,
-              bold: true,
-              size: 22,
-              font: "Times New Roman",
-            }),
-          );
-        }
-        runs.push(
-          new TextRun({
-            text: item.value || "",
-            size: 22,
-            font: "Times New Roman",
-            italics: item.handwritten || false,
-            strike: item.strikethrough || false,
-          }),
-        );
-        children.push(
-          new Paragraph({
-            spacing: { after: 100 },
-            children: runs,
-          }),
-        );
-      }
-    }
-  }
-
-  // Candidate info fields
-  const fields = merged.fields || {};
-  const fieldPairs = [
-    ["Candidate Name", fields.candidateName],
-    ["Father's/Mother's/Husband's Name", fields.fatherMotherHusbandName],
-    ["Postal Address", fields.postalAddress],
-    ["Assembly Constituency", fields.assemblyConstituency],
-    ["Serial Number", fields.serialNumber],
-    ["Part Number", fields.partNumber],
-    ["Political Party", fields.party],
-    ["Age", fields.age],
-    ["Date", fields.date],
-    ["Proposer Name", fields.proposerName],
-    ["Proposer Serial No.", fields.proposerSerialNo],
-    ["Proposer Part No.", fields.proposerPartNo],
-    ["Language", fields.language],
-  ];
-
-  const visibleFields = fieldPairs.filter(([, v]) => v);
-  if (visibleFields.length > 0) {
-    children.push(
-      new Paragraph({
-        spacing: { before: 300, after: 150 },
-        children: [
-          new TextRun({
-            text: "CANDIDATE DETAILS",
-            bold: true,
-            size: 24,
-            font: "Times New Roman",
-          }),
-        ],
-      }),
-    );
-
-    // Build a 2-column details table
-    const detailRows = visibleFields.map(
-      ([label, value]) =>
-        new TableRow({
-          children: [
-            new TableCell({
-              width: { size: 3500, type: WidthType.DXA },
-              children: [
-                new Paragraph({
-                  children: [
-                    new TextRun({
-                      text: label,
-                      bold: true,
-                      size: 20,
-                      font: "Times New Roman",
-                    }),
-                  ],
-                }),
-              ],
-            }),
-            new TableCell({
-              width: { size: 6000, type: WidthType.DXA },
-              children: [
-                new Paragraph({
-                  children: [
-                    new TextRun({
-                      text: String(value),
-                      size: 20,
-                      font: "Times New Roman",
-                    }),
-                  ],
-                }),
-              ],
-            }),
-          ],
-        }),
-    );
-
-    children.push(
-      new Table({
-        rows: detailRows,
-        width: { size: 9500, type: WidthType.DXA },
-      }),
-    );
-  }
-
-  // Tables from OCR
-  for (const table of merged.tables || []) {
-    if (table.tableTitle) {
-      children.push(
-        new Paragraph({
-          spacing: { before: 300, after: 100 },
-          children: [
-            new TextRun({
-              text: table.tableTitle,
-              bold: true,
-              size: 22,
-              font: "Times New Roman",
-            }),
-          ],
-        }),
-      );
-    }
-
-    const tableBorders = {
-      top: { style: BorderStyle.SINGLE, size: 1, color: "000000" },
-      bottom: { style: BorderStyle.SINGLE, size: 1, color: "000000" },
-      left: { style: BorderStyle.SINGLE, size: 1, color: "000000" },
-      right: { style: BorderStyle.SINGLE, size: 1, color: "000000" },
-    };
-
-    const allRows = [];
-
-    // Header row
-    if (table.headers && table.headers.length > 0) {
-      allRows.push(
-        new TableRow({
-          tableHeader: true,
-          children: table.headers.map(
-            (h) =>
-              new TableCell({
-                borders: tableBorders,
-                children: [
-                  new Paragraph({
-                    alignment: AlignmentType.CENTER,
-                    children: [
-                      new TextRun({
-                        text: h || "",
-                        bold: true,
-                        size: 18,
-                        font: "Times New Roman",
-                      }),
-                    ],
-                  }),
-                ],
-              }),
-          ),
-        }),
-      );
-    }
-
-    // Data rows
-    for (const row of table.rows || []) {
-      const cells = (Array.isArray(row) ? row : []).map(
-        (cellVal) =>
-          new TableCell({
-            borders: tableBorders,
-            children: [
-              new Paragraph({
-                alignment: AlignmentType.CENTER,
-                children: [
-                  new TextRun({
-                    text: String(cellVal ?? ""),
-                    size: 18,
-                    font: "Times New Roman",
-                  }),
-                ],
-              }),
-            ],
-          }),
-      );
-
-      if (cells.length > 0) {
-        allRows.push(new TableRow({ children: cells }));
-      }
-    }
-
-    if (allRows.length > 0) {
-      children.push(
-        new Table({
-          rows: allRows,
-          width: { size: 9500, type: WidthType.DXA },
-        }),
-      );
-    }
-  }
-
-  // Criminal record section
-  const cr = merged.criminalRecord || {};
-  const crEntries = Object.entries(cr).filter(([, v]) => v);
-  if (crEntries.length > 0) {
-    children.push(
-      new Paragraph({
-        spacing: { before: 300, after: 150 },
-        children: [
-          new TextRun({
-            text: "CRIMINAL RECORD DECLARATION",
-            bold: true,
-            size: 24,
-            font: "Times New Roman",
-          }),
-        ],
-      }),
-    );
-
-    for (const [key, value] of crEntries) {
-      const label = key
-        .replace(/([A-Z])/g, " $1")
-        .replace(/^./, (c) => c.toUpperCase())
-        .trim();
-      children.push(
-        new Paragraph({
-          spacing: { after: 50 },
-          children: [
-            new TextRun({
-              text: `${label}: `,
-              bold: true,
-              size: 20,
-              font: "Times New Roman",
-            }),
-            new TextRun({
-              text: String(value),
-              size: 20,
-              font: "Times New Roman",
-            }),
-          ],
-        }),
-      );
-    }
-  }
-
-  // Other declaration sections
-  const declarationSections = [
-    { key: "officeOfProfit", title: "OFFICE OF PROFIT" },
-    { key: "insolvency", title: "INSOLVENCY" },
-    { key: "foreignAllegiance", title: "FOREIGN ALLEGIANCE" },
-    { key: "disqualification", title: "DISQUALIFICATION" },
-    {
-      key: "dismissalForCorruption",
-      title: "DISMISSAL FOR CORRUPTION/DISLOYALTY",
-    },
-    { key: "governmentContracts", title: "GOVERNMENT CONTRACTS" },
-  ];
-
-  for (const { key, title } of declarationSections) {
-    const entries = Object.entries(merged[key] || {}).filter(([, v]) => v);
-    if (entries.length > 0) {
-      children.push(
-        new Paragraph({
-          spacing: { before: 200, after: 100 },
-          children: [
-            new TextRun({
-              text: title,
-              bold: true,
-              size: 22,
-              font: "Times New Roman",
-            }),
-          ],
-        }),
-      );
-      for (const [k, v] of entries) {
-        const label = k
-          .replace(/([A-Z])/g, " $1")
-          .replace(/^./, (c) => c.toUpperCase())
-          .trim();
-        children.push(
-          new Paragraph({
-            spacing: { after: 50 },
-            children: [
-              new TextRun({
-                text: `${label}: `,
-                bold: true,
-                size: 20,
-                font: "Times New Roman",
-              }),
-              new TextRun({
-                text: String(v),
-                size: 20,
-                font: "Times New Roman",
-              }),
-            ],
-          }),
-        );
-      }
-    }
-  }
-
-  // Assets section
-  const assets = merged.assets || {};
-  const movableEntries = Object.entries(assets.movable || {}).filter(
-    ([, v]) => v,
-  );
-  const immovableEntries = Object.entries(assets.immovable || {}).filter(
-    ([, v]) => v,
-  );
-
-  if (movableEntries.length > 0 || immovableEntries.length > 0) {
-    children.push(
-      new Paragraph({
-        spacing: { before: 300, after: 150 },
-        children: [
-          new TextRun({
-            text: "ASSETS",
-            bold: true,
-            size: 24,
-            font: "Times New Roman",
-          }),
-        ],
-      }),
-    );
-
-    if (movableEntries.length > 0) {
-      children.push(
-        new Paragraph({
-          spacing: { after: 100 },
-          children: [
-            new TextRun({
-              text: "Movable Assets:",
-              bold: true,
-              size: 22,
-              font: "Times New Roman",
-            }),
-          ],
-        }),
-      );
-      for (const [k, v] of movableEntries) {
-        const label = k
-          .replace(/([A-Z])/g, " $1")
-          .replace(/^./, (c) => c.toUpperCase())
-          .trim();
-        children.push(
-          new Paragraph({
-            indent: { left: 400 },
-            spacing: { after: 50 },
-            children: [
-              new TextRun({
-                text: `${label}: `,
-                bold: true,
-                size: 20,
-                font: "Times New Roman",
-              }),
-              new TextRun({
-                text: String(v),
-                size: 20,
-                font: "Times New Roman",
-              }),
-            ],
-          }),
-        );
-      }
-    }
-
-    if (immovableEntries.length > 0) {
-      children.push(
-        new Paragraph({
-          spacing: { after: 100 },
-          children: [
-            new TextRun({
-              text: "Immovable Assets:",
-              bold: true,
-              size: 22,
-              font: "Times New Roman",
-            }),
-          ],
-        }),
-      );
-      for (const [k, v] of immovableEntries) {
-        const label = k
-          .replace(/([A-Z])/g, " $1")
-          .replace(/^./, (c) => c.toUpperCase())
-          .trim();
-        children.push(
-          new Paragraph({
-            indent: { left: 400 },
-            spacing: { after: 50 },
-            children: [
-              new TextRun({
-                text: `${label}: `,
-                bold: true,
-                size: 20,
-                font: "Times New Roman",
-              }),
-              new TextRun({
-                text: String(v),
-                size: 20,
-                font: "Times New Roman",
-              }),
-            ],
-          }),
-        );
-      }
-    }
-  }
-
-  // Liabilities section
-  const liabEntries = Object.entries(merged.liabilities || {}).filter(
-    ([, v]) => v,
-  );
-  if (liabEntries.length > 0) {
-    children.push(
-      new Paragraph({
-        spacing: { before: 300, after: 150 },
-        children: [
-          new TextRun({
-            text: "LIABILITIES",
-            bold: true,
-            size: 24,
-            font: "Times New Roman",
-          }),
-        ],
-      }),
-    );
-    for (const [k, v] of liabEntries) {
-      const label = k
-        .replace(/([A-Z])/g, " $1")
-        .replace(/^./, (c) => c.toUpperCase())
-        .trim();
-      children.push(
-        new Paragraph({
-          spacing: { after: 50 },
-          children: [
-            new TextRun({
-              text: `${label}: `,
-              bold: true,
-              size: 20,
-              font: "Times New Roman",
-            }),
-            new TextRun({ text: String(v), size: 20, font: "Times New Roman" }),
-          ],
-        }),
-      );
-    }
-  }
-
-  // Raw text pages as appendix
-  if (rawPages && rawPages.length > 0 && !skipRawOcr) {
-    children.push(
-      new Paragraph({
-        spacing: { before: 400, after: 200 },
-        children: [
-          new TextRun({ break: 1 }),
-          new TextRun({
-            text: "─── RAW OCR TEXT (APPENDIX) ───",
-            bold: true,
-            size: 22,
-            font: "Times New Roman",
-            color: "666666",
-          }),
-        ],
-      }),
-    );
-
-    for (const page of rawPages) {
-      children.push(
-        new Paragraph({
-          spacing: { before: 200, after: 100 },
-          children: [
-            new TextRun({
-              text: `Page ${page.pageNumber}:`,
-              bold: true,
-              size: 20,
-              font: "Times New Roman",
-              color: "333333",
-            }),
-          ],
-        }),
-      );
-
-      const rawText =
-        page.structured_json?.rawText || page.raw_text || "(no text)";
-      const lines = rawText.split("\n");
-      for (const line of lines) {
-        children.push(
-          new Paragraph({
-            spacing: { after: 30 },
-            children: [
-              new TextRun({
-                text: line,
-                size: 18,
-                font: "Courier New",
-                color: "444444",
-              }),
-            ],
-          }),
-        );
-      }
-    }
-  }
-
-  const doc = new Document({
-    sections: [
-      {
-        properties: {
-          page: {
-            margin: {
-              top: 720, // 0.5 inch
-              bottom: 720,
-              left: 1080, // 0.75 inch
-              right: 1080,
-            },
-          },
-        },
-        children,
-      },
-    ],
-  });
-
-  return doc;
-}
-
-// ============================================
-// MULTER CONFIG
-// ============================================
-
-const affidavitUpload = multer({
-  storage: multer.diskStorage({
-    destination: (req, _file, cb) => {
-      const sessionId = req.affidavitSessionId || uuidv4();
-      req.affidavitSessionId = sessionId;
-      const dest = path.join(storageRoot, sessionId, "pdf");
-      try {
-        fs.ensureDirSync(dest);
-        cb(null, dest);
-      } catch (err) {
-        cb(err);
-      }
-    },
-    filename: (_req, file, cb) => {
-      cb(null, file.originalname || "affidavit.pdf");
-    },
-  }),
-  fileFilter: (_req, file, cb) => {
-    if (file.mimetype !== "application/pdf") {
-      cb(new Error("Only PDF uploads are allowed"));
-    } else {
-      cb(null, true);
-    }
-  },
-  limits: { fileSize: 50 * 1024 * 1024 },
-});
-
-// ============================================
-// UPLOAD & PROCESS
-// ============================================
-
-router.post(
-  "/upload",
-  (req, _res, next) => {
-    req.affidavitSessionId = uuidv4();
-    next();
-  },
-  affidavitUpload.single("file"),
-  async (req, res) => {
-    const sessionId = req.affidavitSessionId;
-    const pdfPath = req.file?.path;
-    const originalName = req.file?.originalname || "affidavit.pdf";
-
-    if (!pdfPath) {
-      return res.status(400).json({ error: "PDF file is required" });
-    }
-
-    // Prevent rapid duplicate uploads
-    const lastUpload = recentUploads.get(originalName);
-    if (lastUpload && Date.now() - lastUpload < 30000) {
-      return res.status(429).json({
-        error:
-          "This file was just uploaded. Please wait before uploading again.",
-      });
-    }
-    recentUploads.set(originalName, Date.now());
-    for (const [name, ts] of recentUploads) {
-      if (Date.now() - ts > 60000) recentUploads.delete(name);
-    }
-
-    try {
-      // Create session
-      await query(
-        `INSERT INTO affidavit_sessions
-         (id, original_filename, status, processed_pages, total_pages)
-         VALUES ($1, $2, 'processing', 0, 0)`,
-        [sessionId, originalName],
-      );
-
-      // Split PDF
-      const pageDir = path.join(storageRoot, sessionId, "pages");
-      const pagePaths = await splitPdfToPages(pdfPath, pageDir);
-
-      await query(
-        "UPDATE affidavit_sessions SET total_pages=$1, updated_at=now() WHERE id=$2",
-        [pagePaths.length, sessionId],
-      );
-
-      // Return immediately
-      res.status(201).json({
-        sessionId,
-        originalFilename: originalName,
-        totalPages: pagePaths.length,
-        status: "processing",
-        message: `Processing ${pagePaths.length} pages in background`,
-      });
-
-      // ---- Background processing ----
-      activeAffidavitSessions.set(sessionId, { stopped: false });
-
-      let processedCount = 0;
-      const allPageResults = [];
-
-      const onPageDone = async (pageIndex, pagePath, parsed, rawText) => {
-        try {
-          const pageRes = await query(
-            `INSERT INTO affidavit_pages
-             (session_id, page_number, page_path, raw_text, structured_json)
-             VALUES ($1, $2, $3, $4, $5) RETURNING id`,
-            [
-              sessionId,
-              pageIndex + 1,
-              pagePath,
-              rawText,
-              JSON.stringify(parsed),
-            ],
-          );
-          const pageId = pageRes.rows[0].id;
-
-          // Extract and save dynamic field entries
-          const allFields = {};
-
-          // Gather from fields
-          if (parsed.fields) {
-            for (const [k, v] of Object.entries(parsed.fields)) {
-              if (v !== undefined && v !== null && v !== "")
-                allFields[k] = String(v);
-            }
-          }
-
-          // Gather from criminal record
-          if (parsed.criminalRecord) {
-            for (const [k, v] of Object.entries(parsed.criminalRecord)) {
-              if (v) allFields[`criminal_${k}`] = String(v);
-            }
-          }
-
-          // Gather from other declaration sections
-          const sections = [
-            "officeOfProfit",
-            "insolvency",
-            "foreignAllegiance",
-            "disqualification",
-            "dismissalForCorruption",
-            "governmentContracts",
-          ];
-          for (const sec of sections) {
-            if (parsed[sec]) {
-              for (const [k, v] of Object.entries(parsed[sec])) {
-                if (v) allFields[`${sec}_${k}`] = String(v);
-              }
-            }
-          }
-
-          // Gather assets
-          if (parsed.assets) {
-            if (parsed.assets.movable) {
-              for (const [k, v] of Object.entries(parsed.assets.movable)) {
-                if (v) allFields[`asset_movable_${k}`] = String(v);
-              }
-            }
-            if (parsed.assets.immovable) {
-              for (const [k, v] of Object.entries(parsed.assets.immovable)) {
-                if (v) allFields[`asset_immovable_${k}`] = String(v);
-              }
-            }
-          }
-
-          // Gather liabilities
-          if (parsed.liabilities) {
-            for (const [k, v] of Object.entries(parsed.liabilities)) {
-              if (v) allFields[`liability_${k}`] = String(v);
-            }
-          }
-
-          // Save all fields dynamically
-          for (const [fieldName, fieldValue] of Object.entries(allFields)) {
-            await query(
-              `INSERT INTO affidavit_entries
-               (session_id, page_id, page_number, field_name, field_value, field_category)
-               VALUES ($1, $2, $3, $4, $5, $6)
-               ON CONFLICT (session_id, field_name) DO UPDATE SET
-                 field_value = EXCLUDED.field_value,
-                 page_id = EXCLUDED.page_id,
-                 page_number = EXCLUDED.page_number`,
-              [
-                sessionId,
-                pageId,
-                pageIndex + 1,
-                fieldName,
-                fieldValue,
-                categorizeField(fieldName),
-              ],
-            );
-          }
-
-          // Save tables as JSONB
-          if (parsed.tables && parsed.tables.length > 0) {
-            for (const table of parsed.tables) {
-              await query(
-                `INSERT INTO affidavit_tables
-                 (session_id, page_id, page_number, table_title, headers, rows_data)
-                 VALUES ($1, $2, $3, $4, $5, $6)`,
-                [
-                  sessionId,
-                  pageId,
-                  pageIndex + 1,
-                  table.tableTitle || "",
-                  JSON.stringify(table.headers || []),
-                  JSON.stringify(table.rows || []),
-                ],
-              );
-            }
-          }
-
-          // Update session metadata from first meaningful page
-          if (parsed.fields) {
-            const updates = [];
-            const vals = [];
-            let idx = 1;
-
-            if (parsed.fields.candidateName) {
-              updates.push(
-                `candidate_name = COALESCE(NULLIF(candidate_name,''), $${idx})`,
-              );
-              vals.push(parsed.fields.candidateName);
-              idx++;
-            }
-            if (parsed.fields.party) {
-              updates.push(`party = COALESCE(NULLIF(party,''), $${idx})`);
-              vals.push(parsed.fields.party);
-              idx++;
-            }
-            if (parsed.constituency || parsed.fields.assemblyConstituency) {
-              updates.push(
-                `constituency = COALESCE(NULLIF(constituency,''), $${idx})`,
-              );
-              vals.push(
-                parsed.fields.assemblyConstituency || parsed.constituency || "",
-              );
-              idx++;
-            }
-            if (parsed.state) {
-              updates.push(`state = COALESCE(NULLIF(state,''), $${idx})`);
-              vals.push(parsed.state);
-              idx++;
-            }
-
-            if (updates.length > 0) {
-              vals.push(sessionId);
-              await query(
-                `UPDATE affidavit_sessions SET ${updates.join(", ")}, updated_at=now() WHERE id=$${idx}`,
-                vals,
-              );
-            }
-          }
-
-          processedCount++;
-          allPageResults[pageIndex] = parsed;
-
-          await query(
-            "UPDATE affidavit_sessions SET processed_pages=$1, updated_at=now() WHERE id=$2",
-            [processedCount, sessionId],
-          );
-
-          console.log(
-            `✅ Affidavit page ${pageIndex + 1} saved (${Object.keys(allFields).length} fields)`,
-          );
-        } catch (dbErr) {
-          console.error(
-            `❌ DB save error for affidavit page ${pageIndex + 1}:`,
-            dbErr.message,
-          );
-        }
-      };
-
-      const { results, errors } = await processAffidavitPagesParallel(
-        pagePaths,
-        sessionId,
-        onPageDone,
-      );
-
-      // Merge all pages
-      const validResults = allPageResults.filter(Boolean);
-      const merged = mergeAffidavitPages(validResults);
-
-      let finalStatus = "completed";
-      if (results.length === 0 && errors.length > 0) finalStatus = "failed";
-      else if (errors.length > 0) finalStatus = "partial";
 
       await query(
         `UPDATE affidavit_sessions
-         SET status=$1, processed_pages=$2, updated_at=now()
-         WHERE id=$3`,
-        [finalStatus, processedCount, sessionId],
+         SET candidate_name=$1, party=$2, constituency=$3, state=$4,
+             status='completed', total_pages=0, processed_pages=0, updated_at=now()
+         WHERE id=$5`,
+        [candidateName, party, constituency, state, sessionId],
       );
 
-      activeAffidavitSessions.delete(sessionId);
-      console.log(
-        `📋 Affidavit session ${sessionId} done [${finalStatus}] — ${results.length}/${pagePaths.length} pages OK`,
-      );
-    } catch (err) {
-      activeAffidavitSessions.delete(sessionId);
+      await query("DELETE FROM affidavit_entries WHERE session_id=$1", [
+        sessionId,
+      ]);
+      await query("DELETE FROM affidavit_tables WHERE session_id=$1", [
+        sessionId,
+      ]);
+      await query("DELETE FROM affidavit_pages WHERE session_id=$1", [
+        sessionId,
+      ]);
+    } else {
       await query(
-        "UPDATE affidavit_sessions SET status='failed', updated_at=now() WHERE id=$1",
-        [sessionId],
-      ).catch(() => {});
-      console.error("Affidavit processing failed:", err.message);
+        `INSERT INTO affidavit_sessions
+         (id, original_filename, candidate_name, party, constituency, state,
+          status, total_pages, processed_pages)
+         VALUES ($1, $2, $3, $4, $5, $6, 'completed', 0, 0)`,
+        [sessionId, "Manual Entry", candidateName, party, constituency, state],
+      );
     }
-  },
-);
 
-// ============================================
-// STOP PROCESSING
-// ============================================
+    const structuredJson = buildMergedStructure(formData);
+    const pageRes = await query(
+      `INSERT INTO affidavit_pages
+       (session_id, page_number, page_path, raw_text, structured_json)
+       VALUES ($1, 1, 'manual-entry', 'Manual entry by admin', $2)
+       RETURNING id`,
+      [sessionId, JSON.stringify(structuredJson)],
+    );
+    const pageId = pageRes.rows[0].id;
 
-router.post("/sessions/:id/stop", async (req, res) => {
-  const { id } = req.params;
-  const sessionState = activeAffidavitSessions.get(id);
-  if (!sessionState) {
-    return res
-      .status(404)
-      .json({ error: "No active processing for this session" });
+    const allFields = flattenFields(formData);
+    for (const [fieldName, fieldValue] of Object.entries(allFields)) {
+      if (fieldValue === undefined || fieldValue === null || fieldValue === "")
+        continue;
+      await query(
+        `INSERT INTO affidavit_entries
+         (session_id, page_id, page_number, field_name, field_value, field_category)
+         VALUES ($1, $2, 1, $3, $4, $5)
+         ON CONFLICT (session_id, field_name) DO UPDATE SET
+           field_value = EXCLUDED.field_value,
+           page_id = EXCLUDED.page_id,
+           page_number = EXCLUDED.page_number`,
+        [
+          sessionId,
+          pageId,
+          fieldName,
+          String(fieldValue),
+          categorizeField(fieldName),
+        ],
+      );
+    }
+
+    const tables = buildAffidavitTables(formData);
+    for (const table of tables) {
+      await query(
+        `INSERT INTO affidavit_tables
+         (session_id, page_id, page_number, table_title, headers, rows_data)
+         VALUES ($1, $2, 1, $3, $4, $5)`,
+        [
+          sessionId,
+          pageId,
+          table.tableTitle,
+          JSON.stringify(table.headers),
+          JSON.stringify(table.rows),
+        ],
+      );
+    }
+
+    res.status(isUpdate ? 200 : 201).json({
+      sessionId,
+      candidateName,
+      party,
+      constituency,
+      state,
+      status: "completed",
+      message: isUpdate
+        ? "Affidavit updated successfully"
+        : "Affidavit created successfully",
+      exportUrl: `/affidavits/sessions/${sessionId}/export/docx`,
+    });
+  } catch (err) {
+    console.error("Manual entry error:", err);
+    res.status(500).json({ error: err.message });
   }
-  sessionState.stopped = true;
-  await query(
-    "UPDATE affidavit_sessions SET status='paused', updated_at=now() WHERE id=$1",
-    [id],
-  );
-  res.json({ message: "Processing stopped", sessionId: id });
 });
 
 // ============================================
@@ -1301,13 +184,6 @@ router.get("/sessions/:id", async (req, res) => {
     if (session.rowCount === 0)
       return res.status(404).json({ error: "Session not found" });
 
-    const pages = await query(
-      `SELECT id, page_number, page_path, raw_text, structured_json, created_at
-       FROM affidavit_pages WHERE session_id=$1
-       ORDER BY page_number`,
-      [id],
-    );
-
     const entries = await query(
       `SELECT id, page_number, field_name, field_value, field_category, created_at
        FROM affidavit_entries WHERE session_id=$1 ORDER BY field_category, field_name`,
@@ -1320,7 +196,6 @@ router.get("/sessions/:id", async (req, res) => {
       [id],
     );
 
-    // Group entries by category
     const entriesByCategory = {};
     for (const entry of entries.rows) {
       const cat = entry.field_category || "general";
@@ -1328,12 +203,17 @@ router.get("/sessions/:id", async (req, res) => {
       entriesByCategory[cat].push(entry);
     }
 
+    const formData = {};
+    for (const entry of entries.rows) {
+      formData[entry.field_name] = entry.field_value;
+    }
+
     res.json({
       session: session.rows[0],
-      pages: pages.rows,
       entries: entries.rows,
       entriesByCategory,
       tables: tables.rows,
+      formData,
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1347,8 +227,6 @@ router.get("/sessions/:id", async (req, res) => {
 router.delete("/sessions/:id", async (req, res) => {
   try {
     const { id } = req.params;
-    const sessionState = activeAffidavitSessions.get(id);
-    if (sessionState) sessionState.stopped = true;
 
     const deleted = await query(
       "DELETE FROM affidavit_sessions WHERE id=$1 RETURNING id",
@@ -1356,9 +234,6 @@ router.delete("/sessions/:id", async (req, res) => {
     );
     if (deleted.rowCount === 0)
       return res.status(404).json({ error: "Session not found" });
-
-    const dir = path.join(storageRoot, id);
-    await fs.remove(dir).catch(() => {});
 
     res.json({ deleted: id, message: "Affidavit session deleted" });
   } catch (err) {
@@ -1395,7 +270,7 @@ router.patch("/sessions/:id/rename", async (req, res) => {
 });
 
 // ============================================
-// EXPORT AS DOCX
+// EXPORT AS DOCX (Template-based)
 // ============================================
 
 router.get("/sessions/:id/export/docx", async (req, res) => {
@@ -1430,18 +305,26 @@ router.get("/sessions/:id/export/docx", async (req, res) => {
       [id],
     );
 
-    // Build merged data for DOCX generation
-    const parsedPages = pages.rows.map((p) => {
+    let merged = {};
+
+    if (pages.rows.length > 0) {
       const json =
-        typeof p.structured_json === "string"
-          ? JSON.parse(p.structured_json)
-          : p.structured_json || {};
-      return json;
-    });
+        typeof pages.rows[0].structured_json === "string"
+          ? JSON.parse(pages.rows[0].structured_json)
+          : pages.rows[0].structured_json || {};
+      merged = json;
+    }
 
-    const merged = mergeAffidavitPages(parsedPages);
+    if (
+      Object.keys(merged.fields || {}).length === 0 &&
+      entries.rows.length > 0
+    ) {
+      merged.fields = {};
+      for (const entry of entries.rows) {
+        merged.fields[entry.field_name] = entry.field_value;
+      }
+    }
 
-    // If merged has no tables from parsing, use DB tables
     if (
       (!merged.tables || merged.tables.length === 0) &&
       tables.rows.length > 0
@@ -1457,20 +340,14 @@ router.get("/sessions/:id/export/docx", async (req, res) => {
       }));
     }
 
-    // If merged has no fields, reconstruct from entries
-    if (
-      Object.keys(merged.fields || {}).length === 0 &&
-      entries.rows.length > 0
-    ) {
-      merged.fields = {};
-      for (const entry of entries.rows) {
-        merged.fields[entry.field_name] = entry.field_value;
-      }
+    if (!templateExists()) {
+      return res.status(500).json({
+        error:
+          "DOCX template file not found. Ensure 'AFFIDAVIT FORMAT WORD.docx' exists in the project root.",
+      });
     }
 
-    const skipRawOcr = req.query.skipRawOcr === "true";
-    const doc = generateAffidavitDocx(merged, pages.rows, { skipRawOcr });
-    const buffer = await Packer.toBuffer(doc);
+    const buffer = await fillAffidavitTemplate(merged);
 
     const filename = session.rows[0].candidate_name
       ? `Affidavit_${session.rows[0].candidate_name.replace(/[^a-zA-Z0-9]/g, "_")}.docx`
@@ -1484,45 +361,6 @@ router.get("/sessions/:id/export/docx", async (req, res) => {
     res.send(buffer);
   } catch (err) {
     console.error("DOCX export error:", err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// ============================================
-// SESSION STATUS (for polling progress)
-// ============================================
-
-router.get("/sessions/:id/status", async (req, res) => {
-  try {
-    const { id } = req.params;
-    const session = await query(
-      `SELECT id, status, total_pages, processed_pages, candidate_name, party,
-              constituency, state, created_at, updated_at
-       FROM affidavit_sessions WHERE id=$1`,
-      [id],
-    );
-    if (session.rowCount === 0)
-      return res.status(404).json({ error: "Session not found" });
-
-    const fieldCount = await query(
-      "SELECT COUNT(*)::int AS count FROM affidavit_entries WHERE session_id=$1",
-      [id],
-    );
-
-    const s = session.rows[0];
-    res.json({
-      sessionId: id,
-      status: s.status,
-      totalPages: s.total_pages,
-      processedPages: s.processed_pages,
-      candidateName: s.candidate_name,
-      party: s.party,
-      constituency: s.constituency,
-      state: s.state,
-      fieldCount: fieldCount.rows[0].count,
-      isProcessing: activeAffidavitSessions.has(id),
-    });
-  } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
@@ -1577,7 +415,7 @@ router.get("/search", async (req, res) => {
 });
 
 // ============================================
-// GET ENTRIES FOR A SESSION (dynamic columns)
+// GET ENTRIES FOR A SESSION
 // ============================================
 
 router.get("/sessions/:id/entries", async (req, res) => {
@@ -1596,8 +434,6 @@ router.get("/sessions/:id/entries", async (req, res) => {
     sql += ` ORDER BY field_category, field_name`;
 
     const result = await query(sql, values);
-
-    // Get unique categories
     const categories = [...new Set(result.rows.map((r) => r.field_category))];
 
     res.json({
@@ -1611,8 +447,602 @@ router.get("/sessions/:id/entries", async (req, res) => {
 });
 
 // ============================================
-// HELPER: Categorize field names
+// GET FORM SCHEMA (for frontend rendering)
 // ============================================
+
+router.get("/form-schema", async (_req, res) => {
+  res.json({ schema: getAffidavitFormSchema() });
+});
+
+// ============================================
+// HELPERS
+// ============================================
+
+function buildAffidavitFormData(data) {
+  return {
+    houseName: data.houseName || "",
+    constituency: data.constituency || data.assemblyConstituency || "",
+    candidateName: data.candidateName || "",
+    fatherMotherHusbandName: data.fatherMotherHusbandName || "",
+    age: data.age || "",
+    postalAddress: data.postalAddress || "",
+    party: data.party || "",
+    isIndependent: data.isIndependent || false,
+    enrolledConstituency: data.enrolledConstituency || "",
+    serialNumber: data.serialNumber || "",
+    partNumber: data.partNumber || "",
+    telephone: data.telephone || "",
+    email: data.email || "",
+    socialMedia1: data.socialMedia1 || "",
+    socialMedia2: data.socialMedia2 || "",
+    socialMedia3: data.socialMedia3 || "",
+    panEntries: data.panEntries || [],
+    hasPendingCases: data.hasPendingCases || "No",
+    pendingCases: data.pendingCases || [],
+    hasConvictions: data.hasConvictions || "No",
+    convictions: data.convictions || [],
+    informedParty: data.informedParty || "",
+    movableAssets: data.movableAssets || {},
+    immovableAssets: data.immovableAssets || {},
+    liabilities: data.liabilities || {},
+    governmentDues: data.governmentDues || {},
+    governmentAccommodation: data.governmentAccommodation || {},
+    selfProfession: data.selfProfession || "",
+    spouseProfession: data.spouseProfession || "",
+    selfIncome: data.selfIncome || "",
+    spouseIncome: data.spouseIncome || "",
+    dependentIncome: data.dependentIncome || "",
+    contractsCandidate: data.contractsCandidate || "",
+    contractsSpouse: data.contractsSpouse || "",
+    contractsDependents: data.contractsDependents || "",
+    contractsHUF: data.contractsHUF || "",
+    contractsPartnershipFirms: data.contractsPartnershipFirms || "",
+    contractsPrivateCompanies: data.contractsPrivateCompanies || "",
+    educationalQualification: data.educationalQualification || "",
+    partBOverrides: data.partBOverrides || {},
+    verificationPlace: data.verificationPlace || "",
+    verificationDate: data.verificationDate || data.date || "",
+    state: data.state || "",
+    date: data.date || "",
+  };
+}
+
+function buildMergedStructure(formData) {
+  const merged = {
+    formType: "Form 26",
+    documentTitle: "AFFIDAVIT",
+    state: formData.state,
+    constituency: formData.constituency,
+    fields: {
+      houseName: formData.houseName,
+      candidateName: formData.candidateName,
+      fatherMotherHusbandName: formData.fatherMotherHusbandName,
+      age: formData.age,
+      postalAddress: formData.postalAddress,
+      assemblyConstituency: formData.constituency,
+      enrolledConstituency:
+        formData.enrolledConstituency || formData.constituency,
+      serialNumber: formData.serialNumber,
+      partNumber: formData.partNumber,
+      party: formData.party,
+      telephone: formData.telephone,
+      email: formData.email,
+      socialMedia1: formData.socialMedia1,
+      socialMedia2: formData.socialMedia2,
+      socialMedia3: formData.socialMedia3,
+      selfProfession: formData.selfProfession,
+      spouseProfession: formData.spouseProfession,
+      selfIncome: formData.selfIncome,
+      spouseIncome: formData.spouseIncome,
+      dependentIncome: formData.dependentIncome,
+      contractsCandidate: formData.contractsCandidate,
+      contractsSpouse: formData.contractsSpouse,
+      contractsDependents: formData.contractsDependents,
+      contractsHUF: formData.contractsHUF,
+      contractsPartnershipFirms: formData.contractsPartnershipFirms,
+      contractsPrivateCompanies: formData.contractsPrivateCompanies,
+      educationalQualification: formData.educationalQualification,
+      verificationPlace: formData.verificationPlace,
+      date: formData.verificationDate || formData.date,
+    },
+    criminalRecord: {
+      hasPendingCases: formData.hasPendingCases,
+      hasConvictions: formData.hasConvictions,
+    },
+    tables: [],
+    sections: [],
+    assets: {
+      movable: formData.movableAssets || {},
+      immovable: formData.immovableAssets || {},
+    },
+    liabilities: formData.liabilities || {},
+  };
+
+  merged.tables = buildAffidavitTables(formData);
+  return merged;
+}
+
+function buildAffidavitTables(formData) {
+  const tables = [];
+
+  // PAN / Income Tax
+  if (formData.panEntries && formData.panEntries.length > 0) {
+    const panRows = [];
+    for (const entry of formData.panEntries) {
+      if (entry.years && entry.years.length > 0) {
+        for (let i = 0; i < entry.years.length; i++) {
+          const yr = entry.years[i];
+          if (i === 0) {
+            panRows.push([
+              entry.slNo || "",
+              entry.name || "",
+              entry.pan || "",
+              yr.year || "",
+              yr.income || "",
+            ]);
+          } else {
+            panRows.push([yr.year || "", yr.income || ""]);
+          }
+        }
+      } else {
+        panRows.push([
+          entry.slNo || "",
+          entry.name || "",
+          entry.pan || "",
+          "",
+          "",
+        ]);
+      }
+    }
+    tables.push({
+      tableTitle:
+        "Details of Permanent Account Number (PAN) and Income Tax Return",
+      headers: [
+        "Sl. No.",
+        "Names",
+        "PAN",
+        "Financial Year",
+        "Total Income (Rs.)",
+      ],
+      rows: panRows,
+    });
+  }
+
+  // Pending Criminal Cases
+  if (
+    formData.hasPendingCases === "Yes" &&
+    formData.pendingCases &&
+    formData.pendingCases.length > 0
+  ) {
+    tables.push({
+      tableTitle: "Pending Criminal Cases",
+      headers: [
+        "(a) FIR No.",
+        "(b) Case No.",
+        "(c) Sections",
+        "(d) Description",
+        "(e) Charges framed",
+        "(f) Charges date",
+        "(g) Appeal filed",
+      ],
+      rows: formData.pendingCases.map((c) => [
+        c.firNo || "",
+        c.caseNo || "",
+        c.sections || "",
+        c.description || "",
+        c.chargesFramed || "",
+        c.chargesDate || "",
+        c.appealFiled || "",
+      ]),
+    });
+  }
+
+  // Convictions
+  if (
+    formData.hasConvictions === "Yes" &&
+    formData.convictions &&
+    formData.convictions.length > 0
+  ) {
+    tables.push({
+      tableTitle: "Cases of Conviction",
+      headers: [
+        "(a) Case No.",
+        "(b) Court Name",
+        "(c) Sections",
+        "(d) Description",
+        "(e) Conviction Date",
+        "(f) Punishment",
+        "(g) Appeal filed",
+        "(h) Appeal status",
+      ],
+      rows: formData.convictions.map((c) => [
+        c.caseNo || "",
+        c.courtName || "",
+        c.sections || "",
+        c.description || "",
+        c.convictionDate || "",
+        c.punishment || "",
+        c.appealFiled || "",
+        c.appealStatus || "",
+      ]),
+    });
+  }
+
+  // Movable Assets
+  if (
+    formData.movableAssets &&
+    Object.keys(formData.movableAssets).length > 0
+  ) {
+    const ma = formData.movableAssets;
+    tables.push({
+      tableTitle: "Movable Assets",
+      headers: [
+        "S.No.",
+        "Description",
+        "Self",
+        "Spouse",
+        "HUF",
+        "Dep-1",
+        "Dep-2",
+        "Dep-3",
+      ],
+      rows: [
+        [
+          "(i)",
+          "Cash in hand",
+          ma.cashSelf || "",
+          ma.cashSpouse || "",
+          ma.cashHUF || "",
+          ma.cashDep1 || "",
+          ma.cashDep2 || "",
+          ma.cashDep3 || "",
+        ],
+        [
+          "(ii)",
+          "Bank deposits",
+          ma.bankSelf || "",
+          ma.bankSpouse || "",
+          ma.bankHUF || "",
+          ma.bankDep1 || "",
+          ma.bankDep2 || "",
+          ma.bankDep3 || "",
+        ],
+        [
+          "(iii)",
+          "Bonds/Shares/Debentures",
+          ma.bondsSelf || "",
+          ma.bondsSpouse || "",
+          ma.bondsHUF || "",
+          ma.bondsDep1 || "",
+          ma.bondsDep2 || "",
+          ma.bondsDep3 || "",
+        ],
+        [
+          "(iv)",
+          "NSS/Postal/Insurance",
+          ma.nssSelf || "",
+          ma.nssSpouse || "",
+          ma.nssHUF || "",
+          ma.nssDep1 || "",
+          ma.nssDep2 || "",
+          ma.nssDep3 || "",
+        ],
+        [
+          "(v)",
+          "Personal loans/advances",
+          ma.loansSelf || "",
+          ma.loansSpouse || "",
+          ma.loansHUF || "",
+          ma.loansDep1 || "",
+          ma.loansDep2 || "",
+          ma.loansDep3 || "",
+        ],
+        [
+          "(vi)",
+          "Motor vehicles",
+          ma.motorSelf || "",
+          ma.motorSpouse || "",
+          ma.motorHUF || "",
+          ma.motorDep1 || "",
+          ma.motorDep2 || "",
+          ma.motorDep3 || "",
+        ],
+        [
+          "(vii)",
+          "Jewellery",
+          ma.jewellSelf || "",
+          ma.jewellSpouse || "",
+          ma.jewellHUF || "",
+          ma.jewellDep1 || "",
+          ma.jewellDep2 || "",
+          ma.jewellDep3 || "",
+        ],
+        [
+          "(viii)",
+          "Other assets",
+          ma.otherSelf || "",
+          ma.otherSpouse || "",
+          ma.otherHUF || "",
+          ma.otherDep1 || "",
+          ma.otherDep2 || "",
+          ma.otherDep3 || "",
+        ],
+        [
+          "(ix)",
+          "Gross Total",
+          ma.totalSelf || "",
+          ma.totalSpouse || "",
+          ma.totalHUF || "",
+          ma.totalDep1 || "",
+          ma.totalDep2 || "",
+          ma.totalDep3 || "",
+        ],
+      ],
+    });
+  }
+
+  // Immovable Assets
+  if (
+    formData.immovableAssets &&
+    Object.keys(formData.immovableAssets).length > 0
+  ) {
+    const ia = formData.immovableAssets;
+    const rows = [];
+    const types = [
+      { key: "agricultural", label: "Agricultural Land" },
+      { key: "nonAgricultural", label: "Non-Agricultural Land" },
+      { key: "commercial", label: "Commercial Building" },
+      { key: "residential", label: "Residential Building" },
+      { key: "others", label: "Others" },
+    ];
+    for (const { key, label } of types) {
+      if (ia[key]) {
+        for (const item of Array.isArray(ia[key]) ? ia[key] : [ia[key]]) {
+          rows.push([
+            label,
+            item.location || "",
+            item.surveyNo || "",
+            item.area || "",
+            item.inherited || "",
+            item.purchaseDate || "",
+            item.purchaseCost || "",
+            item.investment || "",
+            item.marketValue || "",
+          ]);
+        }
+      }
+    }
+    if (rows.length > 0) {
+      tables.push({
+        tableTitle: "Immovable Assets",
+        headers: [
+          "Type",
+          "Location",
+          "Survey No.",
+          "Area",
+          "Inherited",
+          "Purchase Date",
+          "Purchase Cost",
+          "Investment",
+          "Market Value",
+        ],
+        rows,
+      });
+    }
+  }
+
+  // Liabilities
+  if (formData.liabilities && Object.keys(formData.liabilities).length > 0) {
+    const lb = formData.liabilities;
+    tables.push({
+      tableTitle: "Liabilities",
+      headers: [
+        "S.No.",
+        "Description",
+        "Self",
+        "Spouse",
+        "HUF",
+        "Dep-1",
+        "Dep-2",
+        "Dep-3",
+      ],
+      rows: [
+        [
+          "(i)",
+          "Loans from Banks/FIs",
+          lb.bankLoansSelf || "",
+          lb.bankLoansSpouse || "",
+          lb.bankLoansHUF || "",
+          lb.bankLoansDep1 || "",
+          lb.bankLoansDep2 || "",
+          lb.bankLoansDep3 || "",
+        ],
+        [
+          "(ii)",
+          "Loans from others",
+          lb.otherLoansSelf || "",
+          lb.otherLoansSpouse || "",
+          lb.otherLoansHUF || "",
+          lb.otherLoansDep1 || "",
+          lb.otherLoansDep2 || "",
+          lb.otherLoansDep3 || "",
+        ],
+        [
+          "(iii)",
+          "Other liabilities",
+          lb.otherLiabSelf || "",
+          lb.otherLiabSpouse || "",
+          lb.otherLiabHUF || "",
+          lb.otherLiabDep1 || "",
+          lb.otherLiabDep2 || "",
+          lb.otherLiabDep3 || "",
+        ],
+        [
+          "(iv)",
+          "Grand Total",
+          lb.totalSelf || "",
+          lb.totalSpouse || "",
+          lb.totalHUF || "",
+          lb.totalDep1 || "",
+          lb.totalDep2 || "",
+          lb.totalDep3 || "",
+        ],
+      ],
+    });
+  }
+
+  // Government Dues
+  if (
+    formData.governmentDues &&
+    Object.keys(formData.governmentDues).length > 0
+  ) {
+    const gd = formData.governmentDues;
+    tables.push({
+      tableTitle: "Government Dues",
+      headers: [
+        "S.No.",
+        "Description",
+        "Self",
+        "Spouse",
+        "HUF",
+        "Dep-1",
+        "Dep-2",
+        "Dep-3",
+      ],
+      rows: [
+        [
+          "(iii)",
+          "Transport dues",
+          gd.transportSelf || "",
+          gd.transportSpouse || "",
+          gd.transportHUF || "",
+          gd.transportDep1 || "",
+          gd.transportDep2 || "",
+          gd.transportDep3 || "",
+        ],
+        [
+          "(iv)",
+          "Income Tax dues",
+          gd.incomeTaxSelf || "",
+          gd.incomeTaxSpouse || "",
+          gd.incomeTaxHUF || "",
+          gd.incomeTaxDep1 || "",
+          gd.incomeTaxDep2 || "",
+          gd.incomeTaxDep3 || "",
+        ],
+        [
+          "(v)",
+          "GST dues",
+          gd.gstSelf || "",
+          gd.gstSpouse || "",
+          gd.gstHUF || "",
+          gd.gstDep1 || "",
+          gd.gstDep2 || "",
+          gd.gstDep3 || "",
+        ],
+        [
+          "(vi)",
+          "Municipal/Property tax",
+          gd.municipalSelf || "",
+          gd.municipalSpouse || "",
+          gd.municipalHUF || "",
+          gd.municipalDep1 || "",
+          gd.municipalDep2 || "",
+          gd.municipalDep3 || "",
+        ],
+        [
+          "(vii)",
+          "Other dues",
+          gd.otherSelf || "",
+          gd.otherSpouse || "",
+          gd.otherHUF || "",
+          gd.otherDep1 || "",
+          gd.otherDep2 || "",
+          gd.otherDep3 || "",
+        ],
+        [
+          "(viii)",
+          "Grand total",
+          gd.totalSelf || "",
+          gd.totalSpouse || "",
+          gd.totalHUF || "",
+          gd.totalDep1 || "",
+          gd.totalDep2 || "",
+          gd.totalDep3 || "",
+        ],
+      ],
+    });
+  }
+
+  return tables;
+}
+
+function flattenFields(formData) {
+  const flat = {};
+  const simpleKeys = [
+    "houseName",
+    "constituency",
+    "candidateName",
+    "fatherMotherHusbandName",
+    "age",
+    "postalAddress",
+    "party",
+    "enrolledConstituency",
+    "serialNumber",
+    "partNumber",
+    "telephone",
+    "email",
+    "socialMedia1",
+    "socialMedia2",
+    "socialMedia3",
+    "selfProfession",
+    "spouseProfession",
+    "selfIncome",
+    "spouseIncome",
+    "dependentIncome",
+    "contractsCandidate",
+    "contractsSpouse",
+    "contractsDependents",
+    "contractsHUF",
+    "contractsPartnershipFirms",
+    "contractsPrivateCompanies",
+    "educationalQualification",
+    "verificationPlace",
+    "verificationDate",
+    "state",
+    "date",
+    "hasPendingCases",
+    "hasConvictions",
+    "informedParty",
+  ];
+  for (const key of simpleKeys) {
+    if (formData[key] !== undefined && formData[key] !== "") {
+      flat[key] = String(formData[key]);
+    }
+  }
+  if (formData.movableAssets) {
+    for (const [k, v] of Object.entries(formData.movableAssets)) {
+      if (v) flat[`asset_movable_${k}`] = String(v);
+    }
+  }
+  if (
+    formData.immovableAssets &&
+    Object.keys(formData.immovableAssets).length > 0
+  ) {
+    flat["asset_immovable_data"] = JSON.stringify(formData.immovableAssets);
+  }
+  if (formData.liabilities) {
+    for (const [k, v] of Object.entries(formData.liabilities)) {
+      if (v) flat[`liability_${k}`] = String(v);
+    }
+  }
+  if (formData.governmentDues) {
+    for (const [k, v] of Object.entries(formData.governmentDues)) {
+      if (v) flat[`govDues_${k}`] = String(v);
+    }
+  }
+  return flat;
+}
 
 function categorizeField(fieldName) {
   if (fieldName.startsWith("criminal_")) return "criminal_record";
@@ -1627,6 +1057,7 @@ function categorizeField(fieldName) {
   if (fieldName.startsWith("asset_movable_")) return "assets_movable";
   if (fieldName.startsWith("asset_immovable_")) return "assets_immovable";
   if (fieldName.startsWith("liability_")) return "liabilities";
+  if (fieldName.startsWith("govDues_")) return "government_dues";
   if (
     [
       "candidateName",
@@ -1639,14 +1070,613 @@ function categorizeField(fieldName) {
       "age",
       "date",
       "language",
+      "constituency",
+      "state",
+      "telephone",
+      "email",
+      "enrolledConstituency",
     ].includes(fieldName)
   )
     return "candidate_info";
-  if (
-    ["proposerName", "proposerSerialNo", "proposerPartNo"].includes(fieldName)
-  )
-    return "proposer_info";
   return "general";
+}
+
+function getAffidavitFormSchema() {
+  return {
+    title: "Form 26 — Affidavit",
+    description:
+      "Affidavit to be filed by the candidate along with nomination paper before the Returning Officer",
+    sections: [
+      {
+        id: "header",
+        title: "Election Details",
+        fields: [
+          {
+            name: "houseName",
+            label: "Name of the House",
+            type: "text",
+            placeholder: "e.g. Legislative Assembly",
+          },
+          {
+            name: "constituency",
+            label: "Constituency Name",
+            type: "text",
+            placeholder: "e.g. 116 BIDHANNAGAR",
+          },
+          {
+            name: "state",
+            label: "State",
+            type: "text",
+            placeholder: "e.g. WEST BENGAL",
+          },
+        ],
+      },
+      {
+        id: "personal",
+        title: "Part A — Personal Details",
+        fields: [
+          { name: "candidateName", label: "Candidate Full Name", type: "text" },
+          {
+            name: "fatherMotherHusbandName",
+            label: "Father's/Mother's/Husband's Name",
+            type: "text",
+          },
+          { name: "age", label: "Age (years)", type: "text" },
+          {
+            name: "postalAddress",
+            label: "Full Postal Address",
+            type: "textarea",
+          },
+          {
+            name: "party",
+            label: "Political Party Name",
+            type: "text",
+            placeholder: "Leave blank if independent",
+          },
+          {
+            name: "isIndependent",
+            label: "Contesting as Independent",
+            type: "checkbox",
+          },
+          {
+            name: "enrolledConstituency",
+            label: "Enrolled Constituency & State",
+            type: "text",
+          },
+          {
+            name: "serialNumber",
+            label: "Serial No. in Electoral Roll",
+            type: "text",
+          },
+          {
+            name: "partNumber",
+            label: "Part No. in Electoral Roll",
+            type: "text",
+          },
+          { name: "telephone", label: "Telephone Number(s)", type: "text" },
+          { name: "email", label: "Email ID", type: "text" },
+          {
+            name: "socialMedia1",
+            label: "Social Media Account (i)",
+            type: "text",
+          },
+          {
+            name: "socialMedia2",
+            label: "Social Media Account (ii)",
+            type: "text",
+          },
+          {
+            name: "socialMedia3",
+            label: "Social Media Account (iii)",
+            type: "text",
+          },
+        ],
+      },
+      {
+        id: "pan_income",
+        title: "PAN & Income Tax Details",
+        description:
+          "Details of PAN and last 5 years income tax returns for Self, Spouse, HUF, and Dependents",
+        type: "table",
+        tableConfig: {
+          name: "panEntries",
+          columns: [
+            { name: "slNo", label: "Sl. No." },
+            { name: "name", label: "Name" },
+            { name: "pan", label: "PAN" },
+          ],
+          subTable: {
+            name: "years",
+            label: "Financial Year & Income (up to 5 entries)",
+            columns: [
+              { name: "year", label: "Financial Year" },
+              { name: "income", label: "Total Income (Rs.)" },
+            ],
+            maxRows: 5,
+          },
+          defaultRows: [
+            { slNo: "1", label: "Self" },
+            { slNo: "2", label: "Spouse" },
+            { slNo: "3", label: "HUF" },
+            { slNo: "4", label: "Dependent 1" },
+            { slNo: "5", label: "Dependent 2" },
+            { slNo: "6", label: "Dependent 3" },
+          ],
+        },
+      },
+      {
+        id: "criminal_pending",
+        title: "Pending Criminal Cases",
+        fields: [
+          {
+            name: "hasPendingCases",
+            label: "Any pending criminal cases?",
+            type: "select",
+            options: ["No", "Yes"],
+          },
+        ],
+        conditionalTable: {
+          showWhen: { field: "hasPendingCases", value: "Yes" },
+          name: "pendingCases",
+          label: "Details of Pending Cases",
+          columns: [
+            { name: "firNo", label: "(a) FIR No. with Police Station" },
+            { name: "caseNo", label: "(b) Case No. with Court Name" },
+            { name: "sections", label: "(c) Sections of Acts" },
+            { name: "description", label: "(d) Brief Description" },
+            { name: "chargesFramed", label: "(e) Charges Framed? (Yes/No)" },
+            { name: "chargesDate", label: "(f) Date Charges Framed" },
+            { name: "appealFiled", label: "(g) Appeal Filed? (Yes/No)" },
+          ],
+        },
+      },
+      {
+        id: "criminal_conviction",
+        title: "Cases of Conviction",
+        fields: [
+          {
+            name: "hasConvictions",
+            label: "Any convictions?",
+            type: "select",
+            options: ["No", "Yes"],
+          },
+        ],
+        conditionalTable: {
+          showWhen: { field: "hasConvictions", value: "Yes" },
+          name: "convictions",
+          label: "Details of Convictions",
+          columns: [
+            { name: "caseNo", label: "(a) Case No." },
+            { name: "courtName", label: "(b) Court Name" },
+            { name: "sections", label: "(c) Sections" },
+            { name: "description", label: "(d) Description" },
+            { name: "convictionDate", label: "(e) Conviction Date" },
+            { name: "punishment", label: "(f) Punishment" },
+            { name: "appealFiled", label: "(g) Appeal Filed?" },
+            { name: "appealStatus", label: "(h) Appeal Status" },
+          ],
+        },
+      },
+      {
+        id: "party_info",
+        title: "Party Information (6A)",
+        fields: [
+          {
+            name: "informedParty",
+            label: "Information given to political party about criminal cases",
+            type: "textarea",
+            placeholder: "Write NOT APPLICABLE if 5(i) and 6(i) selected",
+          },
+        ],
+      },
+      {
+        id: "movable_assets",
+        title: "Movable Assets",
+        description:
+          "Details of movable assets of Self, Spouse, HUF, and Dependents",
+        type: "asset_table",
+        tableConfig: {
+          name: "movableAssets",
+          personColumns: ["Self", "Spouse", "HUF", "Dep-1", "Dep-2", "Dep-3"],
+          rows: [
+            {
+              id: "cash",
+              label: "(i) Cash in hand",
+              keys: [
+                "cashSelf",
+                "cashSpouse",
+                "cashHUF",
+                "cashDep1",
+                "cashDep2",
+                "cashDep3",
+              ],
+            },
+            {
+              id: "bank",
+              label: "(ii) Bank deposits",
+              keys: [
+                "bankSelf",
+                "bankSpouse",
+                "bankHUF",
+                "bankDep1",
+                "bankDep2",
+                "bankDep3",
+              ],
+            },
+            {
+              id: "bonds",
+              label: "(iii) Bonds/Shares/Debentures",
+              keys: [
+                "bondsSelf",
+                "bondsSpouse",
+                "bondsHUF",
+                "bondsDep1",
+                "bondsDep2",
+                "bondsDep3",
+              ],
+            },
+            {
+              id: "nss",
+              label: "(iv) NSS/Postal/Insurance",
+              keys: [
+                "nssSelf",
+                "nssSpouse",
+                "nssHUF",
+                "nssDep1",
+                "nssDep2",
+                "nssDep3",
+              ],
+            },
+            {
+              id: "loans",
+              label: "(v) Personal loans/advances",
+              keys: [
+                "loansSelf",
+                "loansSpouse",
+                "loansHUF",
+                "loansDep1",
+                "loansDep2",
+                "loansDep3",
+              ],
+            },
+            {
+              id: "motor",
+              label: "(vi) Motor vehicles",
+              keys: [
+                "motorSelf",
+                "motorSpouse",
+                "motorHUF",
+                "motorDep1",
+                "motorDep2",
+                "motorDep3",
+              ],
+            },
+            {
+              id: "jewell",
+              label: "(vii) Jewellery/bullion",
+              keys: [
+                "jewellSelf",
+                "jewellSpouse",
+                "jewellHUF",
+                "jewellDep1",
+                "jewellDep2",
+                "jewellDep3",
+              ],
+            },
+            {
+              id: "other",
+              label: "(viii) Other assets",
+              keys: [
+                "otherSelf",
+                "otherSpouse",
+                "otherHUF",
+                "otherDep1",
+                "otherDep2",
+                "otherDep3",
+              ],
+            },
+            {
+              id: "total",
+              label: "(ix) Gross Total",
+              keys: [
+                "totalSelf",
+                "totalSpouse",
+                "totalHUF",
+                "totalDep1",
+                "totalDep2",
+                "totalDep3",
+              ],
+            },
+          ],
+        },
+      },
+      {
+        id: "immovable_assets",
+        title: "Immovable Assets",
+        description:
+          "Details of each immovable property (land, buildings, apartments)",
+        type: "dynamic_table",
+        tableConfig: {
+          name: "immovableAssets",
+          categories: [
+            { id: "agricultural", label: "Agricultural Land" },
+            { id: "nonAgricultural", label: "Non-Agricultural Land" },
+            { id: "commercial", label: "Commercial Buildings" },
+            { id: "residential", label: "Residential Buildings" },
+            { id: "others", label: "Others" },
+          ],
+          fieldsPerEntry: [
+            { name: "location", label: "Location" },
+            { name: "surveyNo", label: "Survey Number" },
+            { name: "area", label: "Area" },
+            { name: "inherited", label: "Inherited? (Yes/No)" },
+            { name: "purchaseDate", label: "Purchase Date" },
+            { name: "purchaseCost", label: "Purchase Cost" },
+            { name: "investment", label: "Investment on property" },
+            { name: "marketValue", label: "Current Market Value" },
+          ],
+        },
+      },
+      {
+        id: "liabilities",
+        title: "Liabilities",
+        type: "asset_table",
+        tableConfig: {
+          name: "liabilities",
+          personColumns: ["Self", "Spouse", "HUF", "Dep-1", "Dep-2", "Dep-3"],
+          rows: [
+            {
+              id: "bankLoans",
+              label: "(i) Loans from Banks/FIs",
+              keys: [
+                "bankLoansSelf",
+                "bankLoansSpouse",
+                "bankLoansHUF",
+                "bankLoansDep1",
+                "bankLoansDep2",
+                "bankLoansDep3",
+              ],
+            },
+            {
+              id: "otherLoans",
+              label: "(ii) Loans from others",
+              keys: [
+                "otherLoansSelf",
+                "otherLoansSpouse",
+                "otherLoansHUF",
+                "otherLoansDep1",
+                "otherLoansDep2",
+                "otherLoansDep3",
+              ],
+            },
+            {
+              id: "otherLiab",
+              label: "(iii) Other liabilities",
+              keys: [
+                "otherLiabSelf",
+                "otherLiabSpouse",
+                "otherLiabHUF",
+                "otherLiabDep1",
+                "otherLiabDep2",
+                "otherLiabDep3",
+              ],
+            },
+            {
+              id: "total",
+              label: "(iv) Grand Total",
+              keys: [
+                "totalSelf",
+                "totalSpouse",
+                "totalHUF",
+                "totalDep1",
+                "totalDep2",
+                "totalDep3",
+              ],
+            },
+          ],
+        },
+      },
+      {
+        id: "gov_dues",
+        title: "Government Dues",
+        type: "asset_table",
+        tableConfig: {
+          name: "governmentDues",
+          personColumns: ["Self", "Spouse", "HUF", "Dep-1", "Dep-2", "Dep-3"],
+          rows: [
+            {
+              id: "transport",
+              label: "(iii) Transport dues",
+              keys: [
+                "transportSelf",
+                "transportSpouse",
+                "transportHUF",
+                "transportDep1",
+                "transportDep2",
+                "transportDep3",
+              ],
+            },
+            {
+              id: "incomeTax",
+              label: "(iv) Income Tax dues",
+              keys: [
+                "incomeTaxSelf",
+                "incomeTaxSpouse",
+                "incomeTaxHUF",
+                "incomeTaxDep1",
+                "incomeTaxDep2",
+                "incomeTaxDep3",
+              ],
+            },
+            {
+              id: "gst",
+              label: "(v) GST dues",
+              keys: [
+                "gstSelf",
+                "gstSpouse",
+                "gstHUF",
+                "gstDep1",
+                "gstDep2",
+                "gstDep3",
+              ],
+            },
+            {
+              id: "municipal",
+              label: "(vi) Municipal/Property tax",
+              keys: [
+                "municipalSelf",
+                "municipalSpouse",
+                "municipalHUF",
+                "municipalDep1",
+                "municipalDep2",
+                "municipalDep3",
+              ],
+            },
+            {
+              id: "other",
+              label: "(vii) Other dues",
+              keys: [
+                "otherSelf",
+                "otherSpouse",
+                "otherHUF",
+                "otherDep1",
+                "otherDep2",
+                "otherDep3",
+              ],
+            },
+            {
+              id: "total",
+              label: "(viii) Grand total",
+              keys: [
+                "totalSelf",
+                "totalSpouse",
+                "totalHUF",
+                "totalDep1",
+                "totalDep2",
+                "totalDep3",
+              ],
+            },
+          ],
+        },
+      },
+      {
+        id: "gov_accommodation",
+        title: "Government Accommodation",
+        fields: [
+          {
+            name: "governmentAccommodation.occupied",
+            label: "Occupied Govt. accommodation in last 10 years?",
+            type: "select",
+            options: ["No", "Yes"],
+          },
+          {
+            name: "governmentAccommodation.address",
+            label: "Address of Govt. accommodation",
+            type: "textarea",
+          },
+          {
+            name: "governmentAccommodation.noDues",
+            label: "No dues payable as on date",
+            type: "select",
+            options: ["Yes", "No"],
+          },
+        ],
+      },
+      {
+        id: "profession",
+        title: "Profession & Income",
+        fields: [
+          { name: "selfProfession", label: "Profession — Self", type: "text" },
+          {
+            name: "spouseProfession",
+            label: "Profession — Spouse",
+            type: "text",
+          },
+          {
+            name: "selfIncome",
+            label: "Source of Income — Self",
+            type: "text",
+          },
+          {
+            name: "spouseIncome",
+            label: "Source of Income — Spouse",
+            type: "text",
+          },
+          {
+            name: "dependentIncome",
+            label: "Source of Income — Dependents",
+            type: "text",
+          },
+        ],
+      },
+      {
+        id: "contracts",
+        title: "Contracts with Government",
+        fields: [
+          {
+            name: "contractsCandidate",
+            label: "Contracts by Candidate",
+            type: "textarea",
+          },
+          {
+            name: "contractsSpouse",
+            label: "Contracts by Spouse",
+            type: "textarea",
+          },
+          {
+            name: "contractsDependents",
+            label: "Contracts by Dependents",
+            type: "textarea",
+          },
+          {
+            name: "contractsHUF",
+            label: "Contracts by HUF/Trust",
+            type: "textarea",
+          },
+          {
+            name: "contractsPartnershipFirms",
+            label: "Contracts by Partnership Firms",
+            type: "textarea",
+          },
+          {
+            name: "contractsPrivateCompanies",
+            label: "Contracts by Private Companies",
+            type: "textarea",
+          },
+        ],
+      },
+      {
+        id: "education",
+        title: "Education",
+        fields: [
+          {
+            name: "educationalQualification",
+            label: "Highest Educational Qualification",
+            type: "textarea",
+            placeholder:
+              "Full form of certificate/diploma/degree, name of School/College/University, year completed",
+          },
+        ],
+      },
+      {
+        id: "verification",
+        title: "Verification",
+        fields: [
+          {
+            name: "verificationPlace",
+            label: "Place of Verification",
+            type: "text",
+          },
+          {
+            name: "verificationDate",
+            label: "Date of Verification",
+            type: "text",
+            placeholder: "DD/MM/YYYY",
+          },
+        ],
+      },
+    ],
+  };
 }
 
 export default router;

@@ -293,6 +293,28 @@ CREATE TABLE IF NOT EXISTS affidavit_tables (
 );
 
 CREATE INDEX IF NOT EXISTS idx_affidavit_tables_session_id ON affidavit_tables(session_id);
+
+-- ============================================
+-- NOMINATION FORM TABLES (Manual Entry)
+-- ============================================
+
+CREATE TABLE IF NOT EXISTS nomination_sessions (
+  id UUID PRIMARY KEY,
+  candidate_name TEXT,
+  father_mother_husband_name TEXT,
+  postal_address TEXT,
+  party TEXT,
+  constituency TEXT,
+  state TEXT,
+  form_data JSONB DEFAULT '{}',
+  status TEXT DEFAULT 'draft',
+  created_at TIMESTAMPTZ DEFAULT now(),
+  updated_at TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_nomination_sessions_candidate ON nomination_sessions(candidate_name);
+CREATE INDEX IF NOT EXISTS idx_nomination_sessions_party ON nomination_sessions(party);
+CREATE INDEX IF NOT EXISTS idx_nomination_sessions_constituency ON nomination_sessions(constituency);
 `;
 
 async function main() {
