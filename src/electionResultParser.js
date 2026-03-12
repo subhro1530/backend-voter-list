@@ -188,18 +188,33 @@ export function parseElectionResult(text) {
 
     // Extract candidate names from booth results if not found at top level
     if (result.candidates.length === 0 && result.boothResults.length > 0) {
-      // Use the row with the most candidates
-      let maxKeys = 0;
-      let bestRow = null;
-      for (const row of result.boothResults) {
-        const keys = Object.keys(row.candidateVotes || {});
-        if (keys.length > maxKeys) {
-          maxKeys = keys.length;
-          bestRow = row;
-        }
+      // Use the first row's keys (left-to-right order preserved)
+      const firstRow = result.boothResults[0];
+      if (firstRow) {
+        result.candidates = Object.keys(firstRow.candidateVotes);
       }
-      if (bestRow) {
-        result.candidates = Object.keys(bestRow.candidateVotes);
+    }
+
+    // Sanity check: ensure booth candidateVotes keys match candidates array
+    // If candidates array exists and booths have different keys, re-key booths by position
+    if (result.candidates.length > 0 && result.boothResults.length > 0) {
+      for (const booth of result.boothResults) {
+        const boothKeys = Object.keys(booth.candidateVotes || {});
+        const boothValues = Object.values(booth.candidateVotes || {});
+
+        // If keys don't match candidates but count matches, re-key by position
+        if (boothKeys.length === result.candidates.length) {
+          const keysMatch = boothKeys.every(
+            (k, i) => k === result.candidates[i],
+          );
+          if (!keysMatch) {
+            const newVotes = {};
+            for (let i = 0; i < result.candidates.length; i++) {
+              newVotes[result.candidates[i]] = boothValues[i] || 0;
+            }
+            booth.candidateVotes = newVotes;
+          }
+        }
       }
     }
 
@@ -305,8 +320,13 @@ function pullValue(pattern, source) {
 /**
  * Build the OCR prompt for election result pages.
  * The prompt is designed to extract the exact Form 20 structure.
+ * @param {boolean} isFirstPage - Whether this is the first page of the PDF
+ * @param {string[]} page1Candidates - Candidate names extracted from page 1 (used for continuation pages)
  */
-export function getElectionResultOCRPrompt(isFirstPage = false) {
+export function getElectionResultOCRPrompt(
+  isFirstPage = false,
+  page1Candidates = [],
+) {
   if (isFirstPage) {
     return `You are an expert OCR data extractor. You are analyzing Page 1 of an Indian Election Commission "FORM 20 - FINAL RESULT SHEET" PDF.
 
@@ -315,31 +335,37 @@ LOOK AT THE DOCUMENT CAREFULLY. At the top you will find:
 - "Name of Assembly/segment ...NAME Assembly Election"
 
 The table has these EXACT columns (left to right):
-- Column 1: "Serial No. Of Polling Station" (the serial/row number)
+- Column 1: "Sl. No." or "Serial No. Of Polling Station" (the serial/row number)
 - Column 2: The booth/polling station number (may be like 1, 2, 3, 5(A), 7(A), 10(A), etc.)
 - THEN several columns under the header "No of Valid Votes Cast in favour of" — each sub-column has a CANDIDATE NAME as its header. These names are DIFFERENT for every PDF. Extract them EXACTLY as printed.
 - After the candidate columns: "Total of Valid Votes"
-- Then: "No. Of Rejected Votes"  
-- Then: "NOTA"
-- Then: "Total"
+- Then: "No. Of Rejected Votes (Test Votes)"
+- Then: "Votes for NOTA option"
+- Then: "Total Votes"
 - Then: "No. Of Tendered Votes"
 
-IMPORTANT: The candidate names are in the table header cells. They may span 2-3 lines in the header. Combine them into one name. For example if a header cell says "ADHIKARY" on line 1, "PARESH" on line 2, "CHANDRA" on line 3, the candidate name is "ADHIKARY PARESH CHANDRA".
+CRITICAL — READ THE HEADER ROW CAREFULLY:
+- The candidate names are in the table header cells in the row below the "No of Valid Votes Cast in favour of" merged header.
+- They may span 2-3 lines within a single cell. Combine them into one name. For example if a header cell says "DR KAKOLI" on line 1, "GHOSH" on line 2, "DASTIDAR" on line 3, the candidate name is "DR KAKOLI GHOSH DASTIDAR".
+- Count the EXACT number of candidate columns by looking at the header cells between "Booth No." and "Total of Valid Votes". Each cell is ONE candidate.
+- DO NOT split a single candidate's name into multiple candidates. A multi-line name in ONE cell = ONE candidate.
+- DO NOT invent or hallucinate candidate names. Only extract names that are ACTUALLY PRINTED in the header cells.
+- The number of numeric vote columns in each data row MUST equal the number of candidate name columns in the header.
 
 Return ONLY valid JSON (no markdown, no explanation, no prose):
 {
-  "constituency": "exact text from 'Name of Assembly/segment' line, e.g. '1-Mekliganj (SC) Assembly Election'",
-  "totalElectors": 226465,
+  "constituency": "exact text from header area, e.g. '100-HABRA'",
+  "totalElectors": 248989,
   "candidates": ["FULL NAME 1", "FULL NAME 2", "FULL NAME 3", ...],
   "boothResults": [
     {
       "serialNo": 1,
       "boothNo": "1",
-      "candidateVotes": {"FULL NAME 1": 338, "FULL NAME 2": 7, "FULL NAME 3": 5, ...},
-      "totalValidVotes": 665,
+      "candidateVotes": {"FULL NAME 1": 633, "FULL NAME 2": 31, "FULL NAME 3": 85, ...},
+      "totalValidVotes": 1074,
       "rejectedVotes": 0,
-      "nota": 8,
-      "totalVotes": 673,
+      "nota": 9,
+      "totalVotes": 1083,
       "tenderedVotes": 0
     }
   ],
@@ -347,67 +373,228 @@ Return ONLY valid JSON (no markdown, no explanation, no prose):
 }
 
 RULES:
-1. "candidates" array MUST contain ALL candidate names from the column headers, in left-to-right order.
-2. In each booth row, "candidateVotes" keys MUST exactly match the strings in "candidates".
+1. "candidates" array MUST contain ONLY the candidate names from the column headers, in left-to-right order. Do NOT add any names that are not in the header.
+2. In each booth row, "candidateVotes" keys MUST exactly match the strings in "candidates". The number of keys must equal candidates.length.
 3. ALL values must be numbers, NOT strings. Parse "226,465" as 226465.
-4. Extract EVERY row on the page. Do not skip any.
+4. Extract EVERY data row on the page. Do not skip any.
 5. The "serialNo" is the first column (1, 2, 3...) and "boothNo" is the second column (could be 1, 2, 5(A), 7(A), etc.). They may differ!
 6. Set "totals" to null on this page unless there are summary rows at the bottom.
-7. Return ONLY the JSON object — no markdown fences, no text before or after.`;
+7. Return ONLY the JSON object — no markdown fences, no text before or after.
+8. VERIFY: count the candidate columns in the header, count the vote number columns in row 1. They MUST be equal. If they differ, you miscounted — recount.`;
   }
 
-  return `You are an expert OCR data extractor analyzing a continuation page from an Indian Election Commission "FORM 20 - FINAL RESULT SHEET" PDF.
+  // Continuation page prompt — with page 1 candidates if available
+  if (page1Candidates.length > 0) {
+    const candidateList = page1Candidates
+      .map((c, i) => `  ${i + 1}. "${c}"`)
+      .join("\n");
+    const candidateJSON = JSON.stringify(page1Candidates);
+    const exampleVotes = page1Candidates.map((c) => `"${c}": 0`).join(", ");
 
-This is NOT the first page. The table continues from previous pages with the same column structure:
-- Serial No. of Polling Station (row number)
-- Booth/Polling Station number
-- Multiple candidate vote columns (under "No of Valid Votes Cast in favour of")
-- Total Valid Votes
-- Rejected Votes
-- NOTA
-- Total
-- Tendered Votes
+    return `You are an expert OCR data extractor analyzing a continuation page from an Indian Election Commission "FORM 20 - FINAL RESULT SHEET" PDF.
 
-If candidate names are visible in the header on this page, extract them. If the header is not repeated, identify the candidates by the number of numeric columns between booth number and total valid votes.
+THE CANDIDATE NAMES WERE ALREADY EXTRACTED FROM PAGE 1. There are exactly ${page1Candidates.length} candidates:
+${candidateList}
 
-ALSO look for summary rows at the bottom of the page:
+You MUST use these EXACT candidate names as keys. Do NOT rename, rearrange, abbreviate, split, merge, or add any candidate names. The vote columns in the table correspond to these candidates in this exact left-to-right order.
+
+The table columns are (left to right):
+- Column 1: Sl. No. / Serial No. of Polling Station
+- Column 2: Booth/Polling Station number
+- Columns 3 to ${2 + page1Candidates.length}: Vote counts for each candidate (in the order listed above)
+- Then: Total of Valid Votes
+- Then: No. Of Rejected Votes
+- Then: Votes for NOTA option
+- Then: Total Votes
+- Then: No. Of Tendered Votes
+
+ALSO look for summary rows at the bottom of the page (these are NOT booth rows):
 - "Total of votes recorded on EVM" or "Total EVM Votes"
-- "Total of Postal Ballot Votes"  
+- "Total of Postal Ballot Votes"
 - "Total Votes Polled"
 These should go in "totals", NOT in "boothResults".
 
 Return ONLY valid JSON:
 {
-  "constituency": "name if visible at top, else empty string",
-  "totalElectors": number if visible else null,
-  "candidates": ["NAME1", "NAME2", ...],
+  "constituency": "",
+  "totalElectors": null,
+  "candidates": ${candidateJSON},
   "boothResults": [
     {
-      "serialNo": number,
-      "boothNo": "string",
-      "candidateVotes": {"NAME1": votes, "NAME2": votes, ...},
-      "totalValidVotes": number,
-      "rejectedVotes": number,
-      "nota": number,
-      "totalVotes": number,
-      "tenderedVotes": number
+      "serialNo": 1,
+      "boothNo": "1",
+      "candidateVotes": {${exampleVotes}},
+      "totalValidVotes": 0,
+      "rejectedVotes": 0,
+      "nota": 0,
+      "totalVotes": 0,
+      "tenderedVotes": 0
     }
   ],
-  "totals": {
-    "evmVotes": {"NAME1": number, ..., "totalValidVotes": number, "rejectedVotes": number, "nota": number, "totalVotes": number, "tenderedVotes": number},
-    "postalVotes": {same structure or null},
-    "totalVotesPolled": {same structure or null}
-  }
+  "totals": null
 }
 
 RULES:
-1. If candidates are visible in the header, include them in "candidates" array.
-2. If no header is visible, use "Candidate1", "Candidate2", etc. as keys in left-to-right order. They will be reconciled later.
-3. EVERY vote value must be an integer number, NOT a string.
-4. Extract ALL data rows. Do NOT skip any booth row.
-5. Summary/total rows go in "totals" object, NOT in boothResults.
-6. If no summary rows exist on this page, set "totals" to null.
-7. Return ONLY the JSON — no markdown, no prose.`;
+1. "candidates" MUST be exactly ${candidateJSON} — do NOT change it.
+2. "candidateVotes" keys MUST exactly match those ${page1Candidates.length} names. No extra keys, no missing keys.
+3. Map vote columns left-to-right: column 3 → "${page1Candidates[0]}", column 4 → "${page1Candidates[1] || ""}", etc.
+4. ALL values must be integer numbers, NOT strings.
+5. Extract ALL data rows. Do NOT skip any booth row.
+6. Summary/total rows go in "totals", NOT in boothResults.
+7. Return ONLY the JSON — no markdown, no prose, no explanation.`;
+  }
+
+  // Fallback continuation prompt when page 1 candidates are not available
+  return `You are an expert OCR data extractor analyzing a continuation page from an Indian Election Commission "FORM 20 - FINAL RESULT SHEET" PDF.
+
+This is NOT the first page. The table continues from previous pages with the same column structure:
+- Sl. No. / Serial No. of Polling Station (row number)
+- Booth/Polling Station number
+- Multiple candidate vote columns (under "No of Valid Votes Cast in favour of")
+- Total of Valid Votes
+- No. Of Rejected Votes
+- Votes for NOTA option
+- Total Votes
+- No. Of Tendered Votes
+
+If candidate names are visible in the header on this page, extract them EXACTLY as printed. Count the header cells carefully — each cell is one candidate.
+
+If the header row is not repeated on this page, count the number of numeric columns between "Booth No." and "Total Valid Votes" to determine the candidate count. Use "Candidate1", "Candidate2", etc. as placeholder keys, in left-to-right order.
+
+ALSO look for summary rows at the bottom:
+- "Total of votes recorded on EVM" or "Total EVM Votes"
+- "Total of Postal Ballot Votes"
+- "Total Votes Polled"
+These should go in "totals", NOT in "boothResults".
+
+Return ONLY valid JSON:
+{
+  "constituency": "",
+  "totalElectors": null,
+  "candidates": ["NAME1", "NAME2", ...],
+  "boothResults": [
+    {
+      "serialNo": 1,
+      "boothNo": "1",
+      "candidateVotes": {"NAME1": 0, "NAME2": 0, ...},
+      "totalValidVotes": 0,
+      "rejectedVotes": 0,
+      "nota": 0,
+      "totalVotes": 0,
+      "tenderedVotes": 0
+    }
+  ],
+  "totals": null
+}
+
+RULES:
+1. Do NOT invent or hallucinate candidate names. Only use names visible in the header, or use "Candidate1", "Candidate2", etc.
+2. "candidateVotes" keys MUST exactly match "candidates" array. Same count, same spelling.
+3. ALL values must be integer numbers, NOT strings.
+4. Extract ALL data rows. Do NOT skip any.
+5. Summary/total rows go in "totals", NOT in boothResults.
+6. Return ONLY the JSON — no markdown, no prose.`;
+}
+
+/**
+ * Compute string similarity (Dice coefficient) between two strings.
+ * Returns a value between 0 (completely different) and 1 (identical).
+ */
+function stringSimilarity(a, b) {
+  if (!a || !b) return 0;
+  a = a
+    .toUpperCase()
+    .replace(/[^A-Z ]/g, "")
+    .trim();
+  b = b
+    .toUpperCase()
+    .replace(/[^A-Z ]/g, "")
+    .trim();
+  if (a === b) return 1;
+  if (a.length < 2 || b.length < 2) return 0;
+
+  const bigrams = new Map();
+  for (let i = 0; i < a.length - 1; i++) {
+    const bigram = a.substring(i, i + 2);
+    bigrams.set(bigram, (bigrams.get(bigram) || 0) + 1);
+  }
+
+  let intersectionSize = 0;
+  for (let i = 0; i < b.length - 1; i++) {
+    const bigram = b.substring(i, i + 2);
+    const count = bigrams.get(bigram) || 0;
+    if (count > 0) {
+      bigrams.set(bigram, count - 1);
+      intersectionSize++;
+    }
+  }
+
+  return (2 * intersectionSize) / (a.length - 1 + (b.length - 1));
+}
+
+/**
+ * Normalize a candidate name for comparison:
+ * Remove honorifics, extra spaces, and standardize.
+ */
+function normalizeName(name) {
+  if (!name) return "";
+  return name
+    .toUpperCase()
+    .replace(/[^A-Z0-9 ]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/**
+ * Given a list of canonical candidate names from page 1 and a non-canonical name
+ * from another page, find the best matching canonical name.
+ * Returns the canonical name if similarity > threshold, otherwise null.
+ */
+function findBestCandidateMatch(name, canonicalNames, threshold = 0.6) {
+  if (!name || canonicalNames.length === 0) return null;
+  const normalizedName = normalizeName(name);
+  let bestMatch = null;
+  let bestScore = 0;
+
+  for (const canonical of canonicalNames) {
+    const normalizedCanonical = normalizeName(canonical);
+    const score = stringSimilarity(normalizedName, normalizedCanonical);
+    // Also check if one contains the other (handles partial matches)
+    const containsMatch =
+      normalizedCanonical.includes(normalizedName) ||
+      normalizedName.includes(normalizedCanonical);
+    const effectiveScore = containsMatch ? Math.max(score, 0.75) : score;
+
+    if (effectiveScore > bestScore) {
+      bestScore = effectiveScore;
+      bestMatch = canonical;
+    }
+  }
+
+  return bestScore >= threshold ? bestMatch : null;
+}
+
+/**
+ * Deduplicate a list of candidate names, merging similar names.
+ * Returns the deduplicated list and a mapping from original → canonical name.
+ */
+function deduplicateCandidates(allNames) {
+  const canonical = [];
+  const mapping = new Map(); // original name → canonical name
+
+  for (const name of allNames) {
+    if (mapping.has(name)) continue;
+
+    const match = findBestCandidateMatch(name, canonical, 0.65);
+    if (match) {
+      mapping.set(name, match);
+    } else {
+      canonical.push(name);
+      mapping.set(name, name);
+    }
+  }
+
+  return { canonical, mapping };
 }
 
 /**
@@ -434,7 +621,7 @@ export function mergeElectionResults(pageResults) {
   const totalElectors =
     pageResults.find((p) => p.totalElectors)?.totalElectors || null;
 
-  // Get the canonical candidate list — the longest non-generic list
+  // Get the canonical candidate list — prefer page 1 (first page with real names)
   let candidates = [];
   for (const page of pageResults) {
     if (page.candidates && page.candidates.length > 0) {
@@ -444,6 +631,7 @@ export function mergeElectionResults(pageResults) {
       );
       if (hasRealNames && page.candidates.length > candidates.length) {
         candidates = page.candidates;
+        break; // Use the FIRST page with real names (page 1), don't keep looking for longer lists
       }
     }
   }
@@ -457,45 +645,69 @@ export function mergeElectionResults(pageResults) {
     }
   }
 
-  // Reconcile booth results — rename generic "Candidate1" keys to real names
+  // Collect ALL unique candidate names across all pages to build dedup mapping
+  const allCandidateNames = new Set();
+  for (const page of pageResults) {
+    for (const booth of page.boothResults || []) {
+      for (const key of Object.keys(booth.candidateVotes || {})) {
+        allCandidateNames.add(key);
+      }
+    }
+  }
+
+  // Build a mapping from any variant name → canonical name
+  const nameMapping = new Map();
+  for (const name of allCandidateNames) {
+    // If it's already a canonical name, map to itself
+    if (candidates.includes(name)) {
+      nameMapping.set(name, name);
+      continue;
+    }
+    // Check if it's a generic placeholder
+    const genericMatch = name.match(/^Candidate(\d+)$/i);
+    if (genericMatch) {
+      const idx = parseInt(genericMatch[1]) - 1;
+      if (idx < candidates.length) {
+        nameMapping.set(name, candidates[idx]);
+      }
+      continue;
+    }
+    // Try fuzzy matching to a canonical name
+    const bestMatch = findBestCandidateMatch(name, candidates, 0.55);
+    if (bestMatch) {
+      nameMapping.set(name, bestMatch);
+      console.log(`📛 Candidate name reconciled: "${name}" → "${bestMatch}"`);
+    } else {
+      // Unknown name not similar to any canonical — likely hallucinated, skip it
+      console.log(
+        `⚠️ Candidate name "${name}" doesn't match any page 1 candidate — discarding`,
+      );
+      nameMapping.set(name, null); // null = discard
+    }
+  }
+
+  // Reconcile booth results using the mapping
   const allBoothResults = [];
   for (const page of pageResults) {
     for (const booth of page.boothResults || []) {
       const reconciledVotes = {};
-      const voteKeys = Object.keys(booth.candidateVotes || {});
 
-      // Check if this booth uses generic names
-      const usesGenericNames = voteKeys.some((k) => k.match(/^Candidate\d+$/i));
-
-      if (usesGenericNames && candidates.length > 0) {
-        // Map by index: Candidate1 → candidates[0], etc.
-        for (const [key, val] of Object.entries(booth.candidateVotes)) {
-          const match = key.match(/^Candidate(\d+)$/i);
-          if (match) {
-            const idx = parseInt(match[1]) - 1;
-            if (idx < candidates.length) {
-              reconciledVotes[candidates[idx]] = val;
-            } else {
-              reconciledVotes[key] = val;
-            }
-          } else {
-            reconciledVotes[key] = val;
-          }
+      for (const [key, val] of Object.entries(booth.candidateVotes || {})) {
+        const canonicalName = nameMapping.get(key);
+        if (canonicalName === null || canonicalName === undefined) {
+          // Discarded hallucinated name — skip
+          continue;
         }
-      } else if (candidates.length > 0) {
-        // Real names — try to match to canonical names
-        for (const [key, val] of Object.entries(booth.candidateVotes)) {
-          const canonMatch = candidates.find(
-            (c) =>
-              c === key ||
-              c.toLowerCase() === key.toLowerCase() ||
-              c.includes(key) ||
-              key.includes(c),
+        // If multiple source names map to the same canonical, keep the larger value
+        // (handles duplicate columns that shouldn't exist)
+        if (reconciledVotes[canonicalName] !== undefined) {
+          reconciledVotes[canonicalName] = Math.max(
+            reconciledVotes[canonicalName],
+            val,
           );
-          reconciledVotes[canonMatch || key] = val;
+        } else {
+          reconciledVotes[canonicalName] = val;
         }
-      } else {
-        Object.assign(reconciledVotes, booth.candidateVotes);
       }
 
       allBoothResults.push({
@@ -518,21 +730,35 @@ export function mergeElectionResults(pageResults) {
       if (!totalData || typeof totalData !== "object") continue;
       const reconciled = {};
       for (const [key, val] of Object.entries(totalData)) {
-        const match = key.match(/^Candidate(\d+)$/i);
-        if (match && candidates.length > 0) {
-          const idx = parseInt(match[1]) - 1;
-          reconciled[idx < candidates.length ? candidates[idx] : key] = val;
-        } else if (candidates.length > 0) {
-          const canonMatch = candidates.find(
-            (c) =>
-              c === key ||
-              c.toLowerCase() === key.toLowerCase() ||
-              c.includes(key) ||
-              key.includes(c),
-          );
-          reconciled[canonMatch || key] = val;
-        } else {
+        // Non-candidate meta fields (totalValidVotes, etc.) pass through
+        const metaFields = new Set([
+          "totalValidVotes",
+          "total_valid_votes",
+          "validVotes",
+          "rejectedVotes",
+          "rejected_votes",
+          "nota",
+          "NOTA",
+          "totalVotes",
+          "total_votes",
+          "tenderedVotes",
+          "tendered_votes",
+        ]);
+        if (metaFields.has(key)) {
           reconciled[key] = val;
+          continue;
+        }
+        // Try mapping via our name mapping
+        const canonicalName = nameMapping.get(key);
+        if (canonicalName === null || canonicalName === undefined) {
+          // Try fuzzy match directly
+          const bestMatch = findBestCandidateMatch(key, candidates, 0.55);
+          if (bestMatch) {
+            reconciled[bestMatch] = val;
+          }
+          // else discard
+        } else {
+          reconciled[canonicalName] = val;
         }
       }
       totals[totalKey] = reconciled;

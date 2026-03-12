@@ -97,13 +97,14 @@ async function callGeminiForElection(
   apiKey,
   isFirstPage,
   engineLabel = "",
+  page1Candidates = [],
 ) {
   const data = await fsPromises.readFile(filePath);
   const base64 = data.toString("base64");
   const ext = path.extname(filePath).toLowerCase();
   const mime = mimeByExt[ext] || "application/octet-stream";
 
-  const prompt = getElectionResultOCRPrompt(isFirstPage);
+  const prompt = getElectionResultOCRPrompt(isFirstPage, page1Candidates);
 
   const payload = {
     contents: [
@@ -115,8 +116,8 @@ async function callGeminiForElection(
       },
     ],
     generationConfig: {
-      temperature: 0.1,
-      topP: 0.8,
+      temperature: 0.0,
+      topP: 0.5,
       maxOutputTokens: 16384,
     },
   };
@@ -249,7 +250,13 @@ async function processElectionPagesParallel(pagePaths, sessionId, onPageDone) {
   /**
    * Process a single page with retries and key rotation
    */
-  async function processOnePage(pageIndex, pagePath, isFirstPage, keySlot) {
+  async function processOnePage(
+    pageIndex,
+    pagePath,
+    isFirstPage,
+    keySlot,
+    page1Candidates = [],
+  ) {
     let retries = 0;
     let lastError = null;
 
@@ -276,6 +283,7 @@ async function processElectionPagesParallel(pagePaths, sessionId, onPageDone) {
           key,
           isFirstPage,
           engineLabel,
+          page1Candidates,
         );
         const parsed = parseElectionResult(result.text);
 
@@ -332,13 +340,15 @@ async function processElectionPagesParallel(pagePaths, sessionId, onPageDone) {
   const errors = [];
 
   // ── Step 1: Process page 1 ALONE first (gets candidate names & constituency) ──
+  let page1Candidates = [];
   if (pagePaths.length > 0) {
     console.log(`📋 Processing page 1 first (extracts candidate names)...`);
-    const page1Result = await processOnePage(0, pagePaths[0], true, 0);
+    const page1Result = await processOnePage(0, pagePaths[0], true, 0, []);
     if (page1Result.success) {
       results.push(page1Result);
+      page1Candidates = page1Result.parsed.candidates || [];
       console.log(
-        `📋 Page 1 done. Candidates: ${(page1Result.parsed.candidates || []).join(", ")}`,
+        `📋 Page 1 done. Candidates (${page1Candidates.length}): ${page1Candidates.join(", ")}`,
       );
     } else {
       errors.push(page1Result);
@@ -352,6 +362,11 @@ async function processElectionPagesParallel(pagePaths, sessionId, onPageDone) {
     console.log(
       `📦 Processing remaining ${remainingPaths.length} pages (concurrency=${MAX_CONCURRENT})...`,
     );
+    if (page1Candidates.length > 0) {
+      console.log(
+        `📋 Enforcing page 1 candidate names on all continuation pages: ${page1Candidates.join(", ")}`,
+      );
+    }
 
     for (
       let batchStart = 0;
@@ -383,7 +398,7 @@ async function processElectionPagesParallel(pagePaths, sessionId, onPageDone) {
           await new Promise((r) => setTimeout(r, STAGGER_DELAY * idx));
         }
         const pageIndex = batchStart + idx + 1; // +1 because page 0 already done
-        return processOnePage(pageIndex, pagePath, false, idx);
+        return processOnePage(pageIndex, pagePath, false, idx, page1Candidates);
       });
 
       const batchResults = await Promise.all(batchPromises);
@@ -508,6 +523,9 @@ router.post(
       let processedCount = 0;
       const allPageResults = [];
 
+      // Shared state for page 1 candidate names — updated by processElectionPagesParallel
+      const sharedState = { page1Candidates: [] };
+
       // This callback is invoked for each page that completes
       const onPageDone = async (pageIndex, pagePath, parsed, rawText) => {
         try {
@@ -549,9 +567,22 @@ router.post(
           }
 
           // Save candidates discovered on this page (upsert)
+          // Only save from page 1 or if they match page 1 candidates (avoid hallucinated names)
           for (let ci = 0; ci < (parsed.candidates || []).length; ci++) {
             const name = parsed.candidates[ci];
-            if (!name) continue;
+            if (!name || name.match(/^Candidate\d+$/i)) continue;
+            // For non-first pages, only save if name matches a page 1 candidate
+            if (pageIndex > 0 && sharedState.page1Candidates.length > 0) {
+              if (!sharedState.page1Candidates.includes(name)) {
+                continue; // Skip hallucinated/variant names from non-first pages
+              }
+            }
+            // If this is page 1, record candidates in shared state
+            if (pageIndex === 0) {
+              if (!sharedState.page1Candidates.includes(name)) {
+                sharedState.page1Candidates.push(name);
+              }
+            }
             await query(
               `INSERT INTO election_candidates (session_id, candidate_name, candidate_index)
                VALUES ($1, $2, $3)
