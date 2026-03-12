@@ -9,14 +9,20 @@
 
 import express from "express";
 import { v4 as uuidv4 } from "uuid";
+import multer from "multer";
 import { query } from "../db.js";
 import { authenticate, adminOnly } from "../auth.js";
 import {
   fillNominationTemplate,
   nominationTemplateExists,
 } from "../nominationDocxTemplate.js";
+import { uploadImageBuffer } from "../cloudinary.js";
 
 const router = express.Router();
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 5 * 1024 * 1024 },
+});
 
 router.use(authenticate);
 router.use(adminOnly);
@@ -39,6 +45,8 @@ router.post("/manual-entry", async (req, res) => {
     const state = data.state || "";
 
     const formData = buildNominationFormData(data);
+    const candidatePhotoUrl = data.candidatePhotoUrl || "";
+    const candidateSignatureUrl = data.candidateSignatureUrl || "";
 
     if (isUpdate) {
       const existing = await query(
@@ -53,8 +61,9 @@ router.post("/manual-entry", async (req, res) => {
         `UPDATE nomination_sessions
          SET candidate_name=$1, father_mother_husband_name=$2,
              postal_address=$3, party=$4, constituency=$5, state=$6,
-             form_data=$7, status='completed', updated_at=now()
-         WHERE id=$8`,
+             form_data=$7, candidate_photo_url=$8, candidate_signature_url=$9,
+             status='completed', updated_at=now()
+         WHERE id=$10`,
         [
           candidateName,
           fatherName,
@@ -63,6 +72,8 @@ router.post("/manual-entry", async (req, res) => {
           constituency,
           state,
           JSON.stringify(formData),
+          candidatePhotoUrl,
+          candidateSignatureUrl,
           sessionId,
         ],
       );
@@ -70,8 +81,9 @@ router.post("/manual-entry", async (req, res) => {
       await query(
         `INSERT INTO nomination_sessions
          (id, candidate_name, father_mother_husband_name, postal_address,
-          party, constituency, state, form_data, status)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'completed')`,
+          party, constituency, state, form_data, candidate_photo_url,
+          candidate_signature_url, status)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'completed')`,
         [
           sessionId,
           candidateName,
@@ -81,6 +93,8 @@ router.post("/manual-entry", async (req, res) => {
           constituency,
           state,
           JSON.stringify(formData),
+          candidatePhotoUrl,
+          candidateSignatureUrl,
         ],
       );
     }
@@ -99,6 +113,25 @@ router.post("/manual-entry", async (req, res) => {
     });
   } catch (err) {
     console.error("Nomination manual entry error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ============================================
+// UPLOAD PHOTO/SIGNATURE
+// ============================================
+
+router.post("/upload-image", upload.single("image"), async (req, res) => {
+  try {
+    if (!req.file)
+      return res.status(400).json({ error: "No image file provided" });
+    const { type } = req.body; // "photo" or "signature"
+    const folder =
+      type === "signature" ? "nomination_signatures" : "nomination_photos";
+    const result = await uploadImageBuffer(req.file.buffer, { folder });
+    res.json({ url: result.secure_url, publicId: result.public_id, type });
+  } catch (err) {
+    console.error("Image upload error:", err);
     res.status(500).json({ error: err.message });
   }
 });
@@ -308,6 +341,10 @@ function buildNominationFormData(data) {
     // Header
     state: data.state || "",
 
+    // Photo & Signature URLs
+    candidatePhotoUrl: data.candidatePhotoUrl || "",
+    candidateSignatureUrl: data.candidateSignatureUrl || "",
+
     // Part I — Recognised party nomination
     partI_constituency: data.partI_constituency || "",
     partI_candidateName: data.partI_candidateName || data.candidateName || "",
@@ -382,6 +419,8 @@ function buildNominationFormData(data) {
     managingAgent_details: data.managingAgent_details || "",
     disqualification_10A: data.disqualification_10A || "No",
     section10A_date: data.section10A_date || "",
+    partIIIA_place: data.partIIIA_place || "",
+    partIIIA_date: data.partIIIA_date || "",
 
     // Part IV — Returning Officer
     partIV_serialNo: data.partIV_serialNo || "",
@@ -411,7 +450,13 @@ function buildMergedStructure(formData, session) {
   return {
     formType: "Form 2B",
     documentTitle: "NOMINATION PAPER",
-    fields: { ...formData },
+    fields: {
+      ...formData,
+      candidatePhotoUrl:
+        session.candidate_photo_url || formData.candidatePhotoUrl || "",
+      candidateSignatureUrl:
+        session.candidate_signature_url || formData.candidateSignatureUrl || "",
+    },
     proposers: formData.proposers || [],
     state: session.state || formData.state || "",
     constituency:
@@ -436,6 +481,20 @@ function getNominationFormSchema() {
             label: "State",
             type: "text",
             placeholder: "e.g. WEST BENGAL",
+          },
+          {
+            name: "candidatePhotoUrl",
+            label: "Candidate Passport Size Photograph",
+            type: "image_upload",
+            description:
+              "Upload passport size photograph. Use POST /nominations/upload-image with type=photo",
+          },
+          {
+            name: "candidateSignatureUrl",
+            label: "Candidate Signature",
+            type: "image_upload",
+            description:
+              "Upload candidate signature image. Use POST /nominations/upload-image with type=signature",
           },
         ],
       },
@@ -784,6 +843,18 @@ function getNominationFormSchema() {
             name: "section10A_date",
             label: "Date of disqualification (10A)",
             type: "text",
+          },
+          {
+            name: "partIIIA_place",
+            label: "Place (Part IIIA)",
+            type: "text",
+            placeholder: "Place where declaration is made",
+          },
+          {
+            name: "partIIIA_date",
+            label: "Date (Part IIIA)",
+            type: "text",
+            placeholder: "DD/MM/YYYY",
           },
         ],
       },

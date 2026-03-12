@@ -306,6 +306,8 @@ CREATE TABLE IF NOT EXISTS nomination_sessions (
   party TEXT,
   constituency TEXT,
   state TEXT,
+  candidate_photo_url TEXT,
+  candidate_signature_url TEXT,
   form_data JSONB DEFAULT '{}',
   status TEXT DEFAULT 'draft',
   created_at TIMESTAMPTZ DEFAULT now(),
@@ -315,6 +317,35 @@ CREATE TABLE IF NOT EXISTS nomination_sessions (
 CREATE INDEX IF NOT EXISTS idx_nomination_sessions_candidate ON nomination_sessions(candidate_name);
 CREATE INDEX IF NOT EXISTS idx_nomination_sessions_party ON nomination_sessions(party);
 CREATE INDEX IF NOT EXISTS idx_nomination_sessions_constituency ON nomination_sessions(constituency);
+
+-- Add photo/signature columns to existing tables if missing
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_name = 'nomination_sessions' AND column_name = 'candidate_photo_url'
+  ) THEN
+    ALTER TABLE nomination_sessions ADD COLUMN candidate_photo_url TEXT;
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_name = 'nomination_sessions' AND column_name = 'candidate_signature_url'
+  ) THEN
+    ALTER TABLE nomination_sessions ADD COLUMN candidate_signature_url TEXT;
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_name = 'affidavit_sessions' AND column_name = 'candidate_photo_url'
+  ) THEN
+    ALTER TABLE affidavit_sessions ADD COLUMN candidate_photo_url TEXT;
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_name = 'affidavit_sessions' AND column_name = 'candidate_signature_url'
+  ) THEN
+    ALTER TABLE affidavit_sessions ADD COLUMN candidate_signature_url TEXT;
+  END IF;
+END $$;
 `;
 
 async function main() {

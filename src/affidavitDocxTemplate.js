@@ -381,6 +381,18 @@ function replaceTextPlaceholders(xml, fields, merged) {
   if (social2) {
     xml = replaceDotsBetween(xml, "(ii)", "(iii)", social2);
   }
+  if (social3) {
+    const dotChars = `[…\\.]+`;
+    const xmlGap = `(?:</w:t></w:r>(?:<w:proofErr[^/]*/?>)*<w:r>(?:<w:rPr>(?:[^<]|<(?!/w:rPr>))*</w:rPr>)?<w:t[^>]*>)?`;
+    const s3Pattern = new RegExp(
+      `(\\(iii\\))((?:${dotChars}${xmlGap})*${dotChars})`,
+      "s",
+    );
+    const s3Match = xml.match(s3Pattern);
+    if (s3Match) {
+      xml = xml.replace(s3Match[0], `(iii) ${escapeXml(social3)}`);
+    }
+  }
 
   // 13. (a) Self……………… (b) Spouse ……………… (profession)
   const selfProfession = fields.selfProfession || fields.professionSelf || "";
@@ -501,6 +513,26 @@ function replaceTextPlaceholders(xml, fields, merged) {
         xml = xml.replace(monthMatch[0], `day of ${escapeXml(monthYear)}`);
       }
     }
+  }
+
+  // 18. Government accommodation details
+  const govAccom =
+    fields.governmentAccommodation || merged.governmentAccommodation || {};
+  if (govAccom.address) {
+    xml = replaceDotsAfter(xml, "accommodation", govAccom.address);
+  }
+  if (govAccom.duesDate) {
+    xml = replaceDotsAfter(xml, "as on date", govAccom.duesDate);
+  }
+
+  // 19. Oath Commissioner / Notary details
+  if (fields.oathCommissionerName) {
+    xml = replaceDotsAfter(xml, "before me", fields.oathCommissionerName);
+  }
+
+  // 20. Disputed liabilities field
+  if (fields.disputedLiabilities) {
+    xml = replaceDotsAfter(xml, "disputed", fields.disputedLiabilities);
   }
 
   return xml;
@@ -1105,6 +1137,78 @@ function fillCriminalDeclarations(xml, merged) {
 }
 
 // ─────────────────────────────────────────────
+// IMAGE EMBEDDING HELPER
+// ─────────────────────────────────────────────
+
+let affImageCounter = 200; // start high to avoid conflicts
+
+async function downloadImage(url) {
+  try {
+    const response = await fetch(url);
+    if (!response.ok) return null;
+    return Buffer.from(await response.arrayBuffer());
+  } catch {
+    return null;
+  }
+}
+
+function addImageToDocx(zip, imageBuffer, imageId) {
+  const ext = "png";
+  const mediaPath = `word/media/aff_image${imageId}.${ext}`;
+  zip.addFile(mediaPath, imageBuffer);
+
+  let rels = zip.readAsText("word/_rels/document.xml.rels");
+  const relId = `rIdAffImg${imageId}`;
+  const relEntry = `<Relationship Id="${relId}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/aff_image${imageId}.${ext}"/>`;
+  rels = rels.replace("</Relationships>", relEntry + "</Relationships>");
+  zip.updateFile("word/_rels/document.xml.rels", Buffer.from(rels, "utf8"));
+
+  return relId;
+}
+
+function getInlineImageXml(relId, widthCm, heightCm) {
+  const cx = Math.round(widthCm * 360000);
+  const cy = Math.round(heightCm * 360000);
+  const docPrId = affImageCounter++;
+  return `<w:drawing><wp:inline distT="0" distB="0" distL="0" distR="0" xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"><wp:extent cx="${cx}" cy="${cy}"/><wp:docPr id="${docPrId}" name="Image${docPrId}"/><a:graphic xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:pic xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:nvPicPr><pic:cNvPr id="${docPrId}" name="img${docPrId}"/><pic:cNvPicPr/></pic:nvPicPr><pic:blipFill><a:blip xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" r:embed="${relId}"/><a:stretch><a:fillRect/></a:stretch></pic:blipFill><pic:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="${cx}" cy="${cy}"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></pic:spPr></pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing>`;
+}
+
+async function embedImages(zip, xml, merged) {
+  const fields = merged.fields || {};
+
+  // Candidate photograph — near "passport size photograph" text
+  if (fields.candidatePhotoUrl) {
+    const imgBuf = await downloadImage(fields.candidatePhotoUrl);
+    if (imgBuf) {
+      const relId = addImageToDocx(zip, imgBuf, 1);
+      const imgXml = getInlineImageXml(relId, 2, 2.5);
+      const photoMatch = xml.match(/(<w:p [^>]*>[^]*?photograph[^]*?<\/w:p>)/i);
+      if (photoMatch) {
+        const imgPara = `<w:p><w:r>${imgXml}</w:r></w:p>`;
+        xml = xml.replace(photoMatch[0], imgPara + photoMatch[0]);
+      }
+    }
+  }
+
+  // Deponent signature — near "DEPONENT" text
+  if (fields.candidateSignatureUrl || fields.deponentSignatureUrl) {
+    const sigUrl = fields.candidateSignatureUrl || fields.deponentSignatureUrl;
+    const imgBuf = await downloadImage(sigUrl);
+    if (imgBuf) {
+      const relId = addImageToDocx(zip, imgBuf, 2);
+      const imgXml = getInlineImageXml(relId, 4, 1.5);
+      const sigMatch = xml.match(/(<w:p [^>]*>[^]*?DEPONENT[^]*?<\/w:p>)/);
+      if (sigMatch) {
+        const imgPara = `<w:p><w:r>${imgXml}</w:r></w:p>`;
+        xml = xml.replace(sigMatch[0], imgPara + sigMatch[0]);
+      }
+    }
+  }
+
+  return xml;
+}
+
+// ─────────────────────────────────────────────
 // MAIN EXPORT
 // ─────────────────────────────────────────────
 
@@ -1131,6 +1235,9 @@ export async function fillAffidavitTemplate(merged) {
 
   // Step 4: Fill any remaining generic tables from OCR
   xml = fillGenericTables(xml, merged);
+
+  // Step 5: Embed images (photo, signature) if URLs provided
+  xml = await embedImages(zip, xml, merged);
 
   // Write back modified XML
   zip.updateFile("word/document.xml", Buffer.from(xml, "utf8"));

@@ -11,14 +11,20 @@
 
 import express from "express";
 import { v4 as uuidv4 } from "uuid";
+import multer from "multer";
 import { query } from "../db.js";
 import { authenticate, adminOnly } from "../auth.js";
 import {
   fillAffidavitTemplate,
   templateExists,
 } from "../affidavitDocxTemplate.js";
+import { uploadImageBuffer } from "../cloudinary.js";
 
 const router = express.Router();
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 5 * 1024 * 1024 },
+});
 
 // All affidavit routes require authentication + admin
 router.use(authenticate);
@@ -53,9 +59,10 @@ router.post("/manual-entry", async (req, res) => {
       await query(
         `UPDATE affidavit_sessions
          SET candidate_name=$1, party=$2, constituency=$3, state=$4,
+             candidate_photo_url=$5, candidate_signature_url=$6,
              status='completed', total_pages=0, processed_pages=0, updated_at=now()
-         WHERE id=$5`,
-        [candidateName, party, constituency, state, sessionId],
+         WHERE id=$7`,
+        [candidateName, party, constituency, state, formData.candidatePhotoUrl || null, formData.candidateSignatureUrl || null, sessionId],
       );
 
       await query("DELETE FROM affidavit_entries WHERE session_id=$1", [
@@ -71,9 +78,10 @@ router.post("/manual-entry", async (req, res) => {
       await query(
         `INSERT INTO affidavit_sessions
          (id, original_filename, candidate_name, party, constituency, state,
+          candidate_photo_url, candidate_signature_url,
           status, total_pages, processed_pages)
-         VALUES ($1, $2, $3, $4, $5, $6, 'completed', 0, 0)`,
-        [sessionId, "Manual Entry", candidateName, party, constituency, state],
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'completed', 0, 0)`,
+        [sessionId, "Manual Entry", candidateName, party, constituency, state, formData.candidatePhotoUrl || null, formData.candidateSignatureUrl || null],
       );
     }
 
@@ -139,6 +147,25 @@ router.post("/manual-entry", async (req, res) => {
     });
   } catch (err) {
     console.error("Manual entry error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ============================================
+// UPLOAD PHOTO/SIGNATURE
+// ============================================
+
+router.post("/upload-image", upload.single("image"), async (req, res) => {
+  try {
+    if (!req.file)
+      return res.status(400).json({ error: "No image file provided" });
+    const { type } = req.body; // "photo" or "signature"
+    const folder =
+      type === "signature" ? "affidavit_signatures" : "affidavit_photos";
+    const result = await uploadImageBuffer(req.file.buffer, { folder });
+    res.json({ url: result.secure_url, publicId: result.public_id, type });
+  } catch (err) {
+    console.error("Image upload error:", err);
     res.status(500).json({ error: err.message });
   }
 });
@@ -340,6 +367,16 @@ router.get("/sessions/:id/export/docx", async (req, res) => {
       }));
     }
 
+    // Inject photo/signature URLs from session DB columns into merged fields
+    if (!merged.fields) merged.fields = {};
+    const sessRow = session.rows[0];
+    if (sessRow.candidate_photo_url && !merged.fields.candidatePhotoUrl) {
+      merged.fields.candidatePhotoUrl = sessRow.candidate_photo_url;
+    }
+    if (sessRow.candidate_signature_url && !merged.fields.candidateSignatureUrl) {
+      merged.fields.candidateSignatureUrl = sessRow.candidate_signature_url;
+    }
+
     if (!templateExists()) {
       return res.status(500).json({
         error:
@@ -476,6 +513,11 @@ function buildAffidavitFormData(data) {
     socialMedia1: data.socialMedia1 || "",
     socialMedia2: data.socialMedia2 || "",
     socialMedia3: data.socialMedia3 || "",
+
+    // Photo & Signature URLs
+    candidatePhotoUrl: data.candidatePhotoUrl || "",
+    candidateSignatureUrl: data.candidateSignatureUrl || "",
+
     panEntries: data.panEntries || [],
     hasPendingCases: data.hasPendingCases || "No",
     pendingCases: data.pendingCases || [],
@@ -485,8 +527,18 @@ function buildAffidavitFormData(data) {
     movableAssets: data.movableAssets || {},
     immovableAssets: data.immovableAssets || {},
     liabilities: data.liabilities || {},
+    disputedLiabilities: data.disputedLiabilities || "",
     governmentDues: data.governmentDues || {},
-    governmentAccommodation: data.governmentAccommodation || {},
+    governmentAccommodation: {
+      occupied: data.governmentAccommodation?.occupied || "No",
+      address: data.governmentAccommodation?.address || "",
+      noDues: data.governmentAccommodation?.noDues || "Yes",
+      duesDate: data.governmentAccommodation?.duesDate || "",
+      rentDues: data.governmentAccommodation?.rentDues || "",
+      electricityDues: data.governmentAccommodation?.electricityDues || "",
+      waterDues: data.governmentAccommodation?.waterDues || "",
+      telephoneDues: data.governmentAccommodation?.telephoneDues || "",
+    },
     selfProfession: data.selfProfession || "",
     spouseProfession: data.spouseProfession || "",
     selfIncome: data.selfIncome || "",
@@ -504,8 +556,14 @@ function buildAffidavitFormData(data) {
     verificationDate: data.verificationDate || data.date || "",
     state: data.state || "",
     date: data.date || "",
+
+    // Oath Commissioner
+    oathCommissionerName: data.oathCommissionerName || "",
+    oathCommissionerDesignation: data.oathCommissionerDesignation || "",
+    oathCommissionerSealNo: data.oathCommissionerSealNo || "",
   };
 }
+
 
 function buildMergedStructure(formData) {
   const merged = {
@@ -544,6 +602,12 @@ function buildMergedStructure(formData) {
       educationalQualification: formData.educationalQualification,
       verificationPlace: formData.verificationPlace,
       date: formData.verificationDate || formData.date,
+      candidatePhotoUrl: formData.candidatePhotoUrl,
+      candidateSignatureUrl: formData.candidateSignatureUrl,
+      oathCommissionerName: formData.oathCommissionerName,
+      oathCommissionerDesignation: formData.oathCommissionerDesignation,
+      oathCommissionerSealNo: formData.oathCommissionerSealNo,
+      disputedLiabilities: formData.disputedLiabilities,
     },
     criminalRecord: {
       hasPendingCases: formData.hasPendingCases,
@@ -556,6 +620,7 @@ function buildMergedStructure(formData) {
       immovable: formData.immovableAssets || {},
     },
     liabilities: formData.liabilities || {},
+    governmentAccommodation: formData.governmentAccommodation || {},
   };
 
   merged.tables = buildAffidavitTables(formData);
@@ -1170,6 +1235,20 @@ function getAffidavitFormSchema() {
             label: "Social Media Account (iii)",
             type: "text",
           },
+          {
+            name: "candidatePhotoUrl",
+            label: "Candidate Photograph",
+            type: "image_upload",
+            accept: "image/jpeg,image/png",
+            description: "Upload passport-size photograph of the candidate",
+          },
+          {
+            name: "candidateSignatureUrl",
+            label: "Candidate Signature",
+            type: "image_upload",
+            accept: "image/jpeg,image/png",
+            description: "Upload scanned signature of the deponent",
+          },
         ],
       },
       {
@@ -1560,6 +1639,18 @@ function getAffidavitFormSchema() {
         },
       },
       {
+        id: "disputed_liabilities",
+        title: "Disputed Liabilities",
+        fields: [
+          {
+            name: "disputedLiabilities",
+            label: "Details of disputed liabilities (if any)",
+            type: "textarea",
+            placeholder: "Write NIL if no disputed liabilities",
+          },
+        ],
+      },
+      {
         id: "gov_accommodation",
         title: "Government Accommodation",
         fields: [
@@ -1579,6 +1670,32 @@ function getAffidavitFormSchema() {
             label: "No dues payable as on date",
             type: "select",
             options: ["Yes", "No"],
+          },
+          {
+            name: "governmentAccommodation.duesDate",
+            label: "Dues payable as on date (if applicable)",
+            type: "text",
+            placeholder: "DD/MM/YYYY",
+          },
+          {
+            name: "governmentAccommodation.rentDues",
+            label: "Rent dues (Rs.)",
+            type: "text",
+          },
+          {
+            name: "governmentAccommodation.electricityDues",
+            label: "Electricity dues (Rs.)",
+            type: "text",
+          },
+          {
+            name: "governmentAccommodation.waterDues",
+            label: "Water dues (Rs.)",
+            type: "text",
+          },
+          {
+            name: "governmentAccommodation.telephoneDues",
+            label: "Telephone dues (Rs.)",
+            type: "text",
           },
         ],
       },
@@ -1672,6 +1789,28 @@ function getAffidavitFormSchema() {
             label: "Date of Verification",
             type: "text",
             placeholder: "DD/MM/YYYY",
+          },
+        ],
+      },
+      {
+        id: "oath_commissioner",
+        title: "Oath Commissioner / Notary Details",
+        fields: [
+          {
+            name: "oathCommissionerName",
+            label: "Name of Oath Commissioner / Notary",
+            type: "text",
+          },
+          {
+            name: "oathCommissionerDesignation",
+            label: "Designation",
+            type: "text",
+            placeholder: "e.g. Notary Public / Oath Commissioner",
+          },
+          {
+            name: "oathCommissionerSealNo",
+            label: "Seal / Registration No.",
+            type: "text",
           },
         ],
       },

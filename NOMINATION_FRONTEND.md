@@ -20,6 +20,7 @@ Build a **full-page manual data entry form** for the Indian Election Nomination 
 | -------- | ------------------------------------------------------------ | ------------------------------------------------------------- |
 | `GET`    | `/nominations/form-schema`                                   | Returns the full form schema (sections, fields, table, types) |
 | `POST`   | `/nominations/manual-entry`                                  | Create or update a nomination session                         |
+| `POST`   | `/nominations/upload-image`                                  | Upload candidate photo or signature to Cloudinary             |
 | `GET`    | `/nominations/sessions`                                      | List all nomination sessions                                  |
 | `GET`    | `/nominations/sessions/:id`                                  | Get session detail with all form data                         |
 | `DELETE` | `/nominations/sessions/:id`                                  | Delete a session                                              |
@@ -28,6 +29,23 @@ Build a **full-page manual data entry form** for the Indian Election Nomination 
 | `GET`    | `/nominations/search?candidate=&party=&constituency=&state=` | Search sessions                                               |
 
 All endpoints require `Authorization: Bearer <token>` header (admin role).
+
+### Image Upload Endpoint
+
+**`POST /nominations/upload-image`** — Upload a candidate photograph or signature image.
+
+- **Content-Type:** `multipart/form-data`
+- **Body:** A single file field named `image` (max 5 MB, JPEG or PNG)
+- **Response:**
+
+```json
+{
+  "url": "https://res.cloudinary.com/.../nomination_images/abc123.jpg",
+  "publicId": "nomination_images/abc123"
+}
+```
+
+**Usage:** Call this endpoint first to upload the image, then store the returned `url` in the form data as `candidatePhotoUrl` or `candidateSignatureUrl` before saving via `POST /nominations/manual-entry`.
 
 ---
 
@@ -39,9 +57,13 @@ The form has **7 parts** (Parts I through VI plus Part IIIA). Below is every sec
 
 ### Header — Election Details
 
-| Field Name | Label | Type | Notes                                                                        |
-| ---------- | ----- | ---- | ---------------------------------------------------------------------------- |
-| `state`    | State | text | e.g. "WEST BENGAL". Fills "Election to the Legislative Assembly of \_\_\_\_" |
+| Field Name              | Label                | Type         | Notes                                                                                       |
+| ----------------------- | -------------------- | ------------ | ------------------------------------------------------------------------------------------- |
+| `state`                 | State                | text         | e.g. "WEST BENGAL". Fills "Election to the Legislative Assembly of \_\_\_\_"                |
+| `candidatePhotoUrl`     | Candidate Photograph | image_upload | Upload passport-size photograph. Use `POST /nominations/upload-image` first, store the URL. |
+| `candidateSignatureUrl` | Candidate Signature  | image_upload | Upload scanned signature. Use `POST /nominations/upload-image` first, store the URL.        |
+
+**Image upload fields:** These are not text inputs. Render a file picker + upload button. When the user selects a file, call `POST /nominations/upload-image`, then store the returned `url` in the form state under the corresponding field name. Display a thumbnail preview of the uploaded image.
 
 ---
 
@@ -208,6 +230,13 @@ Each item below is a Yes/No question. If "Yes", an additional detail field appea
 
 **Original form context:** These declarations correspond to grounds for disqualification under the Representation of the People Act, 1951 (Sections 8, 8A, 9, 9A, 10, 10A).
 
+#### Part IIIA — Place & Date
+
+| Field Name       | Label | Type | Notes                                                       |
+| ---------------- | ----- | ---- | ----------------------------------------------------------- |
+| `partIIIA_place` | Place | text | "Place \_\_\_\_" at the bottom of the Part IIIA declaration |
+| `partIIIA_date`  | Date  | text | "Date \_\_\_\_" DD/MM/YYYY at the bottom of Part IIIA       |
+
 ---
 
 ### Part IV — Returning Officer's Record
@@ -263,6 +292,8 @@ From the form: receipt to be handed over to the person presenting the nomination
   "postalAddress": "Flat 3B, Block A, Salt Lake Sector II, Kolkata 700091",
   "party": "All India Trinamool Congress",
   "constituency": "116 BIDHANNAGAR",
+  "candidatePhotoUrl": "https://res.cloudinary.com/.../nomination_images/photo123.jpg",
+  "candidateSignatureUrl": "https://res.cloudinary.com/.../nomination_images/sig456.jpg",
 
   "partI_constituency": "116 BIDHANNAGAR",
   "partI_candidateName": "RAJESH KUMAR SHARMA",
@@ -332,6 +363,9 @@ From the form: receipt to be handed over to the person presenting the nomination
   "managingAgent_details": "",
   "disqualification_10A": "No",
   "section10A_date": "",
+
+  "partIIIA_place": "Kolkata",
+  "partIIIA_date": "15/03/2026",
 
   "partIV_serialNo": "1",
   "partIV_hour": "11:00",

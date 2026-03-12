@@ -512,7 +512,14 @@ function replaceTextPlaceholders(xml, fields) {
     xml = replaceDotsAfter(xml, "Date", fields.partIII_date);
   }
 
-  // ── PART IIIA ──
+  // ── PART IIIA ── Place and Date at the end
+
+  if (fields.partIIIA_place) {
+    xml = replaceDotsAfter(xml, "Place:", fields.partIIIA_place);
+  }
+  if (fields.partIIIA_date) {
+    xml = replaceDotsAfter(xml, "Date:", fields.partIIIA_date);
+  }
 
   // Case/First information report No./Nos.
   if (fields.criminal_firNos) {
@@ -777,55 +784,155 @@ function replaceTextPlaceholders(xml, fields) {
 }
 
 // ─────────────────────────────────────────────
-// TABLE FILLING (Proposers Table)
+// PROPOSER PARAGRAPH FILLING
 // ─────────────────────────────────────────────
 
-function fillProposersTable(xml, merged) {
-  const tables = findTables(xml);
-  if (tables.length === 0) return xml;
-
+/**
+ * Fill proposer data into the numbered paragraphs (1. through 10.).
+ * The DOCX template has numbered paragraphs "1. " "2. " ... "10. " (NOT table rows).
+ * Each paragraph gets the proposer data appended as: "PartNo: X | S.No: Y | Name | Signature | Date"
+ */
+function fillProposerParagraphs(xml, merged) {
   const proposers = merged.proposers || [];
   if (proposers.length === 0) return xml;
 
-  const tableXml = xml.substring(tables[0].start, tables[0].end);
-  const rows = parseTableRows(tableXml);
-
-  // Skip header rows (first 2 rows are headers) — data starts at row index 2
-  // The table has: header row 1, header row 2, then 10 data rows (numbered 1-10)
-  let modified = tableXml;
-
   for (let i = 0; i < Math.min(proposers.length, 10); i++) {
-    const dataRowIdx = i + 2; // skip 2 header rows
-    if (dataRowIdx >= rows.length) break;
-
-    const row = rows[dataRowIdx];
     const p = proposers[i] || {};
+    const num = i + 1;
 
-    // Columns: 0=Sl.no, 1=Part No of Electoral Roll, 2=S.No in that part, 3=Full Name, 4=Signature, 5=Date
-    const cellValues = [
-      null, // Sl.no already has "1.", "2.", etc.
-      p.partNo || "",
-      p.slNo || "",
-      p.fullName || "",
-      p.signature || "",
-      p.date || "",
+    // Build the data string for this proposer
+    const parts = [];
+    if (p.partNo) parts.push(`Part No: ${p.partNo}`);
+    if (p.slNo) parts.push(`S.No: ${p.slNo}`);
+    if (p.fullName) parts.push(p.fullName);
+    if (p.signature) parts.push(p.signature);
+    if (p.date) parts.push(p.date);
+
+    if (parts.length === 0) continue;
+
+    const dataStr = parts.join("  |  ");
+    const escapedData = escapeXml(dataStr);
+
+    // Find the paragraph containing just "N. " or "N." and append data
+    // Pattern: <w:t..."N. "</w:t> or <w:t>"N."</w:t>
+    const numStr = String(num);
+    const patterns = [
+      // "N. " with xml:space="preserve"
+      new RegExp(`(<w:t[^>]*>)(${numStr}\\. )(</w:t>)`, "s"),
+      // "N." without trailing space
+      new RegExp(`(<w:t[^>]*>)(${numStr}\\.)(</w:t>)`, "s"),
     ];
 
-    let newRowXml = row.xml;
-    for (let c = 1; c < Math.min(cellValues.length, row.cells.length); c++) {
-      if (cellValues[c]) {
-        const oldCellXml = row.cells[c].xml;
-        const newCellXml = setCellText(oldCellXml, cellValues[c]);
-        newRowXml = newRowXml.replace(oldCellXml, newCellXml);
+    let found = false;
+    for (const pattern of patterns) {
+      const match = xml.match(pattern);
+      if (match) {
+        // Replace the text content to include proposer data
+        xml = xml.replace(
+          match[0],
+          `${match[1]}${match[2]}${escapedData} ${match[3]}`,
+        );
+        found = true;
+        break;
       }
     }
 
-    modified = modified.replace(row.xml, newRowXml);
+    if (!found) {
+      // Fallback: try to find "N." as standalone text run and append a new run after it
+      const fallbackPattern = new RegExp(
+        `(<w:r>(?:<w:rPr>[^]*?</w:rPr>)?<w:t[^>]*>${numStr}\\.\\s*</w:t></w:r>)`,
+        "s",
+      );
+      const fallbackMatch = xml.match(fallbackPattern);
+      if (fallbackMatch) {
+        const newRun = `<w:r><w:t xml:space="preserve"> ${escapedData}</w:t></w:r>`;
+        xml = xml.replace(fallbackMatch[0], fallbackMatch[0] + newRun);
+      }
+    }
   }
 
-  return (
-    xml.substring(0, tables[0].start) + modified + xml.substring(tables[0].end)
-  );
+  return xml;
+}
+
+// ─────────────────────────────────────────────
+// IMAGE EMBEDDING HELPER
+// ─────────────────────────────────────────────
+
+let imageCounter = 100; // start high to avoid conflicts with existing images
+
+async function downloadImage(url) {
+  try {
+    const response = await fetch(url);
+    if (!response.ok) return null;
+    return Buffer.from(await response.arrayBuffer());
+  } catch {
+    return null;
+  }
+}
+
+function addImageToDocx(zip, imageBuffer, imageId) {
+  const ext = "png";
+  const mediaPath = `word/media/custom_image${imageId}.${ext}`;
+  zip.addFile(mediaPath, imageBuffer);
+
+  // Add relationship
+  let rels = zip.readAsText("word/_rels/document.xml.rels");
+  const relId = `rIdCustomImg${imageId}`;
+  const relEntry = `<Relationship Id="${relId}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/custom_image${imageId}.${ext}"/>`;
+  rels = rels.replace("</Relationships>", relEntry + "</Relationships>");
+  zip.updateFile("word/_rels/document.xml.rels", Buffer.from(rels, "utf8"));
+
+  return relId;
+}
+
+function getInlineImageXml(relId, widthCm, heightCm) {
+  // 1 cm = 360000 EMU
+  const cx = Math.round(widthCm * 360000);
+  const cy = Math.round(heightCm * 360000);
+  const docPrId = imageCounter++;
+  return `<w:drawing><wp:inline distT="0" distB="0" distL="0" distR="0" xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"><wp:extent cx="${cx}" cy="${cy}"/><wp:docPr id="${docPrId}" name="Image${docPrId}"/><a:graphic xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:pic xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:nvPicPr><pic:cNvPr id="${docPrId}" name="img${docPrId}"/><pic:cNvPicPr/></pic:nvPicPr><pic:blipFill><a:blip xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" r:embed="${relId}"/><a:stretch><a:fillRect/></a:stretch></pic:blipFill><pic:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="${cx}" cy="${cy}"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></pic:spPr></pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing>`;
+}
+
+/**
+ * Embed images (photograph, signature) into the DOCX.
+ * Inserts them at known placeholder locations in the document.
+ */
+async function embedImages(zip, xml, merged) {
+  const fields = merged.fields || {};
+
+  // Candidate photograph — insert near "stamp size" text or at beginning
+  if (fields.candidatePhotoUrl) {
+    const imgBuf = await downloadImage(fields.candidatePhotoUrl);
+    if (imgBuf) {
+      const relId = addImageToDocx(zip, imgBuf, 1);
+      const imgXml = getInlineImageXml(relId, 2, 2.5); // 2cm x 2.5cm as per form
+      // Find "photograph" text and insert image run before that paragraph
+      const photoMatch = xml.match(/(<w:p [^>]*>[^]*?photograph[^]*?<\/w:p>)/i);
+      if (photoMatch) {
+        const imgPara = `<w:p><w:r>${imgXml}</w:r></w:p>`;
+        xml = xml.replace(photoMatch[0], imgPara + photoMatch[0]);
+      }
+    }
+  }
+
+  // Candidate signature — insert near "Signature of Candidate" or "Signature of candidate"
+  if (fields.candidateSignatureUrl) {
+    const imgBuf = await downloadImage(fields.candidateSignatureUrl);
+    if (imgBuf) {
+      const relId = addImageToDocx(zip, imgBuf, 2);
+      const imgXml = getInlineImageXml(relId, 4, 1.5); // signature size
+      // Find first "Signature of Candidate" and insert image before it
+      const sigMatch = xml.match(
+        /(<w:p [^>]*>[^]*?Signature of (?:the )?[Cc]andidate[^]*?<\/w:p>)/,
+      );
+      if (sigMatch) {
+        const imgPara = `<w:p><w:r>${imgXml}</w:r></w:p>`;
+        xml = xml.replace(sigMatch[0], imgPara + sigMatch[0]);
+      }
+    }
+  }
+
+  return xml;
 }
 
 // ─────────────────────────────────────────────
@@ -841,8 +948,11 @@ export async function fillNominationTemplate(merged) {
   // Step 1: Replace text placeholders
   xml = replaceTextPlaceholders(xml, fields);
 
-  // Step 2: Fill proposers table
-  xml = fillProposersTable(xml, merged);
+  // Step 2: Fill proposer paragraphs (1. through 10.)
+  xml = fillProposerParagraphs(xml, merged);
+
+  // Step 3: Embed images (photo, signature) if URLs provided
+  xml = await embedImages(zip, xml, merged);
 
   // Write back modified XML
   zip.updateFile("word/document.xml", Buffer.from(xml, "utf8"));
