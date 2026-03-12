@@ -41,7 +41,13 @@ function replaceInXml(xml, searchText, replacement) {
  * The dots/ellipsis between them get replaced with the value.
  * Handles dots spanning multiple XML runs and optional whitespace.
  */
-function replaceDotsBetween(xml, contextBefore, contextAfter, value) {
+function replaceDotsBetween(
+  xml,
+  contextBefore,
+  contextAfter,
+  value,
+  removeAfter = false,
+) {
   if (!value) return xml;
 
   const escBefore = contextBefore.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -52,8 +58,6 @@ function replaceDotsBetween(xml, contextBefore, contextAfter, value) {
   // XML structure that may appear between dot runs (run boundaries + proofErr tags)
   const xmlGap = `(?:</w:t></w:r>(?:<w:proofErr[^/]*/?>)*<w:r>(?:<w:rPr>(?:[^<]|<(?!/w:rPr>))*</w:rPr>)?<w:t[^>]*>)?`;
 
-  // Pattern: before + (dots with optional XML gaps between runs) + optional trailing whitespace/gap + after
-  // Allow optional whitespace before contextAfter (common in template)
   const pattern = new RegExp(
     `(${escBefore})((?:${dotChars}${xmlGap})*${dotChars}(?:${xmlGap})?)\\s*(${escAfter})`,
     "s",
@@ -61,6 +65,7 @@ function replaceDotsBetween(xml, contextBefore, contextAfter, value) {
 
   const match = xml.match(pattern);
   if (match) {
+    const afterText = removeAfter ? "" : match[3];
     // Check if the dots section contains XML tags (cross-run)
     if (match[2].includes("</w:t>")) {
       // Cross-run: put value in first text run, blank out dots in subsequent runs
@@ -71,16 +76,33 @@ function replaceDotsBetween(xml, contextBefore, contextAfter, value) {
         (m, openTag, dots, closeTag) => {
           if (firstRun) {
             firstRun = false;
-            return (openTag || "") + escapeXml(value) + (closeTag || "");
+            return (
+              (openTag
+                ? openTag
+                    .replace(/>$/, ' xml:space="preserve">')
+                    .replace(
+                      / xml:space="preserve" xml:space="preserve"/,
+                      ' xml:space="preserve"',
+                    )
+                : "") +
+              " " +
+              escapeXml(value) +
+              (closeTag || "")
+            );
           }
-          // Clear subsequent dot runs
           return (openTag || "") + (closeTag || "");
         },
       );
-      return xml.replace(match[0], match[1] + dotsSection + " " + match[3]);
+      return xml.replace(
+        match[0],
+        match[1] + dotsSection + (afterText ? " " + afterText : ""),
+      );
     }
     // Same-run: simple replacement
-    return xml.replace(pattern, `$1${escapeXml(value)} $3`);
+    if (removeAfter) {
+      return xml.replace(pattern, `$1 ${escapeXml(value)}`);
+    }
+    return xml.replace(pattern, `$1 ${escapeXml(value)} $3`);
   }
   return xml;
 }
@@ -94,7 +116,7 @@ function replaceDashesBetween(xml, contextBefore, contextAfter, value) {
   const escAfter = contextAfter.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const pattern = new RegExp(`(${escBefore})(-{3,})(${escAfter})`, "s");
   if (xml.match(pattern)) {
-    return xml.replace(pattern, `$1${value}$3`);
+    return xml.replace(pattern, `$1 ${escapeXml(value)} $3`);
   }
   return xml;
 }
@@ -118,7 +140,10 @@ function findTables(xml) {
  * Extract text content from an XML fragment (strip all tags).
  */
 function extractText(xmlFragment) {
-  return xmlFragment.replace(/<[^>]+>/g, "").trim();
+  const raw = xmlFragment.replace(/<[^>]+>/g, "").trim();
+  // Treat cells containing only dots, ellipsis, dashes or whitespace as empty
+  if (/^[….\-\s]*$/.test(raw)) return "";
+  return raw;
 }
 
 /**
@@ -242,7 +267,7 @@ function setCellText(cellXml, value) {
   // Find existing <w:t> tag
   const tMatch = cellXml.match(/<w:t[^>]*>([^<]*)<\/w:t>/);
   if (tMatch) {
-    // Replace the first empty or existing <w:t> content
+    // Replace the first <w:t> content (even if it has dots/ellipsis)
     return cellXml.replace(
       tMatch[0],
       `<w:t xml:space="preserve">${escapeXml(strValue)}</w:t>`,
@@ -300,14 +325,26 @@ function replaceDotsAfter(xml, contextBefore, value) {
         (m, openTag, dots, closeTag) => {
           if (firstRun) {
             firstRun = false;
-            return (openTag || "") + escapeXml(value) + (closeTag || "");
+            return (
+              (openTag
+                ? openTag
+                    .replace(/>$/, ' xml:space="preserve">')
+                    .replace(
+                      / xml:space="preserve" xml:space="preserve"/,
+                      ' xml:space="preserve"',
+                    )
+                : "") +
+              " " +
+              escapeXml(value) +
+              (closeTag || "")
+            );
           }
           return (openTag || "") + (closeTag || "");
         },
       );
       return xml.replace(match[0], match[1] + dotsSection);
     }
-    return xml.replace(match[0], `${match[1]}${escapeXml(value)}`);
+    return xml.replace(match[0], `${match[1]} ${escapeXml(value)}`);
   }
   return xml;
 }
@@ -323,7 +360,7 @@ function replaceTextPlaceholders(xml, fields, merged) {
     fields.assemblyConstituency ||
     merged.constituency ||
     "";
-  xml = replaceDotsBetween(xml, "TO", "(NAME", houseName);
+  xml = replaceDotsBetween(xml, "TO", "(NAME", houseName, true);
 
   // 2. FROM……………………………CONSTITUENCY → constituency
   const constituency =
@@ -353,22 +390,18 @@ function replaceTextPlaceholders(xml, fields, merged) {
 
   // 6. resident of…………………………(mention full postal address)
   const address = fields.postalAddress || "";
-  xml = replaceDotsBetween(
-    xml,
-    "resident of",
-    "(mention full postal address)",
-    address,
-  );
+  xml = replaceDotsBetween(xml, "resident of", "(mention", address, true);
 
   // 7. set up by------------------------------ → party name
   const party = fields.party || "";
-  xml = replaceDashesBetween(xml, "set up by", "\n", party);
-  // Try alternative pattern
   if (party) {
-    const dashPattern = /set up by(-{3,})/;
+    // Match dashes pattern within <w:t> tags
+    const dashPattern = /set up by-{3,}[\s\S]*?(?=<\/w:t>|$)/;
     const dashMatch = xml.match(dashPattern);
     if (dashMatch) {
       xml = xml.replace(dashMatch[0], `set up by ${escapeXml(party)}`);
+    } else {
+      xml = replaceDashesBetween(xml, "set up by", "\n", party);
     }
   }
 
@@ -378,7 +411,7 @@ function replaceTextPlaceholders(xml, fields, merged) {
     fields.assemblyConstituency ||
     merged.constituency ||
     "";
-  xml = replaceDotsBetween(xml, "enrolled in", "(", enrolledIn);
+  xml = replaceDotsBetween(xml, "enrolled in", "(", enrolledIn, true);
 
   // 9. Serial No……….in Part No → serial and part numbers
   const serialNo = fields.serialNumber || "";
@@ -1255,6 +1288,94 @@ async function embedImages(zip, xml, merged) {
  * @param {Object} merged - Merged affidavit data from mergeAffidavitPages()
  * @returns {Buffer} - The filled DOCX file as a buffer
  */
+// ─────────────────────────────────────────────
+// BRACKET HINT CLEANUP
+// ─────────────────────────────────────────────
+
+/**
+ * Remove parenthetical hint text from the filled document.
+ * Only removes hints where the corresponding field has been filled (no dots remain).
+ * Handles both inline hints (within same <w:t> tag) and cross-run hints
+ * (e.g., "(NAME " + "OF " + "THE " + "HOUSE) " in separate <w:r> blocks).
+ */
+function cleanupBracketHints(xml) {
+  // Step 1: Remove standalone bracket-hint <w:r> runs
+  // These are runs that contain ONLY a bracket-hint fragment (with optional tab)
+  // Pattern: <w:r><rPr/><tab?/><w:t>(NAME </w:t></w:r>
+  const standaloneHints = [
+    "\\(NAME ",
+    "HOUSE\\) ",
+    "HOUSE\\)",
+    "CONSTITUENCY\\) ",
+    "CONSTITUENCY\\)",
+  ];
+  for (const hint of standaloneHints) {
+    // Remove entire <w:r> block containing only the hint
+    const runPattern = new RegExp(
+      `<w:r>(?:<w:rPr>[\\s\\S]*?</w:rPr>)?(?:<w:tab/>)?<w:t[^>]*>${hint}</w:t></w:r>`,
+      "g",
+    );
+    xml = xml.replace(runPattern, "");
+  }
+
+  // Remove "OF " and "THE " runs that appear with <w:tab/> (bracket hint context)
+  const tabHints = ["OF ", "THE "];
+  for (const hint of tabHints) {
+    const escHint = hint.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const tabRunPattern = new RegExp(
+      `<w:r>(?:<w:rPr>[\\s\\S]*?</w:rPr>)?<w:tab/><w:t[^>]*>${escHint}</w:t></w:r>`,
+      "g",
+    );
+    xml = xml.replace(tabRunPattern, "");
+  }
+
+  // Step 2: Remove inline bracket hints from <w:t> content
+  // These appear within the same <w:t> tag as other text
+  xml = xml.replace(/<w:t([^>]*)>([^<]*)<\/w:t>/g, (match, attrs, content) => {
+    let newContent = content;
+
+    // Remove known inline bracket hints
+    const inlinePatterns = [
+      [/\s*\(hour\)/g, ""],
+      [/\s*\(date\)/g, ""],
+      [/\s*\(Place\)/g, ""],
+      [/\s*\(State\)/g, ""],
+      [/\s*\(area\)/g, ""],
+      [/\s*\(Name\)/g, ""],
+      [/\s*\(name of the language\)/gi, ""],
+      [/\(mention full postal address\),?/gi, ""],
+      [/mention full postal address\),?/gi, ""],
+      [/\(Name of the Constituency and the state\),?/gi, ""],
+      [/Name of the Constituency and the state\),?/gi, ""],
+      [/\(\*\*name of the political party\)/gi, ""],
+      [/\*\*strike out whichever is not applicable/gi, ""],
+    ];
+
+    // Only remove inline hints if the text around them has NO remaining dots
+    // (meaning the field was filled)
+    const hasDots = /[…]{2,}|\.{4,}/.test(content);
+    if (!hasDots) {
+      for (const [pattern, replacement] of inlinePatterns) {
+        newContent = newContent.replace(pattern, replacement);
+      }
+    }
+
+    if (newContent !== content) {
+      return `<w:t xml:space="preserve">${newContent}</w:t>`;
+    }
+    return match;
+  });
+
+  // Step 3: Remove standalone bracket runs for nomination-style "(State)" split as "(", "State", ")"
+  // Pattern: <w:r><w:t>(</w:t></w:r> followed by <w:r>...<w:t>State</w:t></w:r> followed by <w:r><w:t>)  </w:t></w:r>
+  xml = xml.replace(
+    /<w:r>(?:<w:rPr>[\s\S]*?<\/w:rPr>)?<w:t[^>]*>\(<\/w:t><\/w:r>\s*<w:r>(?:<w:rPr>[\s\S]*?<\/w:rPr>)?<w:t[^>]*>State<\/w:t><\/w:r>\s*<w:r>(?:<w:rPr>[\s\S]*?<\/w:rPr>)?<w:t[^>]*>\)\s*<\/w:t><\/w:r>/g,
+    "",
+  );
+
+  return xml;
+}
+
 export async function fillAffidavitTemplate(merged) {
   const zip = new AdmZip(TEMPLATE_PATH);
   let xml = zip.readAsText("word/document.xml");
@@ -1275,6 +1396,9 @@ export async function fillAffidavitTemplate(merged) {
 
   // Step 5: Embed images (photo, signature) if URLs provided
   xml = await embedImages(zip, xml, merged);
+
+  // Step 6: Clean up bracket hints for filled fields
+  xml = cleanupBracketHints(xml);
 
   // Write back modified XML
   zip.updateFile("word/document.xml", Buffer.from(xml, "utf8"));

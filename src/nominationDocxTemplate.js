@@ -36,7 +36,13 @@ function escapeXml(str) {
 /**
  * Replace ellipsis/dot patterns between context markers.
  */
-function replaceDotsBetween(xml, contextBefore, contextAfter, value) {
+function replaceDotsBetween(
+  xml,
+  contextBefore,
+  contextAfter,
+  value,
+  removeAfter = false,
+) {
   if (!value) return xml;
 
   const escBefore = contextBefore.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -52,6 +58,7 @@ function replaceDotsBetween(xml, contextBefore, contextAfter, value) {
 
   const match = xml.match(pattern);
   if (match) {
+    const afterText = removeAfter ? "" : match[3];
     if (match[2].includes("</w:t>")) {
       let dotsSection = match[2];
       let firstRun = true;
@@ -60,14 +67,32 @@ function replaceDotsBetween(xml, contextBefore, contextAfter, value) {
         (m, openTag, dots, closeTag) => {
           if (firstRun) {
             firstRun = false;
-            return (openTag || "") + escapeXml(value) + (closeTag || "");
+            return (
+              (openTag
+                ? openTag
+                    .replace(/>$/, ' xml:space="preserve">')
+                    .replace(
+                      / xml:space="preserve" xml:space="preserve"/,
+                      ' xml:space="preserve"',
+                    )
+                : "") +
+              " " +
+              escapeXml(value) +
+              (closeTag || "")
+            );
           }
           return (openTag || "") + (closeTag || "");
         },
       );
-      return xml.replace(match[0], match[1] + dotsSection + " " + match[3]);
+      return xml.replace(
+        match[0],
+        match[1] + dotsSection + (afterText ? " " + afterText : ""),
+      );
     }
-    return xml.replace(pattern, `$1${escapeXml(value)} $3`);
+    if (removeAfter) {
+      return xml.replace(pattern, `$1 ${escapeXml(value)}`);
+    }
+    return xml.replace(pattern, `$1 ${escapeXml(value)} $3`);
   }
   return xml;
 }
@@ -97,14 +122,26 @@ function replaceDotsAfter(xml, contextBefore, value) {
         (m, openTag, dots, closeTag) => {
           if (firstRun) {
             firstRun = false;
-            return (openTag || "") + escapeXml(value) + (closeTag || "");
+            return (
+              (openTag
+                ? openTag
+                    .replace(/>$/, ' xml:space="preserve">')
+                    .replace(
+                      / xml:space="preserve" xml:space="preserve"/,
+                      ' xml:space="preserve"',
+                    )
+                : "") +
+              " " +
+              escapeXml(value) +
+              (closeTag || "")
+            );
           }
           return (openTag || "") + (closeTag || "");
         },
       );
       return xml.replace(match[0], match[1] + dotsSection);
     }
-    return xml.replace(match[0], `${match[1]}${escapeXml(value)}`);
+    return xml.replace(match[0], `${match[1]} ${escapeXml(value)}`);
   }
   return xml;
 }
@@ -122,7 +159,9 @@ function findTables(xml) {
 }
 
 function extractText(xmlFragment) {
-  return xmlFragment.replace(/<[^>]+>/g, "").trim();
+  const raw = xmlFragment.replace(/<[^>]+>/g, "").trim();
+  if (/^[….\.\-\s]*$/.test(raw)) return "";
+  return raw;
 }
 
 function parseTableRows(tableXml) {
@@ -247,7 +286,13 @@ function setCellText(cellXml, value) {
 
 function replaceTextPlaceholders(xml, fields) {
   // Header: Election to the Legislative Assembly of...........(State)
-  xml = replaceDotsBetween(xml, "Assembly of", "(State", fields.state || "");
+  xml = replaceDotsBetween(
+    xml,
+    "Assembly of",
+    "(State",
+    fields.state || "",
+    true,
+  );
 
   // ── PART I ──
 
@@ -465,6 +510,7 @@ function replaceTextPlaceholders(xml, fields) {
       "above in",
       "(name of the language)",
       fields.language,
+      true,
     );
   }
 
@@ -494,7 +540,13 @@ function replaceTextPlaceholders(xml, fields) {
 
   // "in relation to...............(area)"
   if (fields.scStArea) {
-    xml = replaceDotsBetween(xml, "relation to", "(area)", fields.scStArea);
+    xml = replaceDotsBetween(
+      xml,
+      "relation to",
+      "(area)",
+      fields.scStArea,
+      true,
+    );
   }
 
   // "Legislative Assembly ............... of (State)"
@@ -697,12 +749,18 @@ function replaceTextPlaceholders(xml, fields) {
 
   // "at my office at..............(hour)"
   if (fields.partIV_hour) {
-    xml = replaceDotsBetween(xml, "office at", "(hour)", fields.partIV_hour);
+    xml = replaceDotsBetween(
+      xml,
+      "office at",
+      "(hour)",
+      fields.partIV_hour,
+      true,
+    );
   }
 
   // "on............(date)"
   if (fields.partIV_date) {
-    xml = replaceDotsBetween(xml, "on", "(date)", fields.partIV_date);
+    xml = replaceDotsBetween(xml, "on", "(date)", fields.partIV_date, true);
   }
 
   // "Date..................."
@@ -751,12 +809,12 @@ function replaceTextPlaceholders(xml, fields) {
 
   // "at..............(hour)" (Part VI)
   if (fields.partVI_hour) {
-    xml = replaceDotsBetween(xml, "at", "(hour)", fields.partVI_hour);
+    xml = replaceDotsBetween(xml, "at", "(hour)", fields.partVI_hour, true);
   }
 
   // "on......................(date)" (Part VI)
   if (fields.partVI_date) {
-    xml = replaceDotsBetween(xml, "on", "(date)", fields.partVI_date);
+    xml = replaceDotsBetween(xml, "on", "(date)", fields.partVI_date, true);
   }
 
   // "at ..............(hour) on.....................(date) at.....(Place)"
@@ -766,19 +824,106 @@ function replaceTextPlaceholders(xml, fields) {
       "scrutiny at ",
       "(hour)",
       fields.partVI_scrutinyHour,
+      true,
     );
   }
   if (fields.partVI_scrutinyDate) {
-    xml = replaceDotsBetween(xml, "on", "(date)", fields.partVI_scrutinyDate);
+    xml = replaceDotsBetween(
+      xml,
+      "on",
+      "(date)",
+      fields.partVI_scrutinyDate,
+      true,
+    );
   }
   if (fields.partVI_scrutinyPlace) {
-    xml = replaceDotsBetween(xml, "at", "(Place)", fields.partVI_scrutinyPlace);
+    xml = replaceDotsBetween(
+      xml,
+      "at",
+      "(Place)",
+      fields.partVI_scrutinyPlace,
+      true,
+    );
   }
 
   // "Date..............."
   if (fields.partVI_roDate) {
     xml = replaceDotsAfter(xml, "Date", fields.partVI_roDate);
   }
+
+  return xml;
+}
+
+// ─────────────────────────────────────────────
+// BRACKET HINT CLEANUP
+// ─────────────────────────────────────────────
+
+/**
+ * Remove leftover bracket hints from the XML after fields have been filled.
+ * Only removes hints when the surrounding text no longer contains dot placeholders.
+ */
+function cleanupBracketHints(xml) {
+  // Step 1: Remove standalone bracket-hint <w:r> runs
+  // These are entire runs whose <w:t> content is ONLY a bracket fragment
+  const standaloneHintPatterns = [
+    /\(NAME\s*/,
+    /HOUSE\)\s*/,
+    /CONSTITUENCY\)\s*/,
+  ];
+  for (const hintRe of standaloneHintPatterns) {
+    xml = xml.replace(
+      new RegExp(
+        `<w:r>(?:<w:rPr>[\\s\\S]*?</w:rPr>)?(?:<w:tab/>)?<w:t[^>]*>(${hintRe.source})</w:t></w:r>`,
+        "g",
+      ),
+      "",
+    );
+  }
+
+  // Step 2: Remove tab-prefixed "OF " and "THE " runs (part of bracket hint sequences)
+  const tabHints = ["OF ", "THE "];
+  for (const hint of tabHints) {
+    const escHint = hint.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    xml = xml.replace(
+      new RegExp(
+        `<w:r>(?:<w:rPr>[\\s\\S]*?</w:rPr>)?<w:tab/><w:t[^>]*>${escHint}</w:t></w:r>`,
+        "g",
+      ),
+      "",
+    );
+  }
+
+  // Step 3: Remove "(State)" split across runs: <w:t>(</w:t> + <w:t>State</w:t> + <w:t>)  </w:t>
+  xml = xml.replace(
+    /<w:r>(?:<w:rPr>[\s\S]*?<\/w:rPr>)?<w:t[^>]*>\(<\/w:t><\/w:r>\s*<w:r>(?:<w:rPr>[\s\S]*?<\/w:rPr>)?<w:t[^>]*>State<\/w:t><\/w:r>\s*<w:r>(?:<w:rPr>[\s\S]*?<\/w:rPr>)?<w:t[^>]*>\)\s*<\/w:t><\/w:r>/g,
+    "",
+  );
+
+  // Step 4: Remove inline bracket hints within <w:t> content (only if no dots remain in that tag)
+  xml = xml.replace(/<w:t([^>]*)>([^<]*)<\/w:t>/g, (match, attrs, content) => {
+    // Only remove if no dot/ellipsis placeholders remain
+    if (/[…]/.test(content) || /\.{3,}/.test(content)) return match;
+
+    let newContent = content;
+    const inlineHints = [
+      /\s*\(hour\)/g,
+      /\s*\(date\)/g,
+      /\s*\(Place\)/g,
+      /\s*\(State\)/g,
+      /\s*\(area\)/g,
+      /\s*\(Name\)/g,
+      /\s*\(name of the language\)/gi,
+      /\s*\(mention full postal address\)/gi,
+    ];
+    for (const re of inlineHints) {
+      newContent = newContent.replace(re, "");
+    }
+
+    if (newContent !== content) {
+      return `<w:t xml:space="preserve">${newContent}</w:t>`;
+    }
+    return match;
+  });
 
   return xml;
 }
@@ -953,6 +1098,9 @@ export async function fillNominationTemplate(merged) {
 
   // Step 3: Embed images (photo, signature) if URLs provided
   xml = await embedImages(zip, xml, merged);
+
+  // Step 4: Clean up leftover bracket hints
+  xml = cleanupBracketHints(xml);
 
   // Write back modified XML
   zip.updateFile("word/document.xml", Buffer.from(xml, "utf8"));
