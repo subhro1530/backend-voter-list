@@ -21,6 +21,7 @@ Build a **full-page manual data entry form** for the Indian Election Affidavit (
 | -------- | ----------------------------------------------------------- | -------------------------------------------------------------- |
 | `GET`    | `/affidavits/form-schema`                                   | Returns the full form schema (sections, fields, tables, types) |
 | `POST`   | `/affidavits/manual-entry`                                  | Create or update an affidavit session                          |
+| `POST`   | `/affidavits/upload-image`                                  | Upload candidate photo or signature to Cloudinary              |
 | `GET`    | `/affidavits/sessions`                                      | List all affidavit sessions                                    |
 | `GET`    | `/affidavits/sessions/:id`                                  | Get session detail with all form data                          |
 | `DELETE` | `/affidavits/sessions/:id`                                  | Delete a session                                               |
@@ -31,11 +32,28 @@ Build a **full-page manual data entry form** for the Indian Election Affidavit (
 
 All endpoints require `Authorization: Bearer <token>` header (admin role).
 
+### Image Upload Endpoint
+
+**`POST /affidavits/upload-image`** — Upload a candidate photograph or deponent signature image.
+
+- **Content-Type:** `multipart/form-data`
+- **Body:** A single file field named `image` (max 5 MB, JPEG or PNG)
+- **Response:**
+
+```json
+{
+  "url": "https://res.cloudinary.com/.../affidavit_images/abc123.jpg",
+  "publicId": "affidavit_images/abc123"
+}
+```
+
+**Usage:** Call this endpoint first to upload the image, then store the returned `url` in the form data as `candidatePhotoUrl` or `candidateSignatureUrl` before saving via `POST /affidavits/manual-entry`.
+
 ---
 
 ## Form Structure — Complete Field Reference
 
-The form has **14 sections**. Below is every section and every field exactly as they appear in the original **Form 26 DOCX template**. The `name` is the JSON key to send to the backend.
+The form has **16 sections**. Below is every section and every field exactly as they appear in the original **Form 26 DOCX template**. The `name` is the JSON key to send to the backend.
 
 ---
 
@@ -55,22 +73,26 @@ These fields fill the header of the Form: "AFFIDAVIT TO BE FILED BY THE CANDIDAT
 
 These fields fill the opening paragraph: "I \_\_\_\_ son/daughter/wife of \_\_\_\_ Aged \_\_\_\_ years, resident of \_\_\_\_, a candidate set up by \_\_\_\_ / contesting as Independent..."
 
-| Field Name                | Label                                | Type     | Placeholder/Notes                          |
-| ------------------------- | ------------------------------------ | -------- | ------------------------------------------ |
-| `candidateName`           | Candidate Full Name                  | text     |                                            |
-| `fatherMotherHusbandName` | Father's / Mother's / Husband's Name | text     |                                            |
-| `age`                     | Age (years)                          | text     | Just the number                            |
-| `postalAddress`           | Full Postal Address                  | textarea | "mention full postal address" per the form |
-| `party`                   | Political Party Name                 | text     | Leave blank if independent                 |
-| `isIndependent`           | Contesting as Independent            | checkbox | Strike-out alternative per form rules      |
-| `enrolledConstituency`    | Enrolled Constituency & State        | text     | "Name of the Constituency and the state"   |
-| `serialNumber`            | Serial No. in Electoral Roll         | text     |                                            |
-| `partNumber`              | Part No. in Electoral Roll           | text     |                                            |
-| `telephone`               | Telephone Number(s)                  | text     |                                            |
-| `email`                   | Email ID                             | text     | "if any" per the form                      |
-| `socialMedia1`            | Social Media Account (i)             | text     | "if any" per the form                      |
-| `socialMedia2`            | Social Media Account (ii)            | text     |                                            |
-| `socialMedia3`            | Social Media Account (iii)           | text     |                                            |
+| Field Name                | Label                                | Type         | Placeholder/Notes                                                                          |
+| ------------------------- | ------------------------------------ | ------------ | ------------------------------------------------------------------------------------------ |
+| `candidateName`           | Candidate Full Name                  | text         |                                                                                            |
+| `fatherMotherHusbandName` | Father's / Mother's / Husband's Name | text         |                                                                                            |
+| `age`                     | Age (years)                          | text         | Just the number                                                                            |
+| `postalAddress`           | Full Postal Address                  | textarea     | "mention full postal address" per the form                                                 |
+| `party`                   | Political Party Name                 | text         | Leave blank if independent                                                                 |
+| `isIndependent`           | Contesting as Independent            | checkbox     | Strike-out alternative per form rules                                                      |
+| `enrolledConstituency`    | Enrolled Constituency & State        | text         | "Name of the Constituency and the state"                                                   |
+| `serialNumber`            | Serial No. in Electoral Roll         | text         |                                                                                            |
+| `partNumber`              | Part No. in Electoral Roll           | text         |                                                                                            |
+| `telephone`               | Telephone Number(s)                  | text         |                                                                                            |
+| `email`                   | Email ID                             | text         | "if any" per the form                                                                      |
+| `socialMedia1`            | Social Media Account (i)             | text         | "if any" per the form                                                                      |
+| `socialMedia2`            | Social Media Account (ii)            | text         |                                                                                            |
+| `socialMedia3`            | Social Media Account (iii)           | text         |                                                                                            |
+| `candidatePhotoUrl`       | Candidate Photograph                 | image_upload | Upload passport-size photograph. Use `POST /affidavits/upload-image` first, store the URL. |
+| `candidateSignatureUrl`   | Deponent Signature                   | image_upload | Upload scanned signature. Use `POST /affidavits/upload-image` first, store the URL.        |
+
+**Image upload fields:** These are not text inputs. Render a file picker + upload button. When the user selects a file, call `POST /affidavits/upload-image`, then store the returned `url` in the form state under the corresponding field name. Display a thumbnail preview of the uploaded image.
 
 ---
 
@@ -409,15 +431,32 @@ From the form: "(ii) Government Dues" — includes accommodation, transport, tax
 
 ---
 
+### Section 10A: Disputed Liabilities
+
+From the form: Any liabilities that are disputed by the candidate.
+
+| Field Name            | Label                           | Type     | Placeholder                            |
+| --------------------- | ------------------------------- | -------- | -------------------------------------- |
+| `disputedLiabilities` | Details of disputed liabilities | textarea | "Write NIL if no disputed liabilities" |
+
+---
+
 ### Section 11: Government Accommodation
 
 From the form: "Dues to departments dealing with Government accommodation — Has the Deponent been in occupation of accommodation provided by the Government at any time during the last ten years?"
 
-| Field Name                         | Label                                          | Type     | Options/Notes                                              |
-| ---------------------------------- | ---------------------------------------------- | -------- | ---------------------------------------------------------- |
-| `governmentAccommodation.occupied` | Occupied Govt. accommodation in last 10 years? | select   | "Yes" / "No"                                               |
-| `governmentAccommodation.address`  | Address of Govt. accommodation                 | textarea | Only if Yes                                                |
-| `governmentAccommodation.noDues`   | No dues payable as on date                     | select   | "Yes" / "No" — requires No Dues Certificate per form rules |
+| Field Name                                | Label                                          | Type     | Options/Notes                                              |
+| ----------------------------------------- | ---------------------------------------------- | -------- | ---------------------------------------------------------- |
+| `governmentAccommodation.occupied`        | Occupied Govt. accommodation in last 10 years? | select   | "Yes" / "No"                                               |
+| `governmentAccommodation.address`         | Address of Govt. accommodation                 | textarea | Only if Yes                                                |
+| `governmentAccommodation.noDues`          | No dues payable as on date                     | select   | "Yes" / "No" — requires No Dues Certificate per form rules |
+| `governmentAccommodation.duesDate`        | Dues payable as on date (if applicable)        | text     | DD/MM/YYYY — Only if `noDues` is "No"                      |
+| `governmentAccommodation.rentDues`        | Rent dues (Rs.)                                | text     | Only if `noDues` is "No"                                   |
+| `governmentAccommodation.electricityDues` | Electricity dues (Rs.)                         | text     | Only if `noDues` is "No"                                   |
+| `governmentAccommodation.waterDues`       | Water dues (Rs.)                               | text     | Only if `noDues` is "No"                                   |
+| `governmentAccommodation.telephoneDues`   | Telephone dues (Rs.)                           | text     | Only if `noDues` is "No"                                   |
+
+**Conditional display:** Show the dues breakdown fields (`duesDate`, `rentDues`, `electricityDues`, `waterDues`, `telephoneDues`) only when `governmentAccommodation.noDues` is "No".
 
 ---
 
@@ -471,6 +510,20 @@ From the form: "Verified at \_\_\_\_ this the \_\_\_\_ day of \_\_\_\_"
 
 ---
 
+### Section 16: Oath Commissioner / Notary Details
+
+From the form: "Before me, \_\_\_\_ (Name of the Oath Commissioner / Magistrate / Notary)"
+
+The affidavit must be sworn before an Oath Commissioner, First Class Magistrate, or Notary Public. Their details are required.
+
+| Field Name                    | Label                              | Type | Placeholder                                |
+| ----------------------------- | ---------------------------------- | ---- | ------------------------------------------ |
+| `oathCommissionerName`        | Name of Oath Commissioner / Notary | text |                                            |
+| `oathCommissionerDesignation` | Designation                        | text | e.g. "Notary Public" / "Oath Commissioner" |
+| `oathCommissionerSealNo`      | Seal / Registration No.            | text |                                            |
+
+---
+
 ## Complete JSON Payload — Example `POST /affidavits/manual-entry`
 
 ```json
@@ -492,6 +545,8 @@ From the form: "Verified at \_\_\_\_ this the \_\_\_\_ day of \_\_\_\_"
   "socialMedia1": "@rajeshsharma (Twitter)",
   "socialMedia2": "facebook.com/rajeshsharma",
   "socialMedia3": "",
+  "candidatePhotoUrl": "https://res.cloudinary.com/.../affidavit_images/photo123.jpg",
+  "candidateSignatureUrl": "https://res.cloudinary.com/.../affidavit_images/sig456.jpg",
   "panEntries": [
     {
       "slNo": "1",
@@ -550,8 +605,16 @@ From the form: "Verified at \_\_\_\_ this the \_\_\_\_ day of \_\_\_\_"
     "municipalSelf": "12000",
     "totalSelf": "12000"
   },
+  "disputedLiabilities": "NIL",
   "governmentAccommodation": {
-    "occupied": "No"
+    "occupied": "No",
+    "address": "",
+    "noDues": "Yes",
+    "duesDate": "",
+    "rentDues": "",
+    "electricityDues": "",
+    "waterDues": "",
+    "telephoneDues": ""
   },
   "selfProfession": "Advocate",
   "spouseProfession": "Homemaker",
@@ -566,7 +629,10 @@ From the form: "Verified at \_\_\_\_ this the \_\_\_\_ day of \_\_\_\_"
   "contractsPrivateCompanies": "Not Applicable",
   "educationalQualification": "LL.B., University of Calcutta, 1998",
   "verificationPlace": "Kolkata",
-  "verificationDate": "15/03/2026"
+  "verificationDate": "15/03/2026",
+  "oathCommissionerName": "Mr. Sanjay Mukherjee",
+  "oathCommissionerDesignation": "Notary Public",
+  "oathCommissionerSealNo": "NP/KOL/2019/1234"
 }
 ```
 
