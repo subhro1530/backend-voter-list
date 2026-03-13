@@ -270,6 +270,8 @@ WHERE (election_year IS NULL)
 -- Create indexes after columns are ensured to exist
 CREATE INDEX IF NOT EXISTS idx_session_voters_religion ON session_voters(religion);
 CREATE INDEX IF NOT EXISTS idx_session_voters_is_printed ON session_voters(is_printed);
+CREATE INDEX IF NOT EXISTS idx_session_voters_session_page_serial ON session_voters(session_id, page_number, serial_number);
+CREATE INDEX IF NOT EXISTS idx_session_voters_session_first_row ON session_voters(session_id, page_number, id);
 CREATE INDEX IF NOT EXISTS idx_sessions_assembly_name ON sessions(assembly_name);
 CREATE INDEX IF NOT EXISTS idx_sessions_booth_no ON sessions(booth_no);
 CREATE INDEX IF NOT EXISTS idx_election_sessions_election_year ON election_sessions(election_year);

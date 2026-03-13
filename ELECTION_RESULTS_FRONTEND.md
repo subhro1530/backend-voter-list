@@ -44,6 +44,10 @@ All APIs require admin JWT bearer token.
 
 - Use when user clicks a booth row (or row action) in results table.
 - Returns matched voter sessions and voters from the best session.
+- Supports optional query params:
+  - `limit` (default 200)
+  - `voterSessionId` (preferred voter session for that booth)
+- Response now includes `selectionSource` with values: `query`, `memory`, `auto`, `none`.
 
 ### Voter Sessions
 
@@ -155,6 +159,29 @@ Do not create a brand new component architecture. Extend your current components
 2. "View Voters" must open voters of that same booth only.
 3. "View Booth Result" from voter session must show full booth election data from fullResults.
 4. Keep assembly context strict; do not cross-show another assembly booth.
+
+## Performance + Session Memory Behavior
+
+1. Persist the last selected voter session per booth in frontend storage.
+
+- Key format: `booth-selection:${electionSessionId}:${normalizedBooth}`
+- Value: selected `voterSessionId`
+
+2. On clicking "View Voters":
+
+- Read stored `voterSessionId` for this booth.
+- Call `GET /election-results/sessions/:id/booths/:boothNo/voter-list?voterSessionId=<storedId>&limit=200`.
+- If API returns 400, retry once without `voterSessionId`.
+
+3. After successful response:
+
+- Save `selectedSession.id` back to storage using the same key.
+- If `selectionSource` is `memory`, show a subtle label like "Opened last used voter session".
+
+4. If multiple `voterSessions` are returned, provide a session switcher (dropdown/chips) in the existing panel.
+
+- On switch, call same endpoint with chosen `voterSessionId`.
+- Update stored key immediately.
 
 ## Acceptance Criteria
 

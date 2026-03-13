@@ -45,38 +45,122 @@ router.use(adminOnly);
 
 const storageRoot = path.join(process.cwd(), "storage", "elections");
 
-async function getVoterSessionBoothMeta() {
-  const result = await query(
-    `SELECT s.id,
-            s.original_filename,
-            s.assembly_name,
-            s.booth_no,
-            s.booth_name,
-            s.created_at,
-            sv.assembly AS fallback_assembly,
-            sv.part_number AS fallback_booth,
-            sv.voter_count
-     FROM sessions s
-     LEFT JOIN LATERAL (
-       SELECT v.assembly,
-              v.part_number,
-              COUNT(*) OVER (PARTITION BY v.session_id) AS voter_count
-       FROM session_voters v
-       WHERE v.session_id = s.id
-       ORDER BY v.page_number ASC, v.id ASC
-       LIMIT 1
-     ) sv ON true`,
-  );
+const VOTER_SESSION_META_TTL_MS = Math.max(
+  Number(process.env.VOTER_SESSION_META_TTL_MS) || 60_000,
+  5_000,
+);
+const voterSessionMetaCache = {
+  data: null,
+  expiresAt: 0,
+  inFlight: null,
+};
 
-  return result.rows.map((row) => ({
-    id: row.id,
-    originalFilename: row.original_filename,
-    boothName: row.booth_name || "",
-    createdAt: row.created_at,
-    voterCount: Number(row.voter_count || 0),
-    assembly: row.assembly_name || row.fallback_assembly || "",
-    boothNo: normalizeBoothNo(row.booth_no || row.fallback_booth || ""),
-  }));
+const BOOTH_SELECTION_TTL_MS = Math.max(
+  Number(process.env.BOOTH_SELECTION_TTL_MS) || 30 * 60 * 1000,
+  60_000,
+);
+const boothSelectionMemory = new Map();
+
+function getBoothSelectionKey(electionSessionId, normalizedBooth) {
+  return `${electionSessionId}:${normalizedBooth}`;
+}
+
+function pruneBoothSelectionMemory() {
+  const now = Date.now();
+  for (const [key, value] of boothSelectionMemory.entries()) {
+    if (!value || value.expiresAt <= now) {
+      boothSelectionMemory.delete(key);
+    }
+  }
+}
+
+function rememberBoothSelection(
+  electionSessionId,
+  normalizedBooth,
+  voterSessionId,
+) {
+  pruneBoothSelectionMemory();
+  boothSelectionMemory.set(
+    getBoothSelectionKey(electionSessionId, normalizedBooth),
+    {
+      voterSessionId,
+      expiresAt: Date.now() + BOOTH_SELECTION_TTL_MS,
+    },
+  );
+}
+
+function readRememberedBoothSelection(electionSessionId, normalizedBooth) {
+  const key = getBoothSelectionKey(electionSessionId, normalizedBooth);
+  const remembered = boothSelectionMemory.get(key);
+  if (!remembered) return null;
+  if (remembered.expiresAt <= Date.now()) {
+    boothSelectionMemory.delete(key);
+    return null;
+  }
+  return remembered.voterSessionId;
+}
+
+async function getVoterSessionBoothMeta() {
+  if (
+    voterSessionMetaCache.data &&
+    voterSessionMetaCache.expiresAt > Date.now()
+  ) {
+    return voterSessionMetaCache.data;
+  }
+
+  if (voterSessionMetaCache.inFlight) {
+    return voterSessionMetaCache.inFlight;
+  }
+
+  voterSessionMetaCache.inFlight = (async () => {
+    const result = await query(
+      `WITH first_voter AS (
+         SELECT DISTINCT ON (v.session_id)
+                v.session_id,
+                v.assembly,
+                v.part_number
+         FROM session_voters v
+         ORDER BY v.session_id, v.page_number ASC, v.id ASC
+       ),
+       voter_counts AS (
+         SELECT v.session_id, COUNT(*)::INT AS voter_count
+         FROM session_voters v
+         GROUP BY v.session_id
+       )
+       SELECT s.id,
+              s.original_filename,
+              s.assembly_name,
+              s.booth_no,
+              s.booth_name,
+              s.created_at,
+              fv.assembly AS fallback_assembly,
+              fv.part_number AS fallback_booth,
+              vc.voter_count
+       FROM sessions s
+       LEFT JOIN first_voter fv ON fv.session_id = s.id
+       LEFT JOIN voter_counts vc ON vc.session_id = s.id`,
+    );
+
+    const mapped = result.rows.map((row) => ({
+      id: row.id,
+      originalFilename: row.original_filename,
+      boothName: row.booth_name || "",
+      createdAt: row.created_at,
+      voterCount: Number(row.voter_count || 0),
+      assembly: row.assembly_name || row.fallback_assembly || "",
+      boothNo: normalizeBoothNo(row.booth_no || row.fallback_booth || ""),
+    }));
+
+    voterSessionMetaCache.data = mapped;
+    voterSessionMetaCache.expiresAt = Date.now() + VOTER_SESSION_META_TTL_MS;
+    return mapped;
+  })();
+
+  try {
+    return await voterSessionMetaCache.inFlight;
+  } finally {
+    voterSessionMetaCache.inFlight = null;
+  }
 }
 
 function findBestVoterSession(voterSessions, electionConstituency, boothNo) {
@@ -1023,6 +1107,10 @@ router.get("/sessions/:id/booths/:boothNo/voter-list", async (req, res) => {
   try {
     const { id, boothNo } = req.params;
     const limit = Math.min(Number(req.query.limit) || 200, 1000);
+    const requestedVoterSessionId =
+      typeof req.query.voterSessionId === "string"
+        ? req.query.voterSessionId.trim()
+        : "";
 
     const electionSession = await query(
       "SELECT id, constituency, election_year FROM election_sessions WHERE id=$1",
@@ -1057,13 +1145,51 @@ router.get("/sessions/:id/booths/:boothNo/voter-list", async (req, res) => {
       return res.json({
         electionSession: electionSession.rows[0],
         boothNo,
+        normalizedBooth,
         voterSessions: [],
+        selectedSession: null,
+        selectionSource: "none",
         voters: [],
         count: 0,
+        limit,
       });
     }
 
-    const primary = matchingSessions[0];
+    let selectedSession = null;
+    let selectionSource = "auto";
+
+    if (requestedVoterSessionId) {
+      selectedSession =
+        matchingSessions.find((s) => s.id === requestedVoterSessionId) || null;
+      if (!selectedSession) {
+        return res.status(400).json({
+          error: "Requested voter session does not match this booth/assembly",
+          requestedVoterSessionId,
+        });
+      }
+      selectionSource = "query";
+    }
+
+    if (!selectedSession) {
+      const rememberedSessionId = readRememberedBoothSelection(
+        id,
+        normalizedBooth,
+      );
+      if (rememberedSessionId) {
+        selectedSession =
+          matchingSessions.find((s) => s.id === rememberedSessionId) || null;
+        if (selectedSession) {
+          selectionSource = "memory";
+        }
+      }
+    }
+
+    if (!selectedSession) {
+      selectedSession = matchingSessions[0];
+    }
+
+    rememberBoothSelection(id, normalizedBooth, selectedSession.id);
+
     const voters = await query(
       `SELECT id, session_id, page_number, assembly, part_number, section, serial_number,
               voter_id, name, relation_type, relation_name, house_number, age, gender,
@@ -1072,7 +1198,7 @@ router.get("/sessions/:id/booths/:boothNo/voter-list", async (req, res) => {
        WHERE session_id = $1
        ORDER BY page_number, serial_number
        LIMIT $2`,
-      [primary.id, limit],
+      [selectedSession.id, limit],
     );
 
     res.json({
@@ -1080,7 +1206,8 @@ router.get("/sessions/:id/booths/:boothNo/voter-list", async (req, res) => {
       boothNo,
       normalizedBooth,
       voterSessions: matchingSessions,
-      selectedSession: primary,
+      selectedSession,
+      selectionSource,
       voters: voters.rows,
       count: voters.rowCount,
       limit,
