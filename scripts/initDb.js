@@ -30,9 +30,6 @@ CREATE TABLE IF NOT EXISTS sessions (
   updated_at TIMESTAMPTZ DEFAULT now()
 );
 
-CREATE INDEX IF NOT EXISTS idx_sessions_assembly_name ON sessions(assembly_name);
-CREATE INDEX IF NOT EXISTS idx_sessions_booth_no ON sessions(booth_no);
-
 CREATE TABLE IF NOT EXISTS session_pages (
   id BIGSERIAL PRIMARY KEY,
   session_id UUID REFERENCES sessions(id) ON DELETE CASCADE,
@@ -94,7 +91,6 @@ CREATE TABLE IF NOT EXISTS election_sessions (
 );
 
 CREATE INDEX IF NOT EXISTS idx_election_sessions_constituency ON election_sessions(constituency);
-CREATE INDEX IF NOT EXISTS idx_election_sessions_election_year ON election_sessions(election_year);
 
 -- Election result pages
 CREATE TABLE IF NOT EXISTS election_pages (
