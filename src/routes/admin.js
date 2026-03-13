@@ -22,7 +22,9 @@ router.use(adminOnly);
 router.get("/sessions", async (_req, res) => {
   try {
     const sql = `
-      SELECT s.id, s.original_filename, s.status, s.total_pages, s.processed_pages, s.booth_name, s.created_at, s.updated_at,
+          SELECT s.id, s.original_filename, s.status, s.total_pages, s.processed_pages,
+            s.assembly_name, s.booth_no, s.booth_name,
+            s.created_at, s.updated_at,
              COUNT(DISTINCT p.id) AS page_count,
              COUNT(v.id) AS voter_count,
              COUNT(CASE WHEN v.is_printed = true THEN 1 END) AS printed_count

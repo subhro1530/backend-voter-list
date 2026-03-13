@@ -38,6 +38,12 @@ import {
   uploadBase64Image,
   extractVoterPhotosFromPage,
 } from "./cloudinary.js";
+import {
+  normalizeBoothNo,
+  normalizeAssemblyName,
+  assemblyLooksRelated,
+  autoSessionName,
+} from "./boothLinking.js";
 
 /**
  * Sanitize voter ID: if it contains slashes (like WB/01/003/000070) it's
@@ -205,6 +211,43 @@ function buildVoterFilter(params, startIndex = 1) {
   return { where, values };
 }
 
+async function getSessionBoothMeta(sessionId) {
+  const result = await query(
+    `SELECT s.id,
+            s.original_filename,
+            s.assembly_name,
+            s.booth_no,
+            s.booth_name,
+            sv.assembly AS fallback_assembly,
+            sv.part_number AS fallback_booth
+     FROM sessions s
+     LEFT JOIN LATERAL (
+       SELECT v.assembly, v.part_number
+       FROM session_voters v
+       WHERE v.session_id = s.id
+       ORDER BY v.page_number ASC, v.id ASC
+       LIMIT 1
+     ) sv ON true
+     WHERE s.id = $1`,
+    [sessionId],
+  );
+
+  if (result.rowCount === 0) return null;
+
+  const row = result.rows[0];
+  const assembly = row.assembly_name || row.fallback_assembly || "";
+  const boothNo = normalizeBoothNo(row.booth_no || row.fallback_booth || "");
+
+  return {
+    id: row.id,
+    originalFilename: row.original_filename,
+    boothName: row.booth_name || "",
+    assembly,
+    boothNo,
+    normalizedAssembly: normalizeAssemblyName(assembly),
+  };
+}
+
 // Session upload - Admin only
 app.post(
   "/sessions",
@@ -257,13 +300,38 @@ app.post(
 
         const structured = parseGeminiStructured(text);
 
-        // Extract booth name from the first page and save to session
-        if (pageIndex === 0 && structured.boothName) {
-          await query(
-            "UPDATE sessions SET booth_name=$1, updated_at=now() WHERE id=$2",
-            [structured.boothName, sessionId],
+        // First page carries authoritative booth + assembly metadata.
+        if (pageIndex === 0) {
+          const firstAssembly = structured.assembly || "";
+          const firstBoothNo = normalizeBoothNo(structured.partNumber || "");
+          const generatedName = autoSessionName(
+            firstAssembly,
+            firstBoothNo,
+            originalName,
           );
-          console.log(`🏫 Booth name detected: ${structured.boothName}`);
+
+          await query(
+            `UPDATE sessions
+             SET booth_name = COALESCE(NULLIF($1,''), booth_name),
+                 assembly_name = COALESCE(NULLIF($2,''), assembly_name),
+                 booth_no = COALESCE(NULLIF($3,''), booth_no),
+                 original_filename = $4,
+                 updated_at = now()
+             WHERE id = $5`,
+            [
+              structured.boothName || "",
+              firstAssembly,
+              firstBoothNo,
+              generatedName,
+              sessionId,
+            ],
+          );
+
+          if (firstBoothNo || structured.boothName) {
+            console.log(
+              `🏫 Session tagged: assembly="${firstAssembly}", booth_no="${firstBoothNo}", booth_name="${structured.boothName || ""}"`,
+            );
+          }
         }
 
         const pageRes = await query(
@@ -451,7 +519,9 @@ app.post(
 // Sessions list - Admin only
 app.get("/sessions", authenticate, adminOnly, async (_req, res) => {
   const sql = `
-    SELECT s.id, s.original_filename, s.status, s.total_pages, s.processed_pages, s.created_at, s.updated_at,
+      SELECT s.id, s.original_filename, s.status, s.total_pages, s.processed_pages,
+        s.assembly_name, s.booth_no, s.booth_name,
+        s.created_at, s.updated_at,
            COUNT(DISTINCT p.id) AS page_count,
            COUNT(v.id) AS voter_count
     FROM sessions s
@@ -552,6 +622,130 @@ app.get("/sessions/:id/voters", authenticate, adminOnly, async (req, res) => {
   const result = await query(sql, values);
   res.json({ voters: result.rows });
 });
+
+// Linked election results for the same assembly + booth as this voter session
+app.get(
+  "/sessions/:id/linked-election-results",
+  authenticate,
+  adminOnly,
+  async (req, res) => {
+    const { id } = req.params;
+    const year = req.query.year ? Number(req.query.year) : null;
+
+    if (year !== null && Number.isNaN(year)) {
+      return res.status(400).json({ error: "Invalid year filter" });
+    }
+
+    const meta = await getSessionBoothMeta(id);
+    if (!meta) {
+      return res.status(404).json({ error: "Session not found" });
+    }
+
+    if (!meta.boothNo) {
+      return res.status(400).json({
+        error: "Booth number not detected for this session",
+        hint: "Booth number is derived from part number on page 1",
+      });
+    }
+
+    const rows = await query(
+      `SELECT es.id AS election_session_id,
+              es.original_filename,
+              es.constituency,
+              es.election_year,
+              es.status,
+              es.created_at,
+              eb.id AS booth_result_id,
+              eb.serial_no,
+              eb.booth_no,
+              eb.candidate_votes,
+              eb.total_valid_votes,
+              eb.rejected_votes,
+              eb.nota,
+              eb.total_votes,
+              eb.tendered_votes
+       FROM election_sessions es
+       JOIN election_booth_results eb ON eb.session_id = es.id
+       WHERE ($1::INT IS NULL OR es.election_year = $1)
+       ORDER BY es.created_at DESC, eb.serial_no ASC`,
+      [year],
+    );
+
+    const linkedRows = rows.rows.filter((row) => {
+      const sameBooth = normalizeBoothNo(row.booth_no) === meta.boothNo;
+      if (!sameBooth) return false;
+      if (!meta.assembly) return true;
+      return assemblyLooksRelated(meta.assembly, row.constituency || "");
+    });
+
+    const uniqueElectionSessionIds = [
+      ...new Set(linkedRows.map((row) => row.election_session_id)),
+    ];
+
+    const fullResults = [];
+
+    for (const electionSessionId of uniqueElectionSessionIds) {
+      const sessionInfoRes = await query(
+        `SELECT id, original_filename, constituency, election_year, total_electors,
+                status, total_pages, processed_pages, created_at, updated_at
+         FROM election_sessions
+         WHERE id = $1`,
+        [electionSessionId],
+      );
+
+      if (sessionInfoRes.rowCount === 0) continue;
+
+      const candidatesRes = await query(
+        `SELECT id, candidate_name, party, candidate_index, created_at
+         FROM election_candidates
+         WHERE session_id = $1
+         ORDER BY candidate_index`,
+        [electionSessionId],
+      );
+
+      const totalsRes = await query(
+        `SELECT id, total_type, candidate_votes, total_valid_votes,
+                rejected_votes, nota, total_votes, tendered_votes, created_at
+         FROM election_totals
+         WHERE session_id = $1
+         ORDER BY total_type`,
+        [electionSessionId],
+      );
+
+      const boothRow = linkedRows.find(
+        (row) => row.election_session_id === electionSessionId,
+      );
+
+      if (!boothRow) continue;
+
+      fullResults.push({
+        electionSession: sessionInfoRes.rows[0],
+        boothResult: {
+          id: boothRow.booth_result_id,
+          serial_no: boothRow.serial_no,
+          booth_no: boothRow.booth_no,
+          candidate_votes: boothRow.candidate_votes,
+          total_valid_votes: boothRow.total_valid_votes,
+          rejected_votes: boothRow.rejected_votes,
+          nota: boothRow.nota,
+          total_votes: boothRow.total_votes,
+          tendered_votes: boothRow.tendered_votes,
+        },
+        candidates: candidatesRes.rows,
+        totals: totalsRes.rows,
+      });
+    }
+
+    res.json({
+      session: meta,
+      filters: { year },
+      linkedResults: linkedRows,
+      fullResults,
+      fullCount: fullResults.length,
+      count: linkedRows.length,
+    });
+  },
+);
 
 // Admin: Global voters search with full filtering
 app.get("/voters/search", authenticate, adminOnly, async (req, res) => {
@@ -830,13 +1024,32 @@ app.post("/sessions/:id/resume", authenticate, adminOnly, async (req, res) => {
 
       const structured = parseGeminiStructured(text);
 
-      // Extract booth name from the first page and save to session
-      if (pageNumber === 1 && structured.boothName) {
-        await query(
-          "UPDATE sessions SET booth_name=$1, updated_at=now() WHERE id=$2",
-          [structured.boothName, id],
+      // First page carries authoritative booth + assembly metadata.
+      if (pageNumber === 1) {
+        const firstAssembly = structured.assembly || "";
+        const firstBoothNo = normalizeBoothNo(structured.partNumber || "");
+        const generatedName = autoSessionName(
+          firstAssembly,
+          firstBoothNo,
+          session.original_filename,
         );
-        console.log(`🏫 Booth name detected: ${structured.boothName}`);
+
+        await query(
+          `UPDATE sessions
+           SET booth_name = COALESCE(NULLIF($1,''), booth_name),
+               assembly_name = COALESCE(NULLIF($2,''), assembly_name),
+               booth_no = COALESCE(NULLIF($3,''), booth_no),
+               original_filename = $4,
+               updated_at = now()
+           WHERE id = $5`,
+          [
+            structured.boothName || "",
+            firstAssembly,
+            firstBoothNo,
+            generatedName,
+            id,
+          ],
+        );
       }
 
       const pageRes = await query(

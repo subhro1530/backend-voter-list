@@ -31,6 +31,11 @@ import {
   getElectionResultOCRPrompt,
   mergeElectionResults,
 } from "../electionResultParser.js";
+import {
+  normalizeBoothNo,
+  assemblyLooksRelated,
+  extractElectionYear,
+} from "../boothLinking.js";
 
 const router = express.Router();
 
@@ -39,6 +44,61 @@ router.use(authenticate);
 router.use(adminOnly);
 
 const storageRoot = path.join(process.cwd(), "storage", "elections");
+
+async function getVoterSessionBoothMeta() {
+  const result = await query(
+    `SELECT s.id,
+            s.original_filename,
+            s.assembly_name,
+            s.booth_no,
+            s.booth_name,
+            s.created_at,
+            sv.assembly AS fallback_assembly,
+            sv.part_number AS fallback_booth,
+            sv.voter_count
+     FROM sessions s
+     LEFT JOIN LATERAL (
+       SELECT v.assembly,
+              v.part_number,
+              COUNT(*) OVER (PARTITION BY v.session_id) AS voter_count
+       FROM session_voters v
+       WHERE v.session_id = s.id
+       ORDER BY v.page_number ASC, v.id ASC
+       LIMIT 1
+     ) sv ON true`,
+  );
+
+  return result.rows.map((row) => ({
+    id: row.id,
+    originalFilename: row.original_filename,
+    boothName: row.booth_name || "",
+    createdAt: row.created_at,
+    voterCount: Number(row.voter_count || 0),
+    assembly: row.assembly_name || row.fallback_assembly || "",
+    boothNo: normalizeBoothNo(row.booth_no || row.fallback_booth || ""),
+  }));
+}
+
+function findBestVoterSession(voterSessions, electionConstituency, boothNo) {
+  const normalizedBooth = normalizeBoothNo(boothNo);
+  if (!normalizedBooth) return null;
+
+  const matches = voterSessions.filter(
+    (session) =>
+      session.boothNo === normalizedBooth &&
+      assemblyLooksRelated(session.assembly, electionConstituency || ""),
+  );
+
+  if (matches.length === 0) return null;
+
+  matches.sort((a, b) => {
+    const aTime = new Date(a.createdAt || 0).getTime();
+    const bTime = new Date(b.createdAt || 0).getTime();
+    return bTime - aTime;
+  });
+
+  return matches[0];
+}
 
 // Track active processing sessions for stop/status
 const activeElectionSessions = new Map();
@@ -494,8 +554,8 @@ router.post(
     try {
       // Create session in DB
       await query(
-        `INSERT INTO election_sessions (id, original_filename, status, processed_pages, total_pages)
-         VALUES ($1, $2, 'processing', 0, 0)`,
+        `INSERT INTO election_sessions (id, original_filename, status, processed_pages, total_pages, election_year)
+         VALUES ($1, $2, 'processing', 0, 0, NULL)`,
         [sessionId, originalName],
       );
 
@@ -591,8 +651,12 @@ router.post(
             );
           }
 
-          // Update constituency + total_electors if found
-          if (parsed.constituency || parsed.totalElectors) {
+          // Update constituency + total_electors + election_year if found
+          const detectedYear = extractElectionYear(
+            parsed.constituency,
+            rawText,
+          );
+          if (parsed.constituency || parsed.totalElectors || detectedYear) {
             const updates = [];
             const vals = [];
             let idx = 1;
@@ -608,6 +672,11 @@ router.post(
                 `total_electors = COALESCE(total_electors, $${idx})`,
               );
               vals.push(parsed.totalElectors);
+              idx++;
+            }
+            if (detectedYear) {
+              updates.push(`election_year = COALESCE(election_year, $${idx})`);
+              vals.push(detectedYear);
               idx++;
             }
             if (updates.length > 0) {
@@ -654,13 +723,15 @@ router.post(
       await query(
         `UPDATE election_sessions
          SET constituency = COALESCE(NULLIF(constituency,''), $1),
-             total_electors = COALESCE(total_electors, $2),
-             status = $3,
-             processed_pages = $4,
+             election_year = COALESCE(election_year, $2),
+             total_electors = COALESCE(total_electors, $3),
+             status = $4,
+             processed_pages = $5,
              updated_at = now()
-         WHERE id = $5`,
+         WHERE id = $6`,
         [
           merged.constituency || null,
+          extractElectionYear(merged.constituency) || null,
           merged.totalElectors || null,
           finalStatus,
           processedCount,
@@ -820,10 +891,46 @@ router.post("/sessions/:id/stop", async (req, res) => {
 // LIST SESSIONS
 // ============================================
 
-router.get("/sessions", async (_req, res) => {
+router.get("/sessions", async (req, res) => {
   try {
+    const { assembly, year, boothNo } = req.query;
+    const where = [];
+    const values = [];
+    let idx = 1;
+
+    if (assembly) {
+      where.push(`LOWER(es.constituency) LIKE $${idx}`);
+      values.push(`%${String(assembly).toLowerCase()}%`);
+      idx++;
+    }
+
+    if (year) {
+      const parsedYear = Number(year);
+      if (Number.isNaN(parsedYear)) {
+        return res.status(400).json({ error: "Invalid year filter" });
+      }
+      where.push(`es.election_year = $${idx}`);
+      values.push(parsedYear);
+      idx++;
+    }
+
+    if (boothNo) {
+      where.push(
+        `EXISTS (
+          SELECT 1 FROM election_booth_results ebx
+          WHERE ebx.session_id = es.id
+            AND REGEXP_REPLACE(UPPER(ebx.booth_no), '[^A-Z0-9]', '', 'g') =
+                REGEXP_REPLACE(UPPER($${idx}), '[^A-Z0-9]', '', 'g')
+        )`,
+      );
+      values.push(String(boothNo));
+      idx++;
+    }
+
+    const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : "";
+
     const sql = `
-      SELECT es.id, es.original_filename, es.constituency, es.total_electors,
+      SELECT es.id, es.original_filename, es.constituency, es.election_year, es.total_electors,
              es.status, es.total_pages, es.processed_pages,
              es.created_at, es.updated_at,
              COUNT(DISTINCT eb.id) AS booth_count,
@@ -831,11 +938,19 @@ router.get("/sessions", async (_req, res) => {
       FROM election_sessions es
       LEFT JOIN election_booth_results eb ON eb.session_id = es.id
       LEFT JOIN election_candidates ec ON ec.session_id = es.id
+      ${whereSql}
       GROUP BY es.id
       ORDER BY es.created_at DESC;
     `;
-    const result = await query(sql);
-    res.json({ sessions: result.rows });
+    const result = await query(sql, values);
+    res.json({
+      filters: {
+        assembly: assembly || null,
+        year: year || null,
+        boothNo: boothNo || null,
+      },
+      sessions: result.rows,
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -869,6 +984,25 @@ router.get("/sessions/:id", async (req, res) => {
       [id],
     );
 
+    const voterSessions = await getVoterSessionBoothMeta();
+
+    const enrichedBoothResults = boothResults.rows.map((row) => {
+      const matched = findBestVoterSession(
+        voterSessions,
+        session.rows[0].constituency,
+        row.booth_no,
+      );
+
+      return {
+        ...row,
+        has_voter_list: Boolean(matched),
+        voter_session_id: matched?.id || null,
+        voter_session_name: matched?.originalFilename || null,
+        voter_booth_name: matched?.boothName || null,
+        voter_count: matched?.voterCount || 0,
+      };
+    });
+
     const totals = await query(
       "SELECT * FROM election_totals WHERE session_id=$1 ORDER BY total_type",
       [id],
@@ -877,8 +1011,79 @@ router.get("/sessions/:id", async (req, res) => {
     res.json({
       session: session.rows[0],
       candidates: candidates.rows,
-      boothResults: boothResults.rows,
+      boothResults: enrichedBoothResults,
       totals: totals.rows,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.get("/sessions/:id/booths/:boothNo/voter-list", async (req, res) => {
+  try {
+    const { id, boothNo } = req.params;
+    const limit = Math.min(Number(req.query.limit) || 200, 1000);
+
+    const electionSession = await query(
+      "SELECT id, constituency, election_year FROM election_sessions WHERE id=$1",
+      [id],
+    );
+    if (electionSession.rowCount === 0) {
+      return res.status(404).json({ error: "Election session not found" });
+    }
+
+    const normalizedBooth = normalizeBoothNo(boothNo);
+    if (!normalizedBooth) {
+      return res.status(400).json({ error: "Invalid booth number" });
+    }
+
+    const voterSessions = await getVoterSessionBoothMeta();
+    const matchingSessions = voterSessions
+      .filter(
+        (s) =>
+          s.boothNo === normalizedBooth &&
+          assemblyLooksRelated(
+            s.assembly,
+            electionSession.rows[0].constituency || "",
+          ),
+      )
+      .sort(
+        (a, b) =>
+          new Date(b.createdAt || 0).getTime() -
+          new Date(a.createdAt || 0).getTime(),
+      );
+
+    if (matchingSessions.length === 0) {
+      return res.json({
+        electionSession: electionSession.rows[0],
+        boothNo,
+        voterSessions: [],
+        voters: [],
+        count: 0,
+      });
+    }
+
+    const primary = matchingSessions[0];
+    const voters = await query(
+      `SELECT id, session_id, page_number, assembly, part_number, section, serial_number,
+              voter_id, name, relation_type, relation_name, house_number, age, gender,
+              religion, photo_url, is_printed, printed_at, created_at
+       FROM session_voters
+       WHERE session_id = $1
+       ORDER BY page_number, serial_number
+       LIMIT $2`,
+      [primary.id, limit],
+    );
+
+    res.json({
+      electionSession: electionSession.rows[0],
+      boothNo,
+      normalizedBooth,
+      voterSessions: matchingSessions,
+      selectedSession: primary,
+      voters: voters.rows,
+      count: voters.rowCount,
+      limit,
     });
   } catch (err) {
     res.status(500).json({ error: err.message });

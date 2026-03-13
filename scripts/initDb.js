@@ -23,10 +23,15 @@ CREATE TABLE IF NOT EXISTS sessions (
   status TEXT DEFAULT 'processing',
   total_pages INT,
   processed_pages INT DEFAULT 0,
+  assembly_name TEXT,
+  booth_no TEXT,
   booth_name TEXT,
   created_at TIMESTAMPTZ DEFAULT now(),
   updated_at TIMESTAMPTZ DEFAULT now()
 );
+
+CREATE INDEX IF NOT EXISTS idx_sessions_assembly_name ON sessions(assembly_name);
+CREATE INDEX IF NOT EXISTS idx_sessions_booth_no ON sessions(booth_no);
 
 CREATE TABLE IF NOT EXISTS session_pages (
   id BIGSERIAL PRIMARY KEY,
@@ -79,6 +84,7 @@ CREATE TABLE IF NOT EXISTS election_sessions (
   id UUID PRIMARY KEY,
   original_filename TEXT,
   constituency TEXT,
+  election_year INT,
   total_electors INT,
   status TEXT DEFAULT 'processing',
   total_pages INT,
@@ -88,6 +94,7 @@ CREATE TABLE IF NOT EXISTS election_sessions (
 );
 
 CREATE INDEX IF NOT EXISTS idx_election_sessions_constituency ON election_sessions(constituency);
+CREATE INDEX IF NOT EXISTS idx_election_sessions_election_year ON election_sessions(election_year);
 
 -- Election result pages
 CREATE TABLE IF NOT EXISTS election_pages (
@@ -189,6 +196,27 @@ BEGIN
     ALTER TABLE sessions ADD COLUMN booth_name TEXT;
   END IF;
 
+  IF NOT EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_name = 'sessions' AND column_name = 'assembly_name'
+  ) THEN
+    ALTER TABLE sessions ADD COLUMN assembly_name TEXT;
+  END IF;
+
+  IF NOT EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_name = 'sessions' AND column_name = 'booth_no'
+  ) THEN
+    ALTER TABLE sessions ADD COLUMN booth_no TEXT;
+  END IF;
+
+  IF NOT EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_name = 'election_sessions' AND column_name = 'election_year'
+  ) THEN
+    ALTER TABLE election_sessions ADD COLUMN election_year INT;
+  END IF;
+
   -- Add photo_url to session_voters if it doesn't exist
   IF NOT EXISTS (
     SELECT 1 FROM information_schema.columns
@@ -222,9 +250,33 @@ BEGIN
   END IF;
 END $$;
 
+UPDATE sessions s
+SET assembly_name = COALESCE(NULLIF(s.assembly_name, ''), src.assembly_name),
+    booth_no = COALESCE(NULLIF(s.booth_no, ''), src.booth_no)
+FROM (
+  SELECT session_id,
+         MAX(NULLIF(assembly, '')) AS assembly_name,
+         MAX(NULLIF(part_number, '')) AS booth_no
+  FROM session_voters
+  GROUP BY session_id
+) src
+WHERE s.id = src.session_id
+  AND (
+    s.assembly_name IS NULL OR s.assembly_name = ''
+    OR s.booth_no IS NULL OR s.booth_no = ''
+  );
+
+UPDATE election_sessions
+SET election_year = NULLIF(SUBSTRING(constituency FROM '((?:19|20)[0-9]{2})'), '')::INT
+WHERE (election_year IS NULL)
+  AND constituency IS NOT NULL;
+
 -- Create indexes after columns are ensured to exist
 CREATE INDEX IF NOT EXISTS idx_session_voters_religion ON session_voters(religion);
 CREATE INDEX IF NOT EXISTS idx_session_voters_is_printed ON session_voters(is_printed);
+CREATE INDEX IF NOT EXISTS idx_sessions_assembly_name ON sessions(assembly_name);
+CREATE INDEX IF NOT EXISTS idx_sessions_booth_no ON sessions(booth_no);
+CREATE INDEX IF NOT EXISTS idx_election_sessions_election_year ON election_sessions(election_year);
 
 -- ============================================
 -- AFFIDAVIT / NOMINATION PAPER TABLES
