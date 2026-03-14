@@ -49,6 +49,11 @@ All APIs require admin JWT bearer token.
   - `voterSessionId` (preferred voter session for that booth)
 - Response now includes `selectionSource` with values: `query`, `memory`, `auto`, `none`.
 
+3b. GET /election-results/sessions/:id/booths/voter-list?boothNo=
+
+- Slash-safe alternative for booth numbers like `12/1` when path params are unreliable.
+- Supports the same query params and response contract as endpoint 3.
+
 ### Voter Sessions
 
 1. GET /sessions
@@ -191,3 +196,19 @@ Do not create a brand new component architecture. Extend your current components
 4. Voter sessions display booth and assembly metadata clearly.
 5. Clicking "View Booth Result" from a voter session shows only matching booth result rows from the same assembly context.
 6. Existing UI remains intact; only enhanced behavior is added.
+
+## Drop-in Frontend Helper
+
+Use scripts/electionResultsFrontendLinking.js to wire the View Voters flow quickly.
+
+It includes:
+
+1. Local storage booth memory using the required key format.
+2. View Voters call with remembered voterSessionId.
+3. Automatic one-time retry without voterSessionId on 400.
+4. Session switch helper that persists the new selected session.
+
+Primary functions:
+
+1. openBoothVoters(...)
+2. switchBoothVoterSession(...)

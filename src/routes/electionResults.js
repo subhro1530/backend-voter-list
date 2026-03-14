@@ -163,6 +163,212 @@ async function getVoterSessionBoothMeta() {
   }
 }
 
+/**
+ * Targeted per-booth session lookup.
+ * Phase 1: reads only the small sessions table (no voter joins).
+ * Phase 2: for sessions without booth_no, fetches first-voter metadata
+ *          only for that subset (usually empty once booth_no is populated).
+ * Phase 3: fetches voter counts only for the 1-3 sessions that actually match.
+ * This avoids the O(all_voters) GROUP BY that made View Voters slow.
+ */
+async function getMatchingVoterSessions(normalizedBoothNo, constituency) {
+  // Fast path: match by sessions.booth_no first.
+  const directRes = await query(
+    `SELECT id, original_filename, assembly_name, booth_no, booth_name, created_at
+     FROM sessions
+     WHERE REGEXP_REPLACE(UPPER(COALESCE(booth_no, '')), '[^A-Z0-9]', '', 'g') = $1
+     ORDER BY created_at DESC`,
+    [normalizedBoothNo],
+  );
+
+  const directMatches = directRes.rows
+    .filter((row) => {
+      if (!constituency) return true;
+      return assemblyLooksRelated(row.assembly_name || "", constituency);
+    })
+    .map((row) => ({ ...row, resolvedAssembly: row.assembly_name || "" }));
+
+  let allMatched = directMatches;
+
+  // Fallback path: only when no direct session booth match exists.
+  if (allMatched.length === 0) {
+    const fallbackRes = await query(
+      `SELECT s.id,
+              s.original_filename,
+              s.assembly_name,
+              s.booth_name,
+              s.created_at,
+              fv.assembly AS fallback_assembly
+       FROM sessions s
+       JOIN LATERAL (
+         SELECT v.assembly, v.part_number
+         FROM session_voters v
+         WHERE v.session_id = s.id
+         ORDER BY v.page_number ASC, v.id ASC
+         LIMIT 1
+       ) fv ON true
+       WHERE (s.booth_no IS NULL OR s.booth_no = '')
+         AND REGEXP_REPLACE(UPPER(COALESCE(fv.part_number, '')), '[^A-Z0-9]', '', 'g') = $1
+       ORDER BY s.created_at DESC`,
+      [normalizedBoothNo],
+    );
+
+    allMatched = fallbackRes.rows
+      .filter((row) => {
+        const asm = row.assembly_name || row.fallback_assembly || "";
+        if (!constituency) return true;
+        return assemblyLooksRelated(asm, constituency);
+      })
+      .map((row) => ({
+        ...row,
+        resolvedAssembly: row.assembly_name || row.fallback_assembly || "",
+      }));
+  }
+
+  if (allMatched.length === 0) return [];
+
+  // Phase 3 – targeted count: only for the 1-3 matched sessions
+  const matchedIds = allMatched.map((s) => s.id);
+  const countsRes = await query(
+    `SELECT session_id, COUNT(*)::INT AS voter_count
+     FROM session_voters
+     WHERE session_id = ANY($1)
+     GROUP BY session_id`,
+    [matchedIds],
+  );
+  const countMap = {};
+  for (const row of countsRes.rows) {
+    countMap[row.session_id] = row.voter_count;
+  }
+
+  return allMatched
+    .map((row) => ({
+      id: row.id,
+      originalFilename: row.original_filename,
+      boothName: row.booth_name || "",
+      createdAt: row.created_at,
+      voterCount: countMap[row.id] || 0,
+      assembly: row.resolvedAssembly,
+      boothNo: normalizedBoothNo,
+    }))
+    .sort(
+      (a, b) =>
+        new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime(),
+    );
+}
+
+async function handleBoothVoterList(req, res, rawBoothNo) {
+  const { id } = req.params;
+  const limit = Math.min(Number(req.query.limit) || 200, 1000);
+  const includeVoters =
+    String(req.query.includeVoters || "1").toLowerCase() !== "0";
+  const requestedVoterSessionId =
+    typeof req.query.voterSessionId === "string"
+      ? req.query.voterSessionId.trim()
+      : "";
+
+  const electionSession = await query(
+    "SELECT id, constituency, election_year FROM election_sessions WHERE id=$1",
+    [id],
+  );
+  if (electionSession.rowCount === 0) {
+    return res.status(404).json({ error: "Election session not found" });
+  }
+
+  const boothNo = String(rawBoothNo || "").trim();
+  const normalizedBooth = normalizeBoothNo(boothNo);
+  if (!normalizedBooth) {
+    return res.status(400).json({ error: "Invalid booth number" });
+  }
+
+  const matchingSessions = await getMatchingVoterSessions(
+    normalizedBooth,
+    electionSession.rows[0].constituency || "",
+  );
+
+  if (matchingSessions.length === 0) {
+    return res.json({
+      electionSession: electionSession.rows[0],
+      boothNo,
+      normalizedBooth,
+      voterSessions: [],
+      selectedSession: null,
+      selectionSource: "none",
+      voters: [],
+      count: 0,
+      limit,
+      includeVoters,
+    });
+  }
+
+  let selectedSession = null;
+  let selectionSource = "auto";
+  let requestedSessionMatched = null;
+
+  if (requestedVoterSessionId) {
+    selectedSession =
+      matchingSessions.find((s) => s.id === requestedVoterSessionId) || null;
+    if (selectedSession) {
+      requestedSessionMatched = true;
+      selectionSource = "query";
+    } else {
+      requestedSessionMatched = false;
+    }
+  }
+
+  if (!selectedSession) {
+    const rememberedSessionId = readRememberedBoothSelection(
+      id,
+      normalizedBooth,
+    );
+    if (rememberedSessionId) {
+      selectedSession =
+        matchingSessions.find((s) => s.id === rememberedSessionId) || null;
+      if (selectedSession) {
+        selectionSource = "memory";
+      }
+    }
+  }
+
+  if (!selectedSession) {
+    selectedSession = matchingSessions[0];
+  }
+
+  rememberBoothSelection(id, normalizedBooth, selectedSession.id);
+
+  let votersRows = [];
+  let votersCount = 0;
+  if (includeVoters) {
+    const voters = await query(
+      `SELECT id, session_id, page_number, assembly, part_number, section, serial_number,
+              voter_id, name, relation_type, relation_name, house_number, age, gender,
+              religion, photo_url, is_printed, printed_at, created_at
+       FROM session_voters
+       WHERE session_id = $1
+       ORDER BY page_number, serial_number
+       LIMIT $2`,
+      [selectedSession.id, limit],
+    );
+    votersRows = voters.rows;
+    votersCount = voters.rowCount;
+  }
+
+  return res.json({
+    electionSession: electionSession.rows[0],
+    boothNo,
+    normalizedBooth,
+    voterSessions: matchingSessions,
+    selectedSession,
+    selectionSource,
+    requestedVoterSessionId: requestedVoterSessionId || null,
+    requestedSessionMatched,
+    voters: votersRows,
+    count: votersCount,
+    limit,
+    includeVoters,
+  });
+}
+
 function findBestVoterSession(voterSessions, electionConstituency, boothNo) {
   const normalizedBooth = normalizeBoothNo(boothNo);
   if (!normalizedBooth) return null;
@@ -1105,113 +1311,19 @@ router.get("/sessions/:id", async (req, res) => {
 
 router.get("/sessions/:id/booths/:boothNo/voter-list", async (req, res) => {
   try {
-    const { id, boothNo } = req.params;
-    const limit = Math.min(Number(req.query.limit) || 200, 1000);
-    const requestedVoterSessionId =
-      typeof req.query.voterSessionId === "string"
-        ? req.query.voterSessionId.trim()
-        : "";
+    const { boothNo } = req.params;
+    return await handleBoothVoterList(req, res, boothNo);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 
-    const electionSession = await query(
-      "SELECT id, constituency, election_year FROM election_sessions WHERE id=$1",
-      [id],
-    );
-    if (electionSession.rowCount === 0) {
-      return res.status(404).json({ error: "Election session not found" });
-    }
-
-    const normalizedBooth = normalizeBoothNo(boothNo);
-    if (!normalizedBooth) {
-      return res.status(400).json({ error: "Invalid booth number" });
-    }
-
-    const voterSessions = await getVoterSessionBoothMeta();
-    const matchingSessions = voterSessions
-      .filter(
-        (s) =>
-          s.boothNo === normalizedBooth &&
-          assemblyLooksRelated(
-            s.assembly,
-            electionSession.rows[0].constituency || "",
-          ),
-      )
-      .sort(
-        (a, b) =>
-          new Date(b.createdAt || 0).getTime() -
-          new Date(a.createdAt || 0).getTime(),
-      );
-
-    if (matchingSessions.length === 0) {
-      return res.json({
-        electionSession: electionSession.rows[0],
-        boothNo,
-        normalizedBooth,
-        voterSessions: [],
-        selectedSession: null,
-        selectionSource: "none",
-        voters: [],
-        count: 0,
-        limit,
-      });
-    }
-
-    let selectedSession = null;
-    let selectionSource = "auto";
-
-    if (requestedVoterSessionId) {
-      selectedSession =
-        matchingSessions.find((s) => s.id === requestedVoterSessionId) || null;
-      if (!selectedSession) {
-        return res.status(400).json({
-          error: "Requested voter session does not match this booth/assembly",
-          requestedVoterSessionId,
-        });
-      }
-      selectionSource = "query";
-    }
-
-    if (!selectedSession) {
-      const rememberedSessionId = readRememberedBoothSelection(
-        id,
-        normalizedBooth,
-      );
-      if (rememberedSessionId) {
-        selectedSession =
-          matchingSessions.find((s) => s.id === rememberedSessionId) || null;
-        if (selectedSession) {
-          selectionSource = "memory";
-        }
-      }
-    }
-
-    if (!selectedSession) {
-      selectedSession = matchingSessions[0];
-    }
-
-    rememberBoothSelection(id, normalizedBooth, selectedSession.id);
-
-    const voters = await query(
-      `SELECT id, session_id, page_number, assembly, part_number, section, serial_number,
-              voter_id, name, relation_type, relation_name, house_number, age, gender,
-              religion, photo_url, is_printed, printed_at, created_at
-       FROM session_voters
-       WHERE session_id = $1
-       ORDER BY page_number, serial_number
-       LIMIT $2`,
-      [selectedSession.id, limit],
-    );
-
-    res.json({
-      electionSession: electionSession.rows[0],
-      boothNo,
-      normalizedBooth,
-      voterSessions: matchingSessions,
-      selectedSession,
-      selectionSource,
-      voters: voters.rows,
-      count: voters.rowCount,
-      limit,
-    });
+// Query-param endpoint for frontend compatibility when booth numbers contain '/'.
+router.get("/sessions/:id/booths/voter-list", async (req, res) => {
+  try {
+    const boothNo =
+      typeof req.query.boothNo === "string" ? req.query.boothNo : "";
+    return await handleBoothVoterList(req, res, boothNo);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
