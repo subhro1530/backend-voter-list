@@ -598,6 +598,72 @@ function validateParsedElectionPage(
   return { ok: true };
 }
 
+function getElectionApiKeys() {
+  const actualKeys = [];
+  const seen = new Set();
+  for (const [key, value] of Object.entries(process.env)) {
+    if (key.startsWith("GEMINI_API_KEY_") && value && value.trim()) {
+      const trimmed = value.trim();
+      if (!seen.has(trimmed)) {
+        actualKeys.push(trimmed);
+        seen.add(trimmed);
+      }
+    }
+  }
+  if (actualKeys.length === 0 && process.env.GEMINI_API_KEY?.trim()) {
+    actualKeys.push(process.env.GEMINI_API_KEY.trim());
+  }
+  return actualKeys;
+}
+
+async function reprocessElectionPageWithRetries({
+  pagePath,
+  pageNumber,
+  totalPages,
+  page1Candidates = [],
+  maxRetries = 8,
+}) {
+  const apiKeys = getElectionApiKeys();
+  if (apiKeys.length === 0) {
+    throw new Error("No Gemini API keys available");
+  }
+
+  let lastErr = null;
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    const key = apiKeys[(attempt - 1) % apiKeys.length];
+    try {
+      const result = await callGeminiForElection(
+        pagePath,
+        key,
+        pageNumber === 1,
+        `Repair-${attempt}`,
+        page1Candidates,
+      );
+      const parsed = parseElectionResult(result.text);
+      const validation = validateParsedElectionPage(parsed, page1Candidates, {
+        isLastPage: pageNumber === totalPages,
+      });
+      if (!validation.ok) {
+        const parseErr = new Error(`PARSE_INCOMPLETE: ${validation.reason}`);
+        parseErr.geminiErrorType = "parse_incomplete";
+        throw parseErr;
+      }
+      return { parsed, rawText: result.text };
+    } catch (err) {
+      lastErr = err;
+      const isRateLimited =
+        err?.geminiErrorType === "temporary" ||
+        String(err?.message || "").includes("RATE_LIMITED");
+      const delayMs = isRateLimited
+        ? 20000 + Math.floor(Math.random() * 1000)
+        : 3500 + attempt * 800;
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+  }
+
+  throw lastErr || new Error(`Failed to reprocess page ${pageNumber}`);
+}
+
 /**
  * Process election pages using controlled parallelism.
  *
@@ -611,20 +677,7 @@ function validateParsedElectionPage(
  */
 async function processElectionPagesParallel(pagePaths, sessionId, onPageDone) {
   // ── Gather API keys ──
-  const actualKeys = [];
-  const seen = new Set();
-  for (const [key, value] of Object.entries(process.env)) {
-    if (key.startsWith("GEMINI_API_KEY_") && value && value.trim()) {
-      const trimmed = value.trim();
-      if (!seen.has(trimmed)) {
-        actualKeys.push(trimmed);
-        seen.add(trimmed);
-      }
-    }
-  }
-  if (actualKeys.length === 0 && process.env.GEMINI_API_KEY) {
-    actualKeys.push(process.env.GEMINI_API_KEY.trim());
-  }
+  const actualKeys = getElectionApiKeys();
   if (actualKeys.length === 0) {
     throw new Error("No Gemini API keys available");
   }
@@ -1326,6 +1379,153 @@ router.post("/sessions/:id/stop", async (req, res) => {
     [id],
   );
   res.json({ message: "Processing stopped", sessionId: id });
+});
+
+router.post("/sessions/:id/repair-missing-pages", async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const sessionRes = await query(
+      "SELECT id, total_pages FROM election_sessions WHERE id=$1",
+      [id],
+    );
+    if (sessionRes.rowCount === 0) {
+      return res.status(404).json({ error: "Session not found" });
+    }
+
+    const totalPages = Number(sessionRes.rows[0].total_pages || 0);
+    if (!totalPages) {
+      return res.status(400).json({ error: "Session has no pages to repair" });
+    }
+
+    const pagesRes = await query(
+      `SELECT ep.id, ep.page_number, ep.page_path,
+              COUNT(eb.id)::INT AS booth_count
+       FROM election_pages ep
+       LEFT JOIN election_booth_results eb ON eb.page_id = ep.id
+       WHERE ep.session_id = $1
+       GROUP BY ep.id, ep.page_number, ep.page_path
+       ORDER BY ep.page_number`,
+      [id],
+    );
+
+    if (pagesRes.rowCount === 0) {
+      return res
+        .status(400)
+        .json({ error: "No page records found for session" });
+    }
+
+    const candidateRes = await query(
+      "SELECT candidate_name FROM election_candidates WHERE session_id=$1 ORDER BY candidate_index",
+      [id],
+    );
+    const page1Candidates = candidateRes.rows
+      .map((r) => r.candidate_name)
+      .filter((name) => !!name && !/^Candidate\d+$/i.test(name));
+
+    const targets = pagesRes.rows.filter((page) => {
+      if (page.page_number >= totalPages) return false;
+      return Number(page.booth_count || 0) === 0;
+    });
+
+    if (targets.length === 0) {
+      return res.json({
+        sessionId: id,
+        message: "No missing middle pages detected",
+        repairedPages: [],
+        remainingPages: [],
+      });
+    }
+
+    const repairedPages = [];
+    const failedPages = [];
+
+    for (const page of targets) {
+      try {
+        const { parsed, rawText } = await reprocessElectionPageWithRetries({
+          pagePath: page.page_path,
+          pageNumber: page.page_number,
+          totalPages,
+          page1Candidates,
+        });
+
+        await query("DELETE FROM election_booth_results WHERE page_id=$1", [
+          page.id,
+        ]);
+
+        for (const booth of parsed.boothResults || []) {
+          await query(
+            `INSERT INTO election_booth_results
+             (session_id, page_id, serial_no, booth_no, candidate_votes,
+              total_valid_votes, rejected_votes, nota, total_votes, tendered_votes)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+            [
+              id,
+              page.id,
+              booth.serialNo,
+              booth.boothNo,
+              JSON.stringify(booth.candidateVotes || {}),
+              booth.totalValidVotes,
+              booth.rejectedVotes,
+              booth.nota,
+              booth.totalVotes,
+              booth.tenderedVotes,
+            ],
+          );
+        }
+
+        await query(
+          "UPDATE election_pages SET raw_text=$1, structured_json=$2 WHERE id=$3",
+          [rawText, JSON.stringify(parsed), page.id],
+        );
+
+        repairedPages.push({
+          pageNumber: page.page_number,
+          boothRowsInserted: (parsed.boothResults || []).length,
+        });
+      } catch (err) {
+        failedPages.push({
+          pageNumber: page.page_number,
+          error: err.message,
+        });
+      }
+    }
+
+    const remainingRes = await query(
+      `SELECT ep.page_number, COUNT(eb.id)::INT AS booth_count
+       FROM election_pages ep
+       LEFT JOIN election_booth_results eb ON eb.page_id = ep.id
+       WHERE ep.session_id = $1
+       GROUP BY ep.page_number
+       HAVING ep.page_number < $2 AND COUNT(eb.id) = 0
+       ORDER BY ep.page_number`,
+      [id, totalPages],
+    );
+
+    const remainingPages = remainingRes.rows.map((r) => Number(r.page_number));
+
+    if (remainingPages.length === 0 && failedPages.length === 0) {
+      await query(
+        "UPDATE election_sessions SET status='completed', updated_at=now() WHERE id=$1",
+        [id],
+      );
+    } else {
+      await query(
+        "UPDATE election_sessions SET status='partial', updated_at=now() WHERE id=$1",
+        [id],
+      );
+    }
+
+    return res.json({
+      sessionId: id,
+      targetedPages: targets.map((p) => p.page_number),
+      repairedPages,
+      failedPages,
+      remainingPages,
+    });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
 });
 
 // ============================================
