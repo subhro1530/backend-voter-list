@@ -510,6 +510,59 @@ function staggeredDelay(ms) {
   return new Promise((r) => setTimeout(r, ms + jitter));
 }
 
+function hasMeaningfulTotals(parsed) {
+  if (!parsed || !parsed.totals || typeof parsed.totals !== "object")
+    return false;
+  const totalValues = Object.values(parsed.totals);
+  if (totalValues.length === 0) return false;
+
+  return totalValues.some((entry) => {
+    if (!entry || typeof entry !== "object") return false;
+    return Object.keys(entry).length > 0;
+  });
+}
+
+/**
+ * Detect likely-incomplete OCR responses so they are retried.
+ */
+function validateParsedElectionPage(parsed, page1Candidates = []) {
+  if (!parsed || typeof parsed !== "object") {
+    return { ok: false, reason: "invalid_parsed_payload" };
+  }
+
+  const booths = Array.isArray(parsed.boothResults) ? parsed.boothResults : [];
+  const hasTotals = hasMeaningfulTotals(parsed);
+
+  if (booths.length === 0 && !hasTotals) {
+    return { ok: false, reason: "no_booths_or_totals" };
+  }
+
+  const identifiableRows = booths.filter((row) => {
+    if (!row || typeof row !== "object") return false;
+    const serialOk = Number.isFinite(Number(row.serialNo));
+    const boothOk = String(row.boothNo || "").trim().length > 0;
+    return serialOk || boothOk;
+  });
+
+  if (booths.length > 0 && identifiableRows.length === 0 && !hasTotals) {
+    return { ok: false, reason: "unidentifiable_booth_rows" };
+  }
+
+  if (page1Candidates.length > 0 && identifiableRows.length > 0) {
+    const mismatchRows = identifiableRows.filter((row) => {
+      const keyCount = Object.keys(row.candidateVotes || {}).length;
+      return keyCount !== page1Candidates.length;
+    }).length;
+    const mismatchRatio = mismatchRows / identifiableRows.length;
+
+    if (mismatchRatio > 0.4) {
+      return { ok: false, reason: "candidate_column_mismatch" };
+    }
+  }
+
+  return { ok: true };
+}
+
 /**
  * Process election pages using controlled parallelism.
  *
@@ -637,6 +690,13 @@ async function processElectionPagesParallel(pagePaths, sessionId, onPageDone) {
         );
         const parsed = parseElectionResult(result.text);
 
+        const validation = validateParsedElectionPage(parsed, page1Candidates);
+        if (!validation.ok) {
+          const parseErr = new Error(`PARSE_INCOMPLETE: ${validation.reason}`);
+          parseErr.geminiErrorType = "parse_incomplete";
+          throw parseErr;
+        }
+
         console.log(
           `✅ Page ${pageIndex + 1}/${pagePaths.length} done — ${(parsed.boothResults || []).length} booths, ${(parsed.candidates || []).length} candidates`,
         );
@@ -667,6 +727,11 @@ async function processElectionPagesParallel(pagePaths, sessionId, onPageDone) {
           );
           // Actually wait here like the voter-list engine does
           await staggeredDelay(RATE_LIMIT_WAIT);
+        } else if (err.geminiErrorType === "parse_incomplete") {
+          console.warn(
+            `⚠️ Page ${pageIndex + 1} parse incomplete (attempt ${retries}/${MAX_RETRIES}), retrying...`,
+          );
+          await staggeredDelay(4000 + retries * 1000);
         } else {
           console.error(
             `❌ Page ${pageIndex + 1} error (attempt ${retries}): ${err.message.slice(0, 150)}`,
@@ -763,6 +828,55 @@ async function processElectionPagesParallel(pagePaths, sessionId, onPageDone) {
         await staggeredDelay(3000);
       }
     }
+  }
+
+  // ── Step 3: Recovery pass for failed pages (slower but more reliable) ──
+  if (errors.length > 0) {
+    console.log(`🩺 Recovery pass for ${errors.length} failed pages...`);
+    const remainingErrors = [];
+    const sortedErrors = [...errors].sort((a, b) => a.pageIndex - b.pageIndex);
+
+    for (const failed of sortedErrors) {
+      const sessionState = activeElectionSessions.get(sessionId);
+      if (sessionState?.stopped || failed.error === "Stopped by user") {
+        remainingErrors.push(failed);
+        continue;
+      }
+
+      const pageIndex = failed.pageIndex;
+      const pagePath = pagePaths[pageIndex];
+      if (!pagePath) {
+        remainingErrors.push(failed);
+        continue;
+      }
+
+      console.log(`🔁 Recovery page ${pageIndex + 1}/${pagePaths.length}...`);
+      const recovered = await processOnePage(
+        pageIndex,
+        pagePath,
+        pageIndex === 0,
+        pageIndex,
+        page1Candidates,
+      );
+
+      if (recovered.success) {
+        results.push(recovered);
+        if (
+          pageIndex === 0 &&
+          Array.isArray(recovered.parsed?.candidates) &&
+          recovered.parsed.candidates.length > 0
+        ) {
+          page1Candidates = recovered.parsed.candidates;
+        }
+      } else {
+        remainingErrors.push(recovered);
+      }
+
+      await staggeredDelay(1500);
+    }
+
+    errors.length = 0;
+    errors.push(...remainingErrors);
   }
 
   console.log(
