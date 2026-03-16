@@ -390,6 +390,31 @@ function findBestVoterSession(voterSessions, electionConstituency, boothNo) {
   return matches[0];
 }
 
+const boothSortCollator = new Intl.Collator("en", {
+  numeric: true,
+  sensitivity: "base",
+});
+
+function sortByBoothNo(rows) {
+  return [...rows].sort((a, b) => {
+    const boothA = String(a?.booth_no ?? "").trim();
+    const boothB = String(b?.booth_no ?? "").trim();
+
+    const boothCmp = boothSortCollator.compare(boothA, boothB);
+    if (boothCmp !== 0) return boothCmp;
+
+    const serialA = Number(a?.serial_no);
+    const serialB = Number(b?.serial_no);
+    const serialAValid = Number.isFinite(serialA);
+    const serialBValid = Number.isFinite(serialB);
+
+    if (serialAValid && serialBValid) return serialA - serialB;
+    if (serialAValid) return -1;
+    if (serialBValid) return 1;
+    return 0;
+  });
+}
+
 // Track active processing sessions for stop/status
 const activeElectionSessions = new Map();
 
@@ -525,7 +550,11 @@ function hasMeaningfulTotals(parsed) {
 /**
  * Detect likely-incomplete OCR responses so they are retried.
  */
-function validateParsedElectionPage(parsed, page1Candidates = []) {
+function validateParsedElectionPage(
+  parsed,
+  page1Candidates = [],
+  { isLastPage = false } = {},
+) {
   if (!parsed || typeof parsed !== "object") {
     return { ok: false, reason: "invalid_parsed_payload" };
   }
@@ -546,6 +575,12 @@ function validateParsedElectionPage(parsed, page1Candidates = []) {
 
   if (booths.length > 0 && identifiableRows.length === 0 && !hasTotals) {
     return { ok: false, reason: "unidentifiable_booth_rows" };
+  }
+
+  // Guardrail: continuation pages should contain booth rows.
+  // If a non-last page returns only totals, OCR likely skipped table rows.
+  if (!isLastPage && identifiableRows.length === 0) {
+    return { ok: false, reason: "no_booths_on_non_last_page" };
   }
 
   if (page1Candidates.length > 0 && identifiableRows.length > 0) {
@@ -690,7 +725,9 @@ async function processElectionPagesParallel(pagePaths, sessionId, onPageDone) {
         );
         const parsed = parseElectionResult(result.text);
 
-        const validation = validateParsedElectionPage(parsed, page1Candidates);
+        const validation = validateParsedElectionPage(parsed, page1Candidates, {
+          isLastPage: pageIndex === pagePaths.length - 1,
+        });
         if (!validation.ok) {
           const parseErr = new Error(`PARSE_INCOMPLETE: ${validation.reason}`);
           parseErr.geminiErrorType = "parse_incomplete";
@@ -1388,9 +1425,11 @@ router.get("/sessions/:id", async (req, res) => {
       [id],
     );
 
+    const sortedBoothResults = sortByBoothNo(boothResults.rows);
+
     const voterSessions = await getVoterSessionBoothMeta();
 
-    const enrichedBoothResults = boothResults.rows.map((row) => {
+    const enrichedBoothResults = sortedBoothResults.map((row) => {
       const matched = findBestVoterSession(
         voterSessions,
         session.rows[0].constituency,
@@ -1602,7 +1641,7 @@ router.get("/sessions/:id/export/excel", async (req, res) => {
       "SELECT * FROM election_booth_results WHERE session_id=$1 ORDER BY serial_no, booth_no",
       [id],
     );
-    const boothResults = boothRes.rows;
+    const boothResults = sortByBoothNo(boothRes.rows);
 
     const totalsRes = await query(
       "SELECT * FROM election_totals WHERE session_id=$1 ORDER BY total_type",
@@ -1772,10 +1811,10 @@ router.get("/sessions/:id/export/excel", async (req, res) => {
     ws.getColumn(tenderedCol).width = 10;
 
     // ---- Data rows ----
-    for (const booth of boothResults) {
+    for (const [rowIndex, booth] of boothResults.entries()) {
       const votes = booth.candidate_votes || {};
       const rowData = [
-        booth.serial_no,
+        rowIndex + 1,
         booth.booth_no,
         ...candidates.map((c) => votes[c.candidate_name] ?? 0),
         booth.total_valid_votes,
