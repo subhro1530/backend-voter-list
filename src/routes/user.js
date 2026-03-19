@@ -1,8 +1,303 @@
 import express from "express";
+import path from "path";
+import fs from "fs-extra";
+import { execFile } from "child_process";
+import { promisify } from "util";
+import { v4 as uuidv4 } from "uuid";
 import { query } from "../db.js";
 import { authenticate } from "../auth.js";
+import {
+  ensureVoterSlipTemplateExists,
+  buildSingleVoterSlipPdf,
+  buildMassVoterSlipPdfFile,
+  buildMassSlipFilename,
+} from "../voterSlipPdf.js";
+import {
+  getVoterSlipLayout,
+  getVoterSlipLayoutPath,
+  getDefaultVoterSlipLayout,
+  clearVoterSlipLayoutCache,
+  saveVoterSlipLayout,
+  getRequiredVoterSlipFields,
+} from "../voterSlipLayout.js";
+import {
+  getConfiguredVoterSlipTemplatePath,
+  getVoterSlipTemplatePublicHint,
+} from "../voterSlipTemplate.js";
+import {
+  getCalibrationState,
+  getManualProfiles,
+  saveCalibrationState,
+  upsertManualProfile,
+  applyManualProfile,
+  getVoterSlipCalibrationStatePath,
+  getVoterSlipManualProfilesPath,
+} from "../voterSlipCalibrationStore.js";
 
 const router = express.Router();
+const execFileAsync = promisify(execFile);
+
+const voterSlipJobs = new Map();
+const voterSlipJobsRoot = path.join(
+  process.cwd(),
+  "storage",
+  "voter-slips",
+  "jobs",
+);
+
+async function cleanupOldVoterSlipJobs() {
+  const now = Date.now();
+  const ttlMs = Number(process.env.VOTER_SLIP_JOB_TTL_MS || 6 * 60 * 60 * 1000);
+
+  for (const [jobId, job] of voterSlipJobs.entries()) {
+    if (!job.finishedAt) continue;
+    const finishedAtMs = new Date(job.finishedAt).getTime();
+    if (Number.isNaN(finishedAtMs)) continue;
+
+    if (now - finishedAtMs > ttlMs) {
+      voterSlipJobs.delete(jobId);
+      if (job.filePath) {
+        await fs.remove(job.filePath).catch(() => null);
+      }
+    }
+  }
+}
+
+function makeMassJobPublicView(job) {
+  return {
+    id: job.id,
+    status: job.status,
+    total: job.total,
+    processed: job.processed,
+    startedAt: job.startedAt,
+    finishedAt: job.finishedAt,
+    error: job.error,
+    filters: job.filters,
+    fileName: job.fileName,
+    downloadUrl:
+      job.status === "completed"
+        ? `/user/voterslips/mass/jobs/${job.id}/download`
+        : null,
+  };
+}
+
+function normalizeText(value) {
+  if (value === null || value === undefined) return "";
+  return String(value).trim();
+}
+
+function isAdminUser(req) {
+  return req?.user?.role === "admin";
+}
+
+function inferLayoutSource(layoutFileExists, layout) {
+  if (!layoutFileExists) return "default";
+
+  const version = String(layout?.version || "").toLowerCase();
+  if (version.includes("gemini")) return "gemini";
+  return "manual";
+}
+
+function toBoolean(value, fallback = false) {
+  if (typeof value === "boolean") return value;
+  if (typeof value === "string") {
+    const lower = value.toLowerCase();
+    if (lower === "true") return true;
+    if (lower === "false") return false;
+  }
+  return fallback;
+}
+
+function parseCalibrationMode(mode) {
+  if (["manual", "gemini", "default"].includes(mode)) return mode;
+  return null;
+}
+
+function summarizeManualProfiles(profiles) {
+  return (profiles || []).map((profile) => ({
+    id: profile.id,
+    name: profile.name,
+    createdAt: profile.createdAt || null,
+    updatedAt: profile.updatedAt || null,
+    source: profile.source || "manual-ui",
+    version: profile?.layout?.version || null,
+  }));
+}
+
+async function buildVoterSlipLayoutResponse(req) {
+  const admin = isAdminUser(req);
+  const layoutPath = getVoterSlipLayoutPath();
+  const layoutFileExists = await fs.pathExists(layoutPath);
+  const stat = layoutFileExists ? await fs.stat(layoutPath) : null;
+  const layout = await getVoterSlipLayout();
+  const source = inferLayoutSource(layoutFileExists, layout);
+  const [calibrationState, manualProfiles] = await Promise.all([
+    getCalibrationState(),
+    admin ? getManualProfiles() : Promise.resolve([]),
+  ]);
+
+  return {
+    layout,
+    meta: {
+      source,
+      layoutFileExists,
+      layoutPath: "storage/voter-slip-layout.json",
+      templateFile: getVoterSlipTemplatePublicHint(),
+      lastUpdated: stat ? stat.mtime.toISOString() : null,
+      coordinateSystem: "normalized-bottom-left",
+      permissions: {
+        isAdmin: admin,
+        canCalibrate: admin,
+        canUseManualCalibration: admin,
+      },
+      calibration: {
+        preferredMode: calibrationState.preferredMode,
+        lastUsedMode: calibrationState.lastUsedMode,
+        activeManualProfileId: admin
+          ? calibrationState.activeManualProfileId
+          : null,
+        lastUsedManualProfileId: admin
+          ? calibrationState.lastUsedManualProfileId
+          : null,
+        updatedAt: calibrationState.updatedAt,
+        statePath: admin
+          ? path
+              .relative(process.cwd(), getVoterSlipCalibrationStatePath())
+              .replaceAll("\\", "/")
+          : null,
+        profilesPath: admin
+          ? path
+              .relative(process.cwd(), getVoterSlipManualProfilesPath())
+              .replaceAll("\\", "/")
+          : null,
+        profiles: admin ? summarizeManualProfiles(manualProfiles) : [],
+        requiredFields: getRequiredVoterSlipFields(),
+        endpoints: {
+          getLayout: "/user/voterslips/layout",
+          getTemplate: "/user/voterslips/layout/template.png",
+          recalibrate: admin ? "/user/voterslips/layout/recalibrate" : null,
+          reset: admin ? "/user/voterslips/layout/reset" : null,
+          saveManual: admin ? "/user/voterslips/layout/manual" : null,
+          applyManualProfile: admin
+            ? "/user/voterslips/layout/manual/:profileId/apply"
+            : null,
+          listManualProfiles: admin
+            ? "/user/voterslips/layout/manual/profiles"
+            : null,
+          setMode: admin ? "/user/voterslips/layout/mode" : null,
+        },
+      },
+    },
+  };
+}
+
+async function runVoterSlipCalibrationScript() {
+  const scriptPath = path.join(
+    process.cwd(),
+    "scripts",
+    "calibrateVoterSlipLayout.js",
+  );
+
+  return execFileAsync(process.execPath, [scriptPath], {
+    cwd: process.cwd(),
+    env: process.env,
+    windowsHide: true,
+    maxBuffer: 1024 * 1024 * 10,
+  });
+}
+
+function formatSerialSortSql(prefix = "v") {
+  return `
+    NULLIF(regexp_replace(${prefix}.serial_number, '[^0-9]', '', 'g'), '')::INT NULLS LAST,
+    ${prefix}.serial_number,
+    ${prefix}.id
+  `;
+}
+
+function mapRowToSlipVoter(row) {
+  return {
+    id: row.id,
+    sessionId: row.session_id,
+    partNumber: row.part_number,
+    boothNo: row.booth_no || row.part_number,
+    boothName: row.booth_name,
+    section: row.section,
+    serialNumber: row.serial_number,
+    name: row.name,
+    relationName: row.relation_name,
+    houseNumber: row.house_number,
+    age: row.age,
+    gender: row.gender,
+  };
+}
+
+async function getVoterForSlipByParam(idParam) {
+  const { column, value } = resolveVoterIdParam(idParam);
+  const result = await query(
+    `SELECT v.id, v.session_id, v.part_number, v.section, v.serial_number, v.name,
+            v.relation_name, v.house_number, v.age, v.gender, v.voter_id,
+            s.booth_no, s.booth_name
+     FROM session_voters v
+     LEFT JOIN sessions s ON s.id = v.session_id
+     WHERE v.${column} = $1
+     ORDER BY v.created_at DESC
+     LIMIT 1`,
+    [value],
+  );
+
+  if (result.rowCount === 0) return null;
+  return mapRowToSlipVoter(result.rows[0]);
+}
+
+async function getMassSlipVoters(filters) {
+  const where = [];
+  const values = [];
+  let idx = 1;
+
+  if (filters.sessionId) {
+    where.push(`v.session_id = $${idx}`);
+    values.push(filters.sessionId);
+    idx += 1;
+  }
+
+  const boothNo = normalizeText(filters.boothNo || filters.partNumber);
+  if (boothNo) {
+    where.push(`v.part_number = $${idx}`);
+    values.push(boothNo);
+    idx += 1;
+  }
+
+  if (filters.assembly) {
+    where.push(`LOWER(v.assembly) LIKE $${idx}`);
+    values.push(`%${String(filters.assembly).toLowerCase()}%`);
+    idx += 1;
+  }
+
+  if (filters.section) {
+    where.push(`LOWER(v.section) LIKE $${idx}`);
+    values.push(`%${String(filters.section).toLowerCase()}%`);
+    idx += 1;
+  }
+
+  if (where.length === 0) {
+    throw new Error(
+      "Mass generation needs at least boothNo/partNumber, sessionId, assembly, or section filter",
+    );
+  }
+
+  const sql = `
+    SELECT v.id, v.session_id, v.part_number, v.section, v.serial_number, v.name,
+           v.relation_name, v.house_number, v.age, v.gender,
+           s.booth_no, s.booth_name
+    FROM session_voters v
+    LEFT JOIN sessions s ON s.id = v.session_id
+    WHERE ${where.join(" AND ")}
+    ORDER BY ${formatSerialSortSql("v")};
+  `;
+
+  const result = await query(sql, values);
+  return result.rows.map(mapRowToSlipVoter);
+}
 
 // All user routes require authentication
 router.use(authenticate);
@@ -288,6 +583,602 @@ router.get("/voters/:id/print-data", async (req, res) => {
     res.json(printData);
   } catch (err) {
     res.status(500).json({ error: err.message });
+  }
+});
+
+async function sendSingleVoterSlip(req, res, idParam) {
+  try {
+    const idValue = idParam || req.query.id;
+    if (!idValue) {
+      return res.status(400).json({
+        error: "id query parameter is required",
+        example: "/user/voters/voterslip.pdf?id=123",
+      });
+    }
+
+    const hasTemplate = await ensureVoterSlipTemplateExists();
+    if (!hasTemplate) {
+      return res.status(500).json({
+        error: "Voter slip template not found",
+        expectedPath: getVoterSlipTemplatePublicHint(),
+      });
+    }
+
+    const voter = await getVoterForSlipByParam(idValue);
+    if (!voter) {
+      return res.status(404).json({ error: "Voter not found" });
+    }
+
+    const pdfBytes = await buildSingleVoterSlipPdf(voter);
+    const serial = normalizeText(voter.serialNumber || "unknown");
+    const partNo = normalizeText(
+      voter.boothNo || voter.partNumber || "unknown",
+    );
+    const fileName = `voterslip-part-${partNo}-serial-${serial}.pdf`
+      .replace(/[^a-zA-Z0-9_.-]+/g, "-")
+      .toLowerCase();
+
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader("Content-Disposition", `attachment; filename="${fileName}"`);
+    return res.send(Buffer.from(pdfBytes));
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+}
+
+/**
+ * Download a single voter slip PDF using the new template.
+ * Works with DB numeric id OR voter id (including query param path-safe option).
+ */
+router.get("/voters/voterslip.pdf", async (req, res) => {
+  return sendSingleVoterSlip(req, res, req.query.id);
+});
+
+/**
+ * Alternate path form for single voter slip.
+ */
+router.get("/voters/:id/voterslip.pdf", async (req, res) => {
+  return sendSingleVoterSlip(req, res, req.params.id);
+});
+
+/**
+ * Get active voter slip layout metadata and field boxes for frontend overlay.
+ */
+router.get("/voterslips/layout", async (req, res) => {
+  try {
+    const payload = await buildVoterSlipLayoutResponse(req);
+    return res.json(payload);
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * Backward-compatible alias for older frontend path.
+ */
+router.get("/voterslips/calibration", async (req, res) => {
+  try {
+    const payload = await buildVoterSlipLayoutResponse(req);
+    return res.json(payload);
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * Serve the voter slip template image for calibration/overlay UIs.
+ */
+router.get("/voterslips/layout/template.png", async (_req, res) => {
+  try {
+    const templatePath = getConfiguredVoterSlipTemplatePath();
+    const exists = await fs.pathExists(templatePath);
+    if (!exists) {
+      return res.status(404).json({
+        error: "Voter slip template not found",
+        expectedPath: getVoterSlipTemplatePublicHint(),
+      });
+    }
+    return res.sendFile(templatePath);
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * Backward-compatible alias for older frontend path.
+ */
+router.get("/voterslips/calibration/template.png", async (_req, res) => {
+  try {
+    const templatePath = getConfiguredVoterSlipTemplatePath();
+    const exists = await fs.pathExists(templatePath);
+    if (!exists) {
+      return res.status(404).json({
+        error: "Voter slip template not found",
+        expectedPath: getVoterSlipTemplatePublicHint(),
+      });
+    }
+    return res.sendFile(templatePath);
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * Get saved manual calibration profiles and preference state.
+ */
+router.get("/voterslips/layout/manual/profiles", async (req, res) => {
+  try {
+    if (!isAdminUser(req)) {
+      return res.status(403).json({
+        error: "Only admin users can view manual voter slip profiles",
+      });
+    }
+
+    const [state, profiles] = await Promise.all([
+      getCalibrationState(),
+      getManualProfiles(),
+    ]);
+
+    return res.json({
+      state,
+      profiles: summarizeManualProfiles(profiles),
+    });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * Save a manual calibration layout from UI-selected boxes.
+ * Admin only.
+ */
+router.post("/voterslips/layout/manual", async (req, res) => {
+  try {
+    if (!isAdminUser(req)) {
+      return res.status(403).json({
+        error: "Only admin users can save manual voter slip layouts",
+      });
+    }
+
+    const fields = req.body?.fields;
+    if (!fields || typeof fields !== "object") {
+      return res.status(400).json({
+        error: "fields object is required",
+      });
+    }
+
+    const profileId = normalizeText(req.body?.profileId) || uuidv4();
+    const profileName = normalizeText(req.body?.name) || "Manual Layout";
+    const activate = toBoolean(req.body?.activate, true);
+    const setPreferred = toBoolean(req.body?.setPreferred, true);
+
+    const { profile, state } = await upsertManualProfile({
+      id: profileId,
+      name: profileName,
+      fields,
+      activate,
+      setPreferred,
+    });
+
+    const payload = await buildVoterSlipLayoutResponse(req);
+    return res.json({
+      message: "Manual voter slip layout saved",
+      profile: {
+        id: profile.id,
+        name: profile.name,
+        version: profile?.layout?.version || null,
+        updatedAt: profile.updatedAt,
+      },
+      state,
+      ...payload,
+    });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * Apply one of the saved manual layout profiles as active.
+ * Admin only.
+ */
+router.post("/voterslips/layout/manual/:profileId/apply", async (req, res) => {
+  try {
+    if (!isAdminUser(req)) {
+      return res.status(403).json({
+        error: "Only admin users can apply manual voter slip layouts",
+      });
+    }
+
+    const profileId = normalizeText(req.params.profileId);
+    if (!profileId) {
+      return res.status(400).json({ error: "profileId is required" });
+    }
+
+    const setPreferred = toBoolean(req.body?.setPreferred, true);
+    const result = await applyManualProfile(profileId, { setPreferred });
+    if (!result) {
+      return res.status(404).json({ error: "Manual layout profile not found" });
+    }
+
+    const payload = await buildVoterSlipLayoutResponse(req);
+    return res.json({
+      message: "Manual voter slip layout applied",
+      profile: {
+        id: result.profile.id,
+        name: result.profile.name,
+        version: result.profile?.layout?.version || null,
+      },
+      state: result.state,
+      ...payload,
+    });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * Persist preferred calibration mode so UI does not need to ask repeatedly.
+ * Admin only.
+ */
+router.patch("/voterslips/layout/mode", async (req, res) => {
+  try {
+    if (!isAdminUser(req)) {
+      return res.status(403).json({
+        error: "Only admin users can change calibration mode",
+      });
+    }
+
+    const mode = parseCalibrationMode(req.body?.preferredMode);
+    if (!mode) {
+      return res.status(400).json({
+        error: "preferredMode must be one of: manual, gemini, default",
+      });
+    }
+
+    if (mode === "manual") {
+      const requestedProfileId = normalizeText(req.body?.profileId);
+      const currentState = await getCalibrationState();
+      const profileId =
+        requestedProfileId ||
+        currentState.activeManualProfileId ||
+        currentState.lastUsedManualProfileId;
+
+      if (!profileId) {
+        return res.status(400).json({
+          error: "No manual profile found. Save manual layout first.",
+        });
+      }
+
+      const applied = await applyManualProfile(profileId, {
+        setPreferred: true,
+      });
+      if (!applied) {
+        return res.status(404).json({
+          error: "Manual layout profile not found",
+        });
+      }
+    } else if (mode === "default") {
+      await saveVoterSlipLayout(getDefaultVoterSlipLayout());
+      await saveCalibrationState({
+        preferredMode: "default",
+        lastUsedMode: "default",
+        activeManualProfileId: null,
+      });
+    } else {
+      await saveCalibrationState({
+        preferredMode: "gemini",
+        lastUsedMode: "gemini",
+      });
+    }
+
+    const payload = await buildVoterSlipLayoutResponse(req);
+    return res.json({
+      message: `Calibration mode updated to ${mode}`,
+      ...payload,
+    });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * Recalibrate layout using Gemini OCR script and return updated layout.
+ * Admin only.
+ */
+router.post("/voterslips/layout/recalibrate", async (req, res) => {
+  try {
+    if (!isAdminUser(req)) {
+      return res.status(403).json({
+        error: "Only admin users can recalibrate voter slip layout",
+      });
+    }
+
+    const hasTemplate = await ensureVoterSlipTemplateExists();
+    if (!hasTemplate) {
+      return res.status(500).json({
+        error: "Voter slip template not found",
+        expectedPath: getVoterSlipTemplatePublicHint(),
+      });
+    }
+
+    let scriptOutput = "";
+    try {
+      const { stdout, stderr } = await runVoterSlipCalibrationScript();
+      scriptOutput = [stdout, stderr].filter(Boolean).join("\n").trim();
+    } catch (scriptErr) {
+      const stderr = scriptErr?.stderr ? String(scriptErr.stderr) : "";
+      const stdout = scriptErr?.stdout ? String(scriptErr.stdout) : "";
+      return res.status(500).json({
+        error: "Gemini calibration failed",
+        details:
+          [stderr, stdout].filter(Boolean).join("\n").trim() ||
+          scriptErr.message,
+      });
+    }
+
+    clearVoterSlipLayoutCache();
+    await saveCalibrationState({
+      lastUsedMode: "gemini",
+    });
+    const payload = await buildVoterSlipLayoutResponse(req);
+    return res.json({
+      message: "Voter slip layout recalibrated",
+      scriptOutput,
+      ...payload,
+    });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * Backward-compatible alias for older frontend path.
+ */
+router.post("/voterslips/recalibrate", async (req, res) => {
+  try {
+    if (!isAdminUser(req)) {
+      return res.status(403).json({
+        error: "Only admin users can recalibrate voter slip layout",
+      });
+    }
+
+    const hasTemplate = await ensureVoterSlipTemplateExists();
+    if (!hasTemplate) {
+      return res.status(500).json({
+        error: "Voter slip template not found",
+        expectedPath: getVoterSlipTemplatePublicHint(),
+      });
+    }
+
+    let scriptOutput = "";
+    try {
+      const { stdout, stderr } = await runVoterSlipCalibrationScript();
+      scriptOutput = [stdout, stderr].filter(Boolean).join("\n").trim();
+    } catch (scriptErr) {
+      const stderr = scriptErr?.stderr ? String(scriptErr.stderr) : "";
+      const stdout = scriptErr?.stdout ? String(scriptErr.stdout) : "";
+      return res.status(500).json({
+        error: "Gemini calibration failed",
+        details:
+          [stderr, stdout].filter(Boolean).join("\n").trim() ||
+          scriptErr.message,
+      });
+    }
+
+    clearVoterSlipLayoutCache();
+    await saveCalibrationState({
+      lastUsedMode: "gemini",
+    });
+    const payload = await buildVoterSlipLayoutResponse(req);
+    return res.json({
+      message: "Voter slip layout recalibrated",
+      scriptOutput,
+      ...payload,
+    });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * Revert custom layout and force default layout usage.
+ * Admin only.
+ */
+router.post("/voterslips/layout/reset", async (req, res) => {
+  try {
+    if (!isAdminUser(req)) {
+      return res.status(403).json({
+        error: "Only admin users can reset voter slip layout",
+      });
+    }
+
+    const layoutPath = getVoterSlipLayoutPath();
+    await fs.remove(layoutPath);
+    clearVoterSlipLayoutCache();
+    await saveCalibrationState({
+      preferredMode: "default",
+      lastUsedMode: "default",
+      activeManualProfileId: null,
+    });
+
+    const payload = await buildVoterSlipLayoutResponse(req);
+
+    return res.json({
+      message: "Voter slip layout reverted to default",
+      ...payload,
+    });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * Backward-compatible alias for older frontend path.
+ */
+router.post("/voterslips/revert", async (req, res) => {
+  try {
+    if (!isAdminUser(req)) {
+      return res.status(403).json({
+        error: "Only admin users can reset voter slip layout",
+      });
+    }
+
+    const layoutPath = getVoterSlipLayoutPath();
+    await fs.remove(layoutPath);
+    clearVoterSlipLayoutCache();
+    await saveCalibrationState({
+      preferredMode: "default",
+      lastUsedMode: "default",
+      activeManualProfileId: null,
+    });
+
+    const payload = await buildVoterSlipLayoutResponse(req);
+
+    return res.json({
+      message: "Voter slip layout reverted to default",
+      ...payload,
+    });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * Start async mass generation of voter slips as one PDF.
+ * Body example: { boothNo: "42", assembly: "Barasat", section: "A" }
+ */
+router.post("/voterslips/mass/start", async (req, res) => {
+  try {
+    await cleanupOldVoterSlipJobs();
+
+    const hasTemplate = await ensureVoterSlipTemplateExists();
+    if (!hasTemplate) {
+      return res.status(500).json({
+        error: "Voter slip template not found",
+        expectedPath: getVoterSlipTemplatePublicHint(),
+      });
+    }
+
+    const filters = {
+      sessionId: normalizeText(req.body?.sessionId),
+      boothNo: normalizeText(req.body?.boothNo),
+      partNumber: normalizeText(req.body?.partNumber),
+      assembly: normalizeText(req.body?.assembly),
+      section: normalizeText(req.body?.section),
+    };
+
+    const voters = await getMassSlipVoters(filters);
+    if (!voters.length) {
+      return res.status(404).json({
+        error: "No voters found for selected filters",
+        filters,
+      });
+    }
+
+    const boothNoForName =
+      filters.boothNo || filters.partNumber || voters[0].boothNo;
+    const fileName = buildMassSlipFilename(boothNoForName);
+    const jobId = uuidv4();
+    const filePath = path.join(voterSlipJobsRoot, jobId, fileName);
+
+    const job = {
+      id: jobId,
+      status: "queued",
+      total: voters.length,
+      processed: 0,
+      startedAt: new Date().toISOString(),
+      finishedAt: null,
+      error: null,
+      filters,
+      fileName,
+      filePath,
+      requestedBy: req.user.id,
+    };
+    voterSlipJobs.set(jobId, job);
+
+    setImmediate(async () => {
+      try {
+        job.status = "processing";
+        await buildMassVoterSlipPdfFile(voters, filePath, {
+          onProgress: (processed, total) => {
+            job.processed = processed;
+            job.total = total;
+          },
+        });
+        job.status = "completed";
+        job.finishedAt = new Date().toISOString();
+      } catch (error) {
+        job.status = "failed";
+        job.error = error.message || "Mass slip generation failed";
+        job.finishedAt = new Date().toISOString();
+      }
+    });
+
+    return res.status(202).json({
+      message: "Mass voter slip generation started",
+      job: makeMassJobPublicView(job),
+    });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * Poll status for mass generation jobs.
+ */
+router.get("/voterslips/mass/jobs/:jobId", async (req, res) => {
+  try {
+    const job = voterSlipJobs.get(req.params.jobId);
+    if (!job) {
+      return res.status(404).json({ error: "Job not found" });
+    }
+
+    if (job.requestedBy !== req.user.id && req.user.role !== "admin") {
+      return res.status(403).json({ error: "You cannot access this job" });
+    }
+
+    return res.json({ job: makeMassJobPublicView(job) });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * Download completed mass generation output PDF.
+ */
+router.get("/voterslips/mass/jobs/:jobId/download", async (req, res) => {
+  try {
+    const job = voterSlipJobs.get(req.params.jobId);
+    if (!job) {
+      return res.status(404).json({ error: "Job not found" });
+    }
+
+    if (job.requestedBy !== req.user.id && req.user.role !== "admin") {
+      return res.status(403).json({ error: "You cannot access this job" });
+    }
+
+    if (job.status !== "completed") {
+      return res.status(409).json({
+        error: "Job is not completed yet",
+        job: makeMassJobPublicView(job),
+      });
+    }
+
+    const exists = await fs.pathExists(job.filePath);
+    if (!exists) {
+      return res.status(404).json({
+        error: "Generated file not found on disk",
+      });
+    }
+
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename="${job.fileName}"`,
+    );
+    return res.sendFile(job.filePath);
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
   }
 });
 

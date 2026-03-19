@@ -6,9 +6,11 @@
     "dev": "node src/server.js",
     "start": "node scripts/initDb.js && node src/server.js",
     "db:init": "node scripts/initDb.js",
-    "create-admin": "node scripts/createAdmin.js"
+    "create-admin": "node scripts/createAdmin.js",
+    "voterslip:calibrate": "node scripts/calibrateVoterSlipLayout.js"
   },
   "dependencies": {
+    "@pdf-lib/fontkit": "^1.1.1",
     "adm-zip": "^0.5.16",
     "bcryptjs": "^3.0.3",
     "cloudinary": "^2.9.0",
@@ -23,6 +25,7 @@
     "multer": "^1.4.5-lts.1",
     "pdf-lib": "^1.17.1",
     "pg": "^8.11.3",
+    "regenerator-runtime": "^0.14.1",
     "uuid": "^9.0.1"
   }
 }

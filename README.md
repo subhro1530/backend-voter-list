@@ -31,7 +31,6 @@ Backend API to ingest PDF voter lists, split them into per-page PDFs, process pa
    ```
 
 2. **Configure env**
-
    - Copy `.env.example` → `.env` and fill:
      - `DATABASE_URL` (Neon connection string)
      - `GEMINI_API_KEY_1` through `GEMINI_API_KEY_7` (7 keys for parallel processing)
@@ -144,9 +143,100 @@ Users can search across ALL assemblies regardless of which session they were upl
 - `GET /user/voters/:id` - Get voter details by database ID
 - `GET /user/voters/by-voter-id/:voterId` - Get voter by their voter ID
 - `GET /user/voters/:id/print-data` - Get print-ready voter card data
+- `GET /user/voters/voterslip.pdf?id=<idOrVoterId>` - Download single voter slip PDF in the latest template
+- `GET /user/voters/:id/voterslip.pdf` - Alternate path for single voter slip PDF
+- `POST /user/voterslips/mass/start` - Start async mass voter slip PDF generation (returns job id)
+- `GET /user/voterslips/mass/jobs/:jobId` - Poll mass-generation status/progress
+- `GET /user/voterslips/mass/jobs/:jobId/download` - Download generated mass voter slip PDF
+- `GET /user/voterslips/layout` - Get active voter slip field-box layout + metadata
+- `GET /user/voterslips/layout/template.png` - Get voter slip template image for overlay UIs
+- `POST /user/voterslips/layout/recalibrate` - Recalibrate layout with Gemini OCR (admin only)
+- `POST /user/voterslips/layout/manual` - Save manual layout boxes from UI and optionally set as preferred (admin only)
+- `POST /user/voterslips/layout/manual/:profileId/apply` - Apply a saved manual layout profile (admin only)
+- `GET /user/voterslips/layout/manual/profiles` - List saved manual layout profiles + persisted calibration state (admin only)
+- `PATCH /user/voterslips/layout/mode` - Persist preferred mode (`manual|gemini|default`) so UI does not ask every time
+- `POST /user/voterslips/layout/reset` - Revert to default layout (admin only)
 - `POST /user/voters/:id/print` - Mark voter as printed
 - `GET /user/profile` - Get own profile
 - `PATCH /user/profile` - Update own profile
+
+### Mass Voter Slip Job Flow
+
+1. Start job:
+   ```sh
+   curl -X POST "http://localhost:4000/user/voterslips/mass/start" \
+     -H "Authorization: Bearer $TOKEN" \
+     -H "Content-Type: application/json" \
+     -d '{"boothNo":"42","assembly":"Barasat"}'
+   ```
+2. Poll progress (`queued` -> `processing` -> `completed`):
+   ```sh
+   curl -H "Authorization: Bearer $TOKEN" \
+     "http://localhost:4000/user/voterslips/mass/jobs/<jobId>"
+   ```
+3. Download when completed:
+   ```sh
+   curl -L -H "Authorization: Bearer $TOKEN" \
+     "http://localhost:4000/user/voterslips/mass/jobs/<jobId>/download" \
+     -o voterslips.pdf
+   ```
+
+### Voter Slip Calibration Flow (Admin)
+
+Template location used by voter-slip rendering:
+
+- Default: `storage/voterslips/layout/template.png`
+- Override with env: `VOTER_SLIP_TEMPLATE_PATH` (absolute or workspace-relative)
+
+1. Read active layout:
+   ```sh
+   curl -H "Authorization: Bearer $TOKEN" \
+     "http://localhost:4000/user/voterslips/layout"
+   ```
+2. Recalibrate from template with Gemini:
+   ```sh
+   curl -X POST -H "Authorization: Bearer $TOKEN" \
+     "http://localhost:4000/user/voterslips/layout/recalibrate"
+   ```
+3. Revert to default layout:
+   ```sh
+   curl -X POST -H "Authorization: Bearer $TOKEN" \
+     "http://localhost:4000/user/voterslips/layout/reset"
+   ```
+
+### Manual Calibration Flow (Admin)
+
+1. Save manual boxes selected in UI and set as preferred:
+   ```sh
+   curl -X POST "http://localhost:4000/user/voterslips/layout/manual" \
+     -H "Authorization: Bearer $TOKEN" \
+     -H "Content-Type: application/json" \
+     -d '{
+       "name":"Main Layout",
+       "setPreferred":true,
+       "activate":true,
+       "fields": {
+         "partNo": {"x":0.70,"y":0.71,"width":0.13,"height":0.05,"align":"left","maxLines":1,"maxFontSize":20,"minFontSize":12,"paddingX":0.008,"paddingY":0.01},
+         "serialNumber": {"x":0.94,"y":0.71,"width":0.04,"height":0.05,"align":"center","maxLines":1,"maxFontSize":20,"minFontSize":12,"paddingX":0.002,"paddingY":0.01},
+         "name": {"x":0.70,"y":0.63,"width":0.19,"height":0.05,"align":"left","maxLines":1,"maxFontSize":22,"minFontSize":12,"paddingX":0.008,"paddingY":0.01},
+         "father": {"x":0.70,"y":0.56,"width":0.19,"height":0.05,"align":"left","maxLines":1,"maxFontSize":20,"minFontSize":12,"paddingX":0.008,"paddingY":0.01},
+         "address": {"x":0.70,"y":0.49,"width":0.28,"height":0.09,"align":"left","maxLines":2,"maxFontSize":18,"minFontSize":10,"paddingX":0.008,"paddingY":0.012},
+         "sex": {"x":0.96,"y":0.63,"width":0.02,"height":0.05,"align":"center","maxLines":1,"maxFontSize":18,"minFontSize":12,"paddingX":0.002,"paddingY":0.01},
+         "age": {"x":0.96,"y":0.56,"width":0.02,"height":0.05,"align":"center","maxLines":1,"maxFontSize":18,"minFontSize":12,"paddingX":0.002,"paddingY":0.01},
+         "pollingStation": {"x":0.70,"y":0.31,"width":0.28,"height":0.10,"align":"left","maxLines":2,"maxFontSize":18,"minFontSize":11,"paddingX":0.008,"paddingY":0.012}
+       }
+     }'
+   ```
+2. Load profiles for selector UI:
+   ```sh
+   curl -H "Authorization: Bearer $TOKEN" \
+     "http://localhost:4000/user/voterslips/layout/manual/profiles"
+   ```
+3. Apply one saved profile:
+   ```sh
+   curl -X POST -H "Authorization: Bearer $TOKEN" \
+     "http://localhost:4000/user/voterslips/layout/manual/<profileId>/apply"
+   ```
 
 ### Admin Endpoints (requires admin authentication)
 
