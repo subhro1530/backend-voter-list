@@ -220,6 +220,133 @@ function normalizeFieldWithFallback(inputField, fallbackField) {
   };
 }
 
+function getFieldCenter(field) {
+  return {
+    x: field.x + field.width / 2,
+    y: field.y + field.height / 2,
+  };
+}
+
+function fieldDistanceScore(box, fallbackField) {
+  const a = getFieldCenter(box);
+  const b = getFieldCenter(fallbackField);
+
+  const dx = a.x - b.x;
+  const dy = a.y - b.y;
+  const centerDistance = Math.sqrt(dx * dx + dy * dy);
+
+  const widthDiff = Math.abs(box.width - fallbackField.width);
+  const heightDiff = Math.abs(box.height - fallbackField.height);
+
+  // Center position should dominate matching; size is a small tie-breaker.
+  return centerDistance + widthDiff * 0.35 + heightDiff * 0.35;
+}
+
+function normalizeInputBoxes(boxes, fallback = DEFAULT_LAYOUT) {
+  if (!Array.isArray(boxes)) return [];
+
+  return boxes
+    .map((box, index) => {
+      if (!box || typeof box !== "object") return null;
+
+      const baseFallback = fallback.fields.name;
+      const normalized = normalizeFieldWithFallback(box, baseFallback);
+
+      const rawLabel = String(box.label || box.field || box.name || "")
+        .trim()
+        .toLowerCase();
+      const label = REQUIRED_FIELDS.find(
+        (field) => field.toLowerCase() === rawLabel,
+      );
+
+      return {
+        index,
+        ...normalized,
+        label: label || null,
+      };
+    })
+    .filter(Boolean);
+}
+
+export function suggestVoterSlipFieldsFromBoxes(
+  boxes,
+  fallback = DEFAULT_LAYOUT,
+) {
+  const normalizedBoxes = normalizeInputBoxes(boxes, fallback);
+
+  const assigned = new Map();
+  const usedBoxIndexes = new Set();
+  const mapping = [];
+
+  // Pass 1: trust explicit labels if valid.
+  normalizedBoxes.forEach((box) => {
+    if (!box.label || assigned.has(box.label)) return;
+    assigned.set(box.label, box);
+    usedBoxIndexes.add(box.index);
+    mapping.push({
+      boxIndex: box.index,
+      field: box.label,
+      source: "explicit",
+      score: 0,
+    });
+  });
+
+  // Pass 2: greedy nearest-match for remaining fields.
+  const unassignedFields = REQUIRED_FIELDS.filter(
+    (field) => !assigned.has(field),
+  );
+  const freeBoxes = normalizedBoxes.filter(
+    (box) => !usedBoxIndexes.has(box.index),
+  );
+
+  unassignedFields.forEach((fieldName) => {
+    if (!freeBoxes.length) return;
+
+    let bestIdx = -1;
+    let bestScore = Number.POSITIVE_INFINITY;
+
+    for (let i = 0; i < freeBoxes.length; i += 1) {
+      const score = fieldDistanceScore(
+        freeBoxes[i],
+        fallback.fields[fieldName],
+      );
+      if (score < bestScore) {
+        bestScore = score;
+        bestIdx = i;
+      }
+    }
+
+    if (bestIdx >= 0) {
+      const selected = freeBoxes.splice(bestIdx, 1)[0];
+      assigned.set(fieldName, selected);
+      usedBoxIndexes.add(selected.index);
+      mapping.push({
+        boxIndex: selected.index,
+        field: fieldName,
+        source: "auto-nearest",
+        score: Number(bestScore.toFixed(6)),
+      });
+    }
+  });
+
+  const fields = {};
+  REQUIRED_FIELDS.forEach((name) => {
+    fields[name] = normalizeFieldWithFallback(
+      assigned.get(name),
+      fallback.fields[name],
+    );
+  });
+
+  return {
+    fields,
+    mapping,
+    missingInputCount: Math.max(
+      0,
+      REQUIRED_FIELDS.length - normalizedBoxes.length,
+    ),
+  };
+}
+
 export function normalizeVoterSlipLayoutFields(
   fields,
   fallback = DEFAULT_LAYOUT,
@@ -246,6 +373,25 @@ export function buildVoterSlipLayout(fields, options = {}) {
   return {
     version,
     fields: normalizeVoterSlipLayoutFields(fields, fallback),
+  };
+}
+
+export function buildVoterSlipLayoutFromBoxes(boxes, options = {}) {
+  const fallback = options.fallbackLayout || DEFAULT_LAYOUT;
+  const versionPrefix = options.versionPrefix || "manual";
+  const version =
+    options.version || `${versionPrefix}-${new Date().toISOString()}`;
+
+  const { fields, mapping, missingInputCount } =
+    suggestVoterSlipFieldsFromBoxes(boxes, fallback);
+
+  return {
+    layout: {
+      version,
+      fields,
+    },
+    mapping,
+    missingInputCount,
   };
 }
 

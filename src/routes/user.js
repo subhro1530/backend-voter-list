@@ -19,6 +19,8 @@ import {
   clearVoterSlipLayoutCache,
   saveVoterSlipLayout,
   getRequiredVoterSlipFields,
+  buildVoterSlipLayoutFromBoxes,
+  suggestVoterSlipFieldsFromBoxes,
 } from "../voterSlipLayout.js";
 import {
   getConfiguredVoterSlipTemplatePath,
@@ -178,6 +180,9 @@ async function buildVoterSlipLayoutResponse(req) {
           recalibrate: admin ? "/user/voterslips/layout/recalibrate" : null,
           reset: admin ? "/user/voterslips/layout/reset" : null,
           saveManual: admin ? "/user/voterslips/layout/manual" : null,
+          autoLabelManualBoxes: admin
+            ? "/user/voterslips/layout/manual/auto-labels"
+            : null,
           applyManualProfile: admin
             ? "/user/voterslips/layout/manual/:profileId/apply"
             : null,
@@ -729,6 +734,37 @@ router.get("/voterslips/layout/manual/profiles", async (req, res) => {
 });
 
 /**
+ * Preview auto-generated field labels from manually selected boxes.
+ * Admin only.
+ */
+router.post("/voterslips/layout/manual/auto-labels", async (req, res) => {
+  try {
+    if (!isAdminUser(req)) {
+      return res.status(403).json({
+        error: "Only admin users can use manual auto-labels",
+      });
+    }
+
+    const boxes = req.body?.boxes;
+    if (!Array.isArray(boxes) || !boxes.length) {
+      return res.status(400).json({
+        error: "boxes array is required",
+      });
+    }
+
+    const suggestion = suggestVoterSlipFieldsFromBoxes(boxes);
+    return res.json({
+      message: "Auto labels generated from selected boxes",
+      fields: suggestion.fields,
+      mapping: suggestion.mapping,
+      missingInputCount: suggestion.missingInputCount,
+    });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+/**
  * Save a manual calibration layout from UI-selected boxes.
  * Admin only.
  */
@@ -740,11 +776,24 @@ router.post("/voterslips/layout/manual", async (req, res) => {
       });
     }
 
-    const fields = req.body?.fields;
-    if (!fields || typeof fields !== "object") {
+    const fieldsInput = req.body?.fields;
+    const boxesInput = req.body?.boxes;
+    const hasFields = fieldsInput && typeof fieldsInput === "object";
+    const hasBoxes = Array.isArray(boxesInput) && boxesInput.length > 0;
+
+    if (!hasFields && !hasBoxes) {
       return res.status(400).json({
-        error: "fields object is required",
+        error: "Either fields object or boxes array is required",
       });
+    }
+
+    let fields = fieldsInput;
+    let autoLabelResult = null;
+    if (!hasFields && hasBoxes) {
+      autoLabelResult = buildVoterSlipLayoutFromBoxes(boxesInput, {
+        versionPrefix: "manual-auto",
+      });
+      fields = autoLabelResult.layout.fields;
     }
 
     const profileId = normalizeText(req.body?.profileId) || uuidv4();
@@ -769,6 +818,12 @@ router.post("/voterslips/layout/manual", async (req, res) => {
         version: profile?.layout?.version || null,
         updatedAt: profile.updatedAt,
       },
+      autoLabel: autoLabelResult
+        ? {
+            mapping: autoLabelResult.mapping,
+            missingInputCount: autoLabelResult.missingInputCount,
+          }
+        : null,
       state,
       ...payload,
     });

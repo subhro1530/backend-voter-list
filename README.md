@@ -152,6 +152,7 @@ Users can search across ALL assemblies regardless of which session they were upl
 - `GET /user/voterslips/layout/template.png` - Get voter slip template image for overlay UIs
 - `POST /user/voterslips/layout/recalibrate` - Recalibrate layout with Gemini OCR (admin only)
 - `POST /user/voterslips/layout/manual` - Save manual layout boxes from UI and optionally set as preferred (admin only)
+- `POST /user/voterslips/layout/manual/auto-labels` - Auto-generate field labels from selected manual boxes (admin only)
 - `POST /user/voterslips/layout/manual/:profileId/apply` - Apply a saved manual layout profile (admin only)
 - `GET /user/voterslips/layout/manual/profiles` - List saved manual layout profiles + persisted calibration state (admin only)
 - `PATCH /user/voterslips/layout/mode` - Persist preferred mode (`manual|gemini|default`) so UI does not ask every time
@@ -206,7 +207,21 @@ Template location used by voter-slip rendering:
 
 ### Manual Calibration Flow (Admin)
 
-1. Save manual boxes selected in UI and set as preferred:
+1. Preview auto labels from UI-selected boxes:
+
+   ```sh
+   curl -X POST "http://localhost:4000/user/voterslips/layout/manual/auto-labels" \
+     -H "Authorization: Bearer $TOKEN" \
+     -H "Content-Type: application/json" \
+     -d '{
+       "boxes": [
+         {"x":0.70,"y":0.71,"width":0.13,"height":0.05},
+         {"x":0.94,"y":0.71,"width":0.04,"height":0.05}
+       ]
+     }'
+   ```
+
+2. Save manual boxes selected in UI and set as preferred:
    ```sh
    curl -X POST "http://localhost:4000/user/voterslips/layout/manual" \
      -H "Authorization: Bearer $TOKEN" \
@@ -227,12 +242,12 @@ Template location used by voter-slip rendering:
        }
      }'
    ```
-2. Load profiles for selector UI:
+3. Load profiles for selector UI:
    ```sh
    curl -H "Authorization: Bearer $TOKEN" \
      "http://localhost:4000/user/voterslips/layout/manual/profiles"
    ```
-3. Apply one saved profile:
+4. Apply one saved profile:
    ```sh
    curl -X POST -H "Authorization: Bearer $TOKEN" \
      "http://localhost:4000/user/voterslips/layout/manual/<profileId>/apply"

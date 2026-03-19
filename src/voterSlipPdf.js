@@ -34,27 +34,8 @@ function toAge(value) {
 }
 
 function toGenderShort(value) {
-  const raw = normalizeText(value).toLowerCase();
-  if (!raw) return "";
-  if (
-    raw.startsWith("m") ||
-    raw.includes("male") ||
-    raw.includes("পুরুষ") ||
-    raw.includes("purush")
-  ) {
-    return "M";
-  }
-  if (
-    raw.startsWith("f") ||
-    raw.includes("female") ||
-    raw.includes("মহিলা") ||
-    raw.includes("নারী") ||
-    raw.includes("mohila") ||
-    raw.includes("nari")
-  ) {
-    return "F";
-  }
-  return "O";
+  // Keep original value to avoid wrong auto-translation/transliteration.
+  return normalizeText(value);
 }
 
 function buildAddress(voter) {
@@ -394,16 +375,16 @@ export async function buildMassVoterSlipPdfFile(
   const layout = await getVoterSlipLayout();
   const tpl = await buildTemplateEmbed(pdfDoc);
 
-  // Always keep 4 slips per page: fixed 2x2 grid on A4 landscape.
-  const pageWidth = 842;
-  const pageHeight = 595;
+  // Keep 4 slips per page in a vertical stack (one below another) on A4 portrait.
+  const pageWidth = 595;
+  const pageHeight = 842;
   const marginX = 18;
   const marginY = 18;
-  const gapX = 14;
+  const gapX = 0;
   const gapY = 14;
 
-  const cols = 2;
-  const rows = 2;
+  const cols = 1;
+  const rows = 4;
   const slipsPerPage = cols * rows;
 
   const availableCellWidth =
