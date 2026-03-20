@@ -10,6 +10,8 @@
  */
 
 import express from "express";
+import path from "path";
+import fs from "fs-extra";
 import { v4 as uuidv4 } from "uuid";
 import multer from "multer";
 import { query } from "../db.js";
@@ -25,6 +27,73 @@ const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 5 * 1024 * 1024 },
 });
+const affidavitStorageRoot = path.join(process.cwd(), "storage", "affidavits");
+const STORAGE_RETENTION_MS = Math.max(
+  Number(process.env.STORAGE_RETENTION_MS) || 24 * 60 * 60 * 1000,
+  60 * 60 * 1000,
+);
+const STORAGE_CLEANUP_INTERVAL_MS = Math.max(
+  Number(process.env.STORAGE_CLEANUP_INTERVAL_MS) || 60 * 60 * 1000,
+  10 * 60 * 1000,
+);
+
+async function cleanupAffidavitStorage() {
+  try {
+    await fs.ensureDir(affidavitStorageRoot);
+
+    const [dirs, sessions] = await Promise.all([
+      fs.readdir(affidavitStorageRoot),
+      query("SELECT id, status, updated_at FROM affidavit_sessions"),
+    ]);
+
+    const now = Date.now();
+    const sessionMap = new Map(
+      sessions.rows.map((row) => [
+        String(row.id),
+        {
+          status: String(row.status || ""),
+          updatedAtMs: new Date(row.updated_at).getTime(),
+        },
+      ]),
+    );
+
+    for (const dirName of dirs) {
+      const dirPath = path.join(affidavitStorageRoot, dirName);
+      const stat = await fs.stat(dirPath).catch(() => null);
+      if (!stat || !stat.isDirectory()) continue;
+
+      const sessionMeta = sessionMap.get(dirName);
+      if (!sessionMeta) {
+        const orphanAgeMs = now - stat.mtimeMs;
+        if (orphanAgeMs > STORAGE_RETENTION_MS) {
+          await fs.remove(dirPath).catch(() => null);
+        }
+        continue;
+      }
+
+      if (sessionMeta.status === "completed") {
+        await fs.remove(dirPath).catch(() => null);
+        continue;
+      }
+
+      const fallbackAgeMs = now - stat.mtimeMs;
+      const updatedAgeMs = Number.isNaN(sessionMeta.updatedAtMs)
+        ? fallbackAgeMs
+        : now - sessionMeta.updatedAtMs;
+
+      if (updatedAgeMs > STORAGE_RETENTION_MS) {
+        await fs.remove(dirPath).catch(() => null);
+      }
+    }
+  } catch (err) {
+    console.warn("Affidavit storage cleanup skipped:", err.message);
+  }
+}
+
+void cleanupAffidavitStorage();
+setInterval(() => {
+  void cleanupAffidavitStorage();
+}, STORAGE_CLEANUP_INTERVAL_MS);
 
 // All affidavit routes require authentication + admin
 router.use(authenticate);
@@ -62,7 +131,15 @@ router.post("/manual-entry", async (req, res) => {
              candidate_photo_url=$5, candidate_signature_url=$6,
              status='completed', total_pages=0, processed_pages=0, updated_at=now()
          WHERE id=$7`,
-        [candidateName, party, constituency, state, formData.candidatePhotoUrl || null, formData.candidateSignatureUrl || null, sessionId],
+        [
+          candidateName,
+          party,
+          constituency,
+          state,
+          formData.candidatePhotoUrl || null,
+          formData.candidateSignatureUrl || null,
+          sessionId,
+        ],
       );
 
       await query("DELETE FROM affidavit_entries WHERE session_id=$1", [
@@ -81,7 +158,16 @@ router.post("/manual-entry", async (req, res) => {
           candidate_photo_url, candidate_signature_url,
           status, total_pages, processed_pages)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'completed', 0, 0)`,
-        [sessionId, "Manual Entry", candidateName, party, constituency, state, formData.candidatePhotoUrl || null, formData.candidateSignatureUrl || null],
+        [
+          sessionId,
+          "Manual Entry",
+          candidateName,
+          party,
+          constituency,
+          state,
+          formData.candidatePhotoUrl || null,
+          formData.candidateSignatureUrl || null,
+        ],
       );
     }
 
@@ -373,7 +459,10 @@ router.get("/sessions/:id/export/docx", async (req, res) => {
     if (sessRow.candidate_photo_url && !merged.fields.candidatePhotoUrl) {
       merged.fields.candidatePhotoUrl = sessRow.candidate_photo_url;
     }
-    if (sessRow.candidate_signature_url && !merged.fields.candidateSignatureUrl) {
+    if (
+      sessRow.candidate_signature_url &&
+      !merged.fields.candidateSignatureUrl
+    ) {
       merged.fields.candidateSignatureUrl = sessRow.candidate_signature_url;
     }
 
@@ -563,7 +652,6 @@ function buildAffidavitFormData(data) {
     oathCommissionerSealNo: data.oathCommissionerSealNo || "",
   };
 }
-
 
 function buildMergedStructure(formData) {
   const merged = {

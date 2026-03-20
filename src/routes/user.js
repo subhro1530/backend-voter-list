@@ -47,9 +47,32 @@ const voterSlipJobsRoot = path.join(
   "jobs",
 );
 
+async function cleanupVoterSlipJobsOnStartup() {
+  await fs.remove(voterSlipJobsRoot).catch(() => null);
+  await fs.ensureDir(voterSlipJobsRoot).catch(() => null);
+}
+
+// On each server relaunch, purge stale mass-slip artifacts from disk.
+void cleanupVoterSlipJobsOnStartup();
+
+async function deleteMassJobArtifacts(job) {
+  if (!job?.filePath) return;
+
+  const filePath = job.filePath;
+  const jobDir = path.dirname(filePath);
+
+  job.filePath = null;
+  job.downloadUrl = null;
+
+  await fs.remove(filePath).catch(() => null);
+  await fs.remove(jobDir).catch(() => null);
+}
+
 async function cleanupOldVoterSlipJobs() {
   const now = Date.now();
-  const ttlMs = Number(process.env.VOTER_SLIP_JOB_TTL_MS || 6 * 60 * 60 * 1000);
+  const ttlMs = Number(
+    process.env.VOTER_SLIP_JOB_TTL_MS || 24 * 60 * 60 * 1000,
+  );
 
   for (const [jobId, job] of voterSlipJobs.entries()) {
     if (!job.finishedAt) continue;
@@ -58,14 +81,18 @@ async function cleanupOldVoterSlipJobs() {
 
     if (now - finishedAtMs > ttlMs) {
       voterSlipJobs.delete(jobId);
-      if (job.filePath) {
-        await fs.remove(job.filePath).catch(() => null);
-      }
+      await deleteMassJobArtifacts(job);
     }
   }
 }
 
 function makeMassJobPublicView(job) {
+  const canDownload =
+    job.status === "completed" &&
+    !job.downloadedAt &&
+    !job.downloadFailedAt &&
+    Boolean(job.filePath);
+
   return {
     id: job.id,
     status: job.status,
@@ -76,10 +103,10 @@ function makeMassJobPublicView(job) {
     error: job.error,
     filters: job.filters,
     fileName: job.fileName,
-    downloadUrl:
-      job.status === "completed"
-        ? `/user/voterslips/mass/jobs/${job.id}/download`
-        : null,
+    downloadedAt: job.downloadedAt || null,
+    downloadUrl: canDownload
+      ? `/user/voterslips/mass/jobs/${job.id}/download`
+      : null,
   };
 }
 
@@ -1147,6 +1174,8 @@ router.post("/voterslips/mass/start", async (req, res) => {
       filters,
       fileName,
       filePath,
+      downloadedAt: null,
+      downloadFailedAt: null,
       requestedBy: req.user.id,
     };
     voterSlipJobs.set(jobId, job);
@@ -1183,6 +1212,8 @@ router.post("/voterslips/mass/start", async (req, res) => {
  */
 router.get("/voterslips/mass/jobs/:jobId", async (req, res) => {
   try {
+    await cleanupOldVoterSlipJobs();
+
     const job = voterSlipJobs.get(req.params.jobId);
     if (!job) {
       return res.status(404).json({ error: "Job not found" });
@@ -1203,6 +1234,8 @@ router.get("/voterslips/mass/jobs/:jobId", async (req, res) => {
  */
 router.get("/voterslips/mass/jobs/:jobId/download", async (req, res) => {
   try {
+    await cleanupOldVoterSlipJobs();
+
     const job = voterSlipJobs.get(req.params.jobId);
     if (!job) {
       return res.status(404).json({ error: "Job not found" });
@@ -1219,6 +1252,13 @@ router.get("/voterslips/mass/jobs/:jobId/download", async (req, res) => {
       });
     }
 
+    if (job.downloadedAt) {
+      return res.status(410).json({
+        error: "This generated PDF was already downloaded and removed",
+        job: makeMassJobPublicView(job),
+      });
+    }
+
     const exists = await fs.pathExists(job.filePath);
     if (!exists) {
       return res.status(404).json({
@@ -1231,7 +1271,19 @@ router.get("/voterslips/mass/jobs/:jobId/download", async (req, res) => {
       "Content-Disposition",
       `attachment; filename="${job.fileName}"`,
     );
-    return res.sendFile(job.filePath);
+
+    return res.download(job.filePath, job.fileName, async (err) => {
+      if (err) {
+        if (!res.headersSent) {
+          res.status(500).json({ error: err.message || "Download failed" });
+        }
+        return;
+      }
+
+      job.downloadedAt = new Date().toISOString();
+      job.downloadFailedAt = null;
+      await deleteMassJobArtifacts(job);
+    });
   } catch (err) {
     return res.status(500).json({ error: err.message });
   }

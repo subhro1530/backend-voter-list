@@ -44,6 +44,82 @@ router.use(authenticate);
 router.use(adminOnly);
 
 const storageRoot = path.join(process.cwd(), "storage", "elections");
+const STORAGE_RETENTION_MS = Math.max(
+  Number(process.env.STORAGE_RETENTION_MS) || 24 * 60 * 60 * 1000,
+  60 * 60 * 1000,
+);
+const STORAGE_CLEANUP_INTERVAL_MS = Math.max(
+  Number(process.env.STORAGE_CLEANUP_INTERVAL_MS) || 60 * 60 * 1000,
+  10 * 60 * 1000,
+);
+
+async function removeElectionStorageBySessionId(sessionId) {
+  if (!sessionId) return;
+  const sessionDir = path.join(storageRoot, sessionId);
+  await fs.remove(sessionDir).catch(() => null);
+}
+
+async function cleanupElectionStorage() {
+  try {
+    await fs.ensureDir(storageRoot);
+
+    const [dirs, sessions] = await Promise.all([
+      fs.readdir(storageRoot),
+      query("SELECT id, status, updated_at FROM election_sessions"),
+    ]);
+
+    const now = Date.now();
+    const sessionMap = new Map(
+      sessions.rows.map((row) => [
+        String(row.id),
+        {
+          status: String(row.status || ""),
+          updatedAtMs: new Date(row.updated_at).getTime(),
+        },
+      ]),
+    );
+
+    for (const dirName of dirs) {
+      const dirPath = path.join(storageRoot, dirName);
+      const stat = await fs.stat(dirPath).catch(() => null);
+      if (!stat || !stat.isDirectory()) continue;
+
+      const sessionMeta = sessionMap.get(dirName);
+      if (!sessionMeta) {
+        const orphanAgeMs = now - stat.mtimeMs;
+        if (orphanAgeMs > STORAGE_RETENTION_MS) {
+          await fs.remove(dirPath).catch(() => null);
+        }
+        continue;
+      }
+
+      if (sessionMeta.status === "completed") {
+        await fs.remove(dirPath).catch(() => null);
+        continue;
+      }
+
+      if (sessionMeta.status === "processing") {
+        continue;
+      }
+
+      const fallbackAgeMs = now - stat.mtimeMs;
+      const updatedAgeMs = Number.isNaN(sessionMeta.updatedAtMs)
+        ? fallbackAgeMs
+        : now - sessionMeta.updatedAtMs;
+
+      if (updatedAgeMs > STORAGE_RETENTION_MS) {
+        await fs.remove(dirPath).catch(() => null);
+      }
+    }
+  } catch (err) {
+    console.warn("Election storage cleanup skipped:", err.message);
+  }
+}
+
+void cleanupElectionStorage();
+setInterval(() => {
+  void cleanupElectionStorage();
+}, STORAGE_CLEANUP_INTERVAL_MS);
 
 const VOTER_SESSION_META_TTL_MS = Math.max(
   Number(process.env.VOTER_SESSION_META_TTL_MS) || 60_000,
@@ -1341,6 +1417,9 @@ router.post(
       }
 
       activeElectionSessions.delete(sessionId);
+      if (finalStatus === "completed") {
+        await removeElectionStorageBySessionId(sessionId);
+      }
       console.log(
         `🏁 Election session ${sessionId} complete [${finalStatus}] — ${results.length}/${pagePaths.length} pages OK, ${merged.candidates.length} candidates, ${merged.boothResults.length} booths`,
       );
