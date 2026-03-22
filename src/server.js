@@ -62,13 +62,92 @@ const app = express();
 const port = process.env.PORT || 3000;
 const storageRoot = path.join(process.cwd(), "storage");
 const pageDelayMs = Number(process.env.GEMINI_PAGE_DELAY_MS || 2000);
+const requestBodyLimitMb = Math.max(
+  Number(process.env.REQUEST_BODY_LIMIT_MB || 10),
+  1,
+);
+const maxUploadMb = Math.max(Number(process.env.MAX_UPLOAD_MB || 150), 10);
+const maxUploadBytes = maxUploadMb * 1024 * 1024;
+const autoResumeRounds = Math.max(
+  Number(process.env.AUTO_RESUME_ROUNDS || 6),
+  1,
+);
+const autoResumeDelayMs = Math.max(
+  Number(process.env.AUTO_RESUME_DELAY_MS || 5000),
+  1000,
+);
 
 // Parse CORS origins from environment variable
 const allowedOrigins = process.env.CORS_ORIGINS
   ? process.env.CORS_ORIGINS.split(",")
-      .map((o) => o.trim().replace(/\/$/, "")) // Remove trailing slashes
+      .map((o) => o.trim().replace(/\/$/, "").toLowerCase()) // Remove trailing slashes
       .filter(Boolean)
   : [];
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function extractOriginHost(originValue) {
+  try {
+    const parsed = new URL(originValue);
+    return parsed.hostname.toLowerCase();
+  } catch {
+    return String(originValue || "")
+      .toLowerCase()
+      .replace(/^https?:\/\//, "")
+      .replace(/\/$/, "");
+  }
+}
+
+function isOriginAllowed(origin) {
+  if (!origin) return true;
+
+  const normalizedOrigin = origin.replace(/\/$/, "").toLowerCase();
+
+  if (allowedOrigins.length === 0 || allowedOrigins.includes("*")) {
+    return true;
+  }
+
+  if (allowedOrigins.includes(normalizedOrigin)) {
+    return true;
+  }
+
+  const originHost = extractOriginHost(normalizedOrigin);
+
+  for (const allowedEntry of allowedOrigins) {
+    const allowed = String(allowedEntry || "").toLowerCase();
+
+    // Exact host match when allowed list contains bare domains
+    const allowedHost = extractOriginHost(allowed);
+    if (originHost === allowedHost) {
+      return true;
+    }
+
+    // Wildcard support: *.example.com or .example.com
+    if (allowed.startsWith("*.") || allowed.startsWith(".")) {
+      const suffix = allowed.replace(/^\*?\./, "");
+      if (originHost === suffix || originHost.endsWith(`.${suffix}`)) {
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
+
+async function getPendingPagePaths(sessionId, allPagePaths, pathToPageNumber) {
+  const processedPagesRes = await query(
+    "SELECT page_number FROM session_pages WHERE session_id=$1",
+    [sessionId],
+  );
+  const processedSet = new Set(
+    processedPagesRes.rows.map((r) => r.page_number),
+  );
+  return allPagePaths.filter(
+    (pagePath) => !processedSet.has(pathToPageNumber.get(pagePath)),
+  );
+}
 
 // CORS configuration with proper origin validation for production
 const corsConfig = {
@@ -78,16 +157,7 @@ const corsConfig = {
       return callback(null, true);
     }
 
-    // Remove trailing slash from origin for comparison
-    const normalizedOrigin = origin.replace(/\/$/, "");
-
-    // If no origins specified or wildcard, allow all
-    if (allowedOrigins.length === 0 || allowedOrigins.includes("*")) {
-      return callback(null, true);
-    }
-
-    // Check if origin is in allowed list
-    if (allowedOrigins.includes(normalizedOrigin)) {
+    if (isOriginAllowed(origin)) {
       return callback(null, true);
     }
 
@@ -95,7 +165,8 @@ const corsConfig = {
     console.log(`CORS blocked origin: ${origin}`);
     console.log(`Allowed origins: ${allowedOrigins.join(", ")}`);
 
-    callback(new Error(`CORS not allowed for origin: ${origin}`));
+    // Return false instead of throwing to keep error responses consistent
+    callback(null, false);
   },
   methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
   allowedHeaders: [
@@ -110,7 +181,10 @@ const corsConfig = {
 
 app.use(cors(corsConfig));
 app.options("*", cors(corsConfig));
-app.use(express.json({ limit: "1mb" }));
+app.use(express.json({ limit: `${requestBodyLimitMb}mb` }));
+app.use(
+  express.urlencoded({ extended: true, limit: `${requestBodyLimitMb}mb` }),
+);
 
 // Mount route modules
 app.use("/auth", authRoutes);
@@ -149,7 +223,7 @@ const upload = multer({
       cb(null, true);
     }
   },
-  limits: { fileSize: 50 * 1024 * 1024 },
+  limits: { fileSize: maxUploadBytes },
 });
 
 function buildVoterFilter(params, startIndex = 1) {
@@ -274,6 +348,9 @@ app.post(
 
       const pageDir = path.join(storageRoot, sessionId, "pages");
       const pagePaths = await splitPdfToPages(pdfPath, pageDir);
+      const pagePathToNumber = new Map(
+        pagePaths.map((pagePath, idx) => [pagePath, idx + 1]),
+      );
       await query(
         "UPDATE sessions SET total_pages=$1, processed_pages=0, updated_at=now() WHERE id=$2",
         [pagePaths.length, sessionId],
@@ -459,6 +536,50 @@ app.post(
         },
       );
 
+      // Automatic recovery rounds: keep resuming until all pages are done.
+      let remainingPagePaths = await getPendingPagePaths(
+        sessionId,
+        pagePaths,
+        pagePathToNumber,
+      );
+      let roundsDone = 0;
+
+      while (remainingPagePaths.length > 0 && roundsDone < autoResumeRounds) {
+        roundsDone++;
+        console.log(
+          `🔁 Auto-resume round ${roundsDone}/${autoResumeRounds}: ${remainingPagePaths.length} pages remaining`,
+        );
+
+        await sleep(autoResumeDelayMs);
+
+        await processPagesBatch(remainingPagePaths, 0, async (progress) => {
+          if (progress.type === "page_complete" && progress.result) {
+            const pageNumber = pagePathToNumber.get(progress.pagePath);
+            if (pageNumber) {
+              try {
+                await savePageToDatabase(
+                  pageNumber - 1,
+                  progress.result,
+                  progress.pagePath,
+                );
+              } catch (err) {
+                console.error(
+                  `Auto-resume save failed for page ${pageNumber}:`,
+                  err.message,
+                );
+                errorCount++;
+              }
+            }
+          }
+        });
+
+        remainingPagePaths = await getPendingPagePaths(
+          sessionId,
+          pagePaths,
+          pagePathToNumber,
+        );
+      }
+
       // Check final status
       const finalStatus = await query(
         "SELECT processed_pages FROM sessions WHERE id=$1",
@@ -483,8 +604,10 @@ app.post(
           errorPages: errorCount,
           status: "paused",
           message:
-            "Session partially completed. Use POST /sessions/:id/resume to continue.",
+            "Session partially completed after automatic retries. Use POST /sessions/:id/resume to continue.",
           keySwitchCount,
+          automaticRetryRounds: roundsDone,
+          batchResult,
           apiKeyStatus: getApiKeyStatuses(),
         });
       }
@@ -499,6 +622,7 @@ app.post(
         pages: pagePaths.length,
         status: "completed",
         keySwitchCount,
+        automaticRetryRounds: roundsDone,
         apiKeyStatus: getApiKeyStatuses(),
       });
     } catch (err) {
@@ -973,6 +1097,9 @@ app.post("/sessions/:id/resume", authenticate, adminOnly, async (req, res) => {
         return numA - numB;
       })
       .map((f, idx) => ({ path: path.join(pageDir, f), pageNumber: idx + 1 }));
+    const pagePathToNumber = new Map(
+      allPagePaths.map((entry) => [entry.path, entry.pageNumber]),
+    );
 
     // Filter out already processed pages
     const remainingPages = allPagePaths.filter(
@@ -1161,11 +1288,44 @@ app.post("/sessions/:id/resume", authenticate, adminOnly, async (req, res) => {
       },
     );
 
+    // Automatic recovery rounds during resume flow.
+    let remainingPagePaths = await getPendingPagePaths(
+      id,
+      allPagePaths.map((p) => p.path),
+      pagePathToNumber,
+    );
+    let roundsDone = 0;
+
+    while (remainingPagePaths.length > 0 && roundsDone < autoResumeRounds) {
+      roundsDone++;
+      console.log(
+        `🔁 Resume auto-round ${roundsDone}/${autoResumeRounds}: ${remainingPagePaths.length} pages remaining`,
+      );
+
+      await sleep(autoResumeDelayMs);
+
+      await processPagesBatch(remainingPagePaths, 0, async (progress) => {
+        if (progress.type === "page_complete" && progress.result) {
+          try {
+            await savePageToDatabase(progress.pagePath, progress.result);
+          } catch (err) {
+            console.error(
+              "Failed to save page during resume auto-round:",
+              err.message,
+            );
+          }
+        }
+      });
+
+      remainingPagePaths = await getPendingPagePaths(
+        id,
+        allPagePaths.map((p) => p.path),
+        pagePathToNumber,
+      );
+    }
+
     // Check for errors
-    if (
-      batchResult.errors.length > 0 &&
-      batchResult.processedCount < remainingPages.length
-    ) {
+    if (remainingPagePaths.length > 0) {
       await query(
         "UPDATE sessions SET status=$1, updated_at=now() WHERE id=$2",
         ["paused", id],
@@ -1175,9 +1335,10 @@ app.post("/sessions/:id/resume", authenticate, adminOnly, async (req, res) => {
         sessionId: id,
         resumed_from_page: resumedFromPage,
         processed_in_resume: batchResult.processedCount,
-        errors: batchResult.errors.length,
-        total_remaining: remainingPages.length,
+        errors: remainingPagePaths.length,
+        total_remaining: remainingPagePaths.length,
         status: "paused",
+        automaticRetryRounds: roundsDone,
         keySwitchCount,
         apiKeyStatus: getApiKeyStatuses(),
       });
@@ -1194,6 +1355,7 @@ app.post("/sessions/:id/resume", authenticate, adminOnly, async (req, res) => {
       resumed_from_page: resumedFromPage,
       total_pages: pagePaths.length,
       status: "completed",
+      automaticRetryRounds: roundsDone,
       keySwitchCount,
     });
   } catch (err) {
@@ -1908,6 +2070,51 @@ app.get("/system/info", authenticate, (req, res) => {
     apiEngines: isAdmin
       ? getApiKeyStatuses()
       : { totalEngines: getApiKeyStatuses().totalEngines },
+  });
+});
+
+// Unified error handler for CORS/multer/runtime errors
+app.use((err, req, res, next) => {
+  if (!err) return next();
+  if (res.headersSent) return next(err);
+
+  const requestOrigin = req.get("origin");
+  if (requestOrigin && isOriginAllowed(requestOrigin)) {
+    res.setHeader("Access-Control-Allow-Origin", requestOrigin);
+    res.setHeader("Vary", "Origin");
+    res.setHeader("Access-Control-Allow-Credentials", "true");
+  }
+
+  if (err instanceof multer.MulterError) {
+    if (err.code === "LIMIT_FILE_SIZE") {
+      return res.status(413).json({
+        error: "Uploaded file is too large",
+        code: err.code,
+        maxUploadMb,
+      });
+    }
+
+    return res.status(400).json({
+      error: err.message || "Upload error",
+      code: err.code || "MULTER_ERROR",
+    });
+  }
+
+  const msg = err.message || "Unexpected server error";
+
+  if (msg.includes("CORS")) {
+    return res.status(403).json({
+      error: "Origin not allowed",
+      details: msg,
+      requestOrigin: requestOrigin || null,
+      configuredOrigins: allowedOrigins,
+    });
+  }
+
+  console.error("Unhandled server error:", msg);
+  return res.status(500).json({
+    error: "Internal server error",
+    details: msg,
   });
 });
 

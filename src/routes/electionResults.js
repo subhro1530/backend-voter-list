@@ -44,6 +44,12 @@ router.use(authenticate);
 router.use(adminOnly);
 
 const storageRoot = path.join(process.cwd(), "storage", "elections");
+const electionUploadMaxMb = Math.max(
+  Number(
+    process.env.ELECTION_UPLOAD_MAX_MB || process.env.MAX_UPLOAD_MB || 150,
+  ),
+  10,
+);
 const STORAGE_RETENTION_MS = Math.max(
   Number(process.env.STORAGE_RETENTION_MS) || 24 * 60 * 60 * 1000,
   60 * 60 * 1000,
@@ -1079,7 +1085,7 @@ const electionUpload = multer({
       cb(null, true);
     }
   },
-  limits: { fileSize: 50 * 1024 * 1024 },
+  limits: { fileSize: electionUploadMaxMb * 1024 * 1024 },
 });
 
 // ============================================

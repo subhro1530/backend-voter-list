@@ -282,6 +282,22 @@ function getNextAvailableEngine() {
   return null;
 }
 
+function getSoonestRecoveryWaitMs(defaultWaitMs = 15000) {
+  const now = Date.now();
+  const waits = [];
+
+  API_KEYS.forEach((key) => {
+    const status = apiKeyStatus.get(key);
+    if (status?.status === "rate_limited" && status.recoveryTime) {
+      const remaining = new Date(status.recoveryTime).getTime() - now;
+      waits.push(Math.max(remaining, 0));
+    }
+  });
+
+  if (waits.length === 0) return defaultWaitMs;
+  return Math.max(Math.min(...waits), 500);
+}
+
 /**
  * Get the current active API key (first one that's still active)
  */
@@ -386,6 +402,11 @@ async function processWithEngine(engineIndex, filePath, retryCount = 0) {
 
   // Check if key is active
   if (status?.status !== "active") {
+    if (status?.status === "rate_limited") {
+      throw new Error(
+        `ENGINE_RATE_LIMITED: Engine ${engineIndex} temporarily rate limited`,
+      );
+    }
     throw new Error(`ENGINE_EXHAUSTED: Engine ${engineIndex} is exhausted`);
   }
 
@@ -560,7 +581,14 @@ export async function processPagesBatch(
   // 2-3 seconds between requests PER ENGINE is enough with different projects
   const PER_ENGINE_DELAY = parseInt(process.env.GEMINI_PAGE_DELAY_MS) || 2000; // 2 seconds per engine
   const RATE_LIMIT_WAIT = 15000; // 15 seconds when rate limited (shorter since different projects)
-  const MAX_RETRIES_PER_PAGE = 5;
+  const MAX_RETRIES_PER_PAGE = Math.max(
+    parseInt(process.env.GEMINI_MAX_RETRIES_PER_PAGE || "8", 10),
+    3,
+  );
+  const MAX_PAGE_WAIT_MS = Math.max(
+    parseInt(process.env.GEMINI_MAX_PAGE_WAIT_MS || "900000", 10),
+    120000,
+  );
 
   // Get number of available engines
   const totalEngines = engines.size;
@@ -598,8 +626,18 @@ export async function processPagesBatch(
       let success = false;
       let retries = 0;
       let lastError = null;
+      const startedAt = Date.now();
 
-      while (!success && retries < MAX_RETRIES_PER_PAGE) {
+      while (!success) {
+        if (Date.now() - startedAt > MAX_PAGE_WAIT_MS) {
+          lastError =
+            lastError ||
+            `Timed out waiting for available engine after ${Math.ceil(
+              MAX_PAGE_WAIT_MS / 1000,
+            )}s`;
+          break;
+        }
+
         tryRecoverExhaustedKeys();
 
         // Find an available engine (try assigned first, then any available)
@@ -621,11 +659,34 @@ export async function processPagesBatch(
 
         const engine = engines.get(useEngineIndex);
         if (!engine) {
-          retries++;
+          const waitMs = getSoonestRecoveryWaitMs(RATE_LIMIT_WAIT);
+          console.log(
+            `⏳ No engine available, waiting ${Math.ceil(waitMs / 1000)}s...`,
+          );
+          await staggeredDelay(waitMs + 500);
           continue;
         }
 
         const keyStatus = apiKeyStatus.get(engine.apiKey);
+
+        if (keyStatus?.status === "exhausted") {
+          const activeCount = API_KEYS.filter(
+            (key) => apiKeyStatus.get(key)?.status === "active",
+          ).length;
+          const rateLimitedCount = API_KEYS.filter(
+            (key) => apiKeyStatus.get(key)?.status === "rate_limited",
+          ).length;
+
+          if (activeCount === 0 && rateLimitedCount === 0) {
+            lastError =
+              lastError ||
+              "All API keys are exhausted. Add more keys or wait for quota reset.";
+            break;
+          }
+
+          await staggeredDelay(1000);
+          continue;
+        }
 
         // Wait if rate limited
         if (keyStatus?.status === "rate_limited" && keyStatus.recoveryTime) {
@@ -639,8 +700,9 @@ export async function processPagesBatch(
                 useEngineIndex + 1
               } rate limited, waiting ${Math.ceil(waitTime / 1000)}s...`,
             );
-            await staggeredDelay(waitTime + 2000);
+            await staggeredDelay(waitTime + 1000);
             tryRecoverExhaustedKeys();
+            continue;
           }
         }
 
@@ -680,7 +742,6 @@ export async function processPagesBatch(
           };
         } catch (err) {
           lastError = err.message;
-          retries++;
 
           if (err.message.includes("ENGINE_RATE_LIMITED")) {
             console.log(
@@ -695,9 +756,15 @@ export async function processPagesBatch(
             );
             await staggeredDelay(1000);
           } else {
+            retries++;
             console.error(
               `❌ Page ${pageIndex + 1} error: ${err.message.slice(0, 80)}`,
             );
+
+            if (retries >= MAX_RETRIES_PER_PAGE) {
+              break;
+            }
+
             await staggeredDelay(3000);
           }
         }
@@ -705,7 +772,7 @@ export async function processPagesBatch(
 
       // Failed after all retries
       console.log(
-        `❌ Page ${pageIndex + 1} FAILED after ${MAX_RETRIES_PER_PAGE} attempts`,
+        `❌ Page ${pageIndex + 1} FAILED: ${lastError || "unknown reason"}`,
       );
 
       if (onProgress) {
