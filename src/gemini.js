@@ -10,38 +10,97 @@ const mimeByExt = {
   ".pdf": "application/pdf",
 };
 
+const KEY_TIERS = {
+  FREE: "free",
+  PAID: "paid",
+};
+
+const keyMetaByApiKey = new Map();
+
 /**
  * Load API keys from environment variables.
  * Dynamically detects all GEMINI_API_KEY_* variables
  * Also checks legacy GEMINI_API_KEY as a fallback
  */
 function loadApiKeysFromEnv() {
-  const keys = [];
+  const entries = [];
   const seen = new Set();
 
-  // Dynamically find all GEMINI_API_KEY_* environment variables
+  const freeEntries = [];
+  const paidEntries = [];
+  const extraFreeEntries = [];
+
+  // Find keys by explicit tiers so paid keys are only used as fallback.
   for (const [key, value] of Object.entries(process.env)) {
-    if (key.startsWith("GEMINI_API_KEY_") && value && value.trim()) {
-      const trimmedValue = value.trim();
-      if (!seen.has(trimmedValue)) {
-        keys.push(trimmedValue);
-        seen.add(trimmedValue);
-      }
+    if (!value || !value.trim()) continue;
+
+    const trimmedValue = value.trim();
+
+    if (/^GEMINI_API_KEY_PAID_\d+$/i.test(key)) {
+      const order = parseInt(key.split("_").pop(), 10) || 9999;
+      paidEntries.push({
+        envName: key,
+        apiKey: trimmedValue,
+        tier: KEY_TIERS.PAID,
+        order,
+      });
+      continue;
+    }
+
+    if (/^GEMINI_API_KEY_\d+$/i.test(key)) {
+      const order = parseInt(key.split("_").pop(), 10) || 9999;
+      freeEntries.push({
+        envName: key,
+        apiKey: trimmedValue,
+        tier: KEY_TIERS.FREE,
+        order,
+      });
+      continue;
+    }
+
+    if (key === "GEMINI_API_KEY") {
+      extraFreeEntries.push({
+        envName: key,
+        apiKey: trimmedValue,
+        tier: KEY_TIERS.FREE,
+        order: 99999,
+      });
+      continue;
+    }
+
+    if (key.startsWith("GEMINI_API_KEY_")) {
+      extraFreeEntries.push({
+        envName: key,
+        apiKey: trimmedValue,
+        tier: KEY_TIERS.FREE,
+        order: 50000,
+      });
     }
   }
 
-  // Also check legacy single key if no numbered keys found
-  if (keys.length === 0 && process.env.GEMINI_API_KEY) {
-    const legacyKey = process.env.GEMINI_API_KEY.trim();
-    if (!seen.has(legacyKey)) {
-      keys.push(legacyKey);
-    }
+  freeEntries.sort((a, b) => a.order - b.order);
+  paidEntries.sort((a, b) => a.order - b.order);
+
+  const ordered = [...freeEntries, ...extraFreeEntries, ...paidEntries];
+
+  for (const item of ordered) {
+    if (seen.has(item.apiKey)) continue;
+    seen.add(item.apiKey);
+    entries.push(item);
   }
+
+  const freeCount = entries.filter(
+    (entry) => entry.tier === KEY_TIERS.FREE,
+  ).length;
+  const paidCount = entries.filter(
+    (entry) => entry.tier === KEY_TIERS.PAID,
+  ).length;
 
   console.log(
-    `🔑 Loaded ${keys.length} unique Gemini API keys from environment`,
+    `🔑 Loaded ${entries.length} unique Gemini API keys (${freeCount} free + ${paidCount} paid fallback)`,
   );
-  return keys;
+
+  return entries;
 }
 
 // API keys loaded from environment variables
@@ -58,11 +117,19 @@ const engines = new Map();
  * Creates independent engines for parallel processing
  */
 export function initializeKeyStatus() {
-  API_KEYS = loadApiKeysFromEnv();
+  const loadedEntries = loadApiKeysFromEnv();
+  API_KEYS = loadedEntries.map((entry) => entry.apiKey);
   apiKeyStatus.clear();
   engines.clear();
+  keyMetaByApiKey.clear();
 
-  API_KEYS.forEach((key, index) => {
+  loadedEntries.forEach((entry, index) => {
+    const key = entry.apiKey;
+    keyMetaByApiKey.set(key, {
+      envName: entry.envName,
+      tier: entry.tier,
+    });
+
     apiKeyStatus.set(key, {
       status: "active",
       exhaustedAt: null,
@@ -78,6 +145,8 @@ export function initializeKeyStatus() {
     engines.set(index, {
       keyIndex: index,
       apiKey: key,
+      tier: entry.tier,
+      envName: entry.envName,
       busy: false,
       processing: null,
       totalProcessed: 0,
@@ -88,6 +157,74 @@ export function initializeKeyStatus() {
     `🚀 Initialized ${API_KEYS.length} API engines for parallel processing`,
   );
   return API_KEYS.length;
+}
+
+function getKeyTier(apiKey) {
+  return keyMetaByApiKey.get(apiKey)?.tier || KEY_TIERS.FREE;
+}
+
+function getTierBreakdown() {
+  const toCounters = () => ({
+    total: 0,
+    active: 0,
+    rateLimited: 0,
+    exhausted: 0,
+    busy: 0,
+    available: 0,
+  });
+
+  const pools = {
+    free: toCounters(),
+    paid: toCounters(),
+  };
+
+  engines.forEach((engine) => {
+    const tier = engine.tier || KEY_TIERS.FREE;
+    const keyStatus = apiKeyStatus.get(engine.apiKey);
+    const pool = pools[tier] || pools.free;
+
+    pool.total += 1;
+    if (engine.busy) pool.busy += 1;
+
+    if (keyStatus?.status === "active") {
+      pool.active += 1;
+      if (!engine.busy) pool.available += 1;
+    } else if (keyStatus?.status === "rate_limited") {
+      pool.rateLimited += 1;
+    } else if (keyStatus?.status === "exhausted") {
+      pool.exhausted += 1;
+    }
+  });
+
+  return pools;
+}
+
+function getActiveDispatchTier() {
+  const pools = getTierBreakdown();
+  if (pools.free.available > 0 || pools.free.active > 0) return KEY_TIERS.FREE;
+  if (pools.paid.available > 0 || pools.paid.active > 0) return KEY_TIERS.PAID;
+  return KEY_TIERS.FREE;
+}
+
+function getDispatchEngines(availableOnly = false) {
+  tryRecoverExhaustedKeys();
+
+  const activeEngines = [];
+  engines.forEach((engine, index) => {
+    const keyStatus = apiKeyStatus.get(engine.apiKey);
+    if (keyStatus?.status === "active") {
+      if (!availableOnly || !engine.busy) {
+        activeEngines.push({ ...engine, index });
+      }
+    }
+  });
+
+  const freeEngines = activeEngines.filter(
+    (engine) => engine.tier === KEY_TIERS.FREE,
+  );
+  if (freeEngines.length > 0) return freeEngines;
+
+  return activeEngines;
 }
 
 // Initialize all keys as active on startup
@@ -235,17 +372,7 @@ function getActiveKeys() {
  * Get available engines for parallel processing
  */
 export function getAvailableEngines() {
-  tryRecoverExhaustedKeys();
-
-  const available = [];
-  engines.forEach((engine, index) => {
-    const keyStatus = apiKeyStatus.get(engine.apiKey);
-    // Active status means ready to use
-    if (keyStatus?.status === "active" && !engine.busy) {
-      available.push({ ...engine, index });
-    }
-  });
-  return available;
+  return getDispatchEngines(true);
 }
 
 /**
@@ -259,15 +386,7 @@ function staggeredDelay(ms) {
  * Get the next available engine (round-robin with rate limit awareness)
  */
 function getNextAvailableEngine() {
-  tryRecoverExhaustedKeys();
-
-  const available = [];
-  engines.forEach((engine, index) => {
-    const keyStatus = apiKeyStatus.get(engine.apiKey);
-    if (keyStatus?.status === "active" && !engine.busy) {
-      available.push({ ...engine, index });
-    }
-  });
+  const available = getDispatchEngines(true);
 
   // Return the engine with lowest request count (load balancing)
   if (available.length > 0) {
@@ -308,9 +427,20 @@ export function getCurrentApiKey() {
 
   tryRecoverExhaustedKeys();
 
-  const activeKey = API_KEYS.find(
-    (key) => apiKeyStatus.get(key)?.status === "active",
+  const dispatchTier = getActiveDispatchTier();
+  let activeKey = API_KEYS.find(
+    (key) =>
+      apiKeyStatus.get(key)?.status === "active" &&
+      getKeyTier(key) === dispatchTier,
   );
+
+  // If the preferred pool is not available, use any active key.
+  if (!activeKey) {
+    activeKey = API_KEYS.find(
+      (key) => apiKeyStatus.get(key)?.status === "active",
+    );
+  }
+
   return activeKey || null;
 }
 
@@ -341,6 +471,8 @@ export function getApiKeyStatuses() {
       engineId: index + 1,
       keyIndex: index + 1,
       keyPreview: `${key.slice(0, 10)}...${key.slice(-4)}`,
+      tier: engine?.tier || getKeyTier(key),
+      envName: engine?.envName || keyMetaByApiKey.get(key)?.envName || null,
       status: status.status,
       busy: engine?.busy || false,
       exhaustedAt: status.exhaustedAt,
@@ -364,6 +496,8 @@ export function getApiKeyStatuses() {
     (s) => s.status === "exhausted",
   ).length;
   const busyCount = statuses.filter((s) => s.busy).length;
+  const pools = getTierBreakdown();
+  const dispatchTier = getActiveDispatchTier();
 
   return {
     totalEngines: API_KEYS.length,
@@ -372,6 +506,8 @@ export function getApiKeyStatuses() {
     exhaustedEngines: exhaustedCount,
     busyEngines: busyCount,
     availableEngines: activeCount - busyCount,
+    activeDispatchTier: dispatchTier,
+    pools,
     allExhausted: activeCount === 0 && rateLimitedCount === 0, // Only exhausted when no active and no rate-limited
     engines: statuses,
   };
@@ -590,10 +726,12 @@ export async function processPagesBatch(
     120000,
   );
 
-  // Get number of available engines
-  const totalEngines = engines.size;
+  // Select dispatch pool (free first, paid fallback).
+  const dispatchPool = getDispatchEngines(false);
+  const totalEngines = dispatchPool.length || engines.size;
+  const dispatchTier = getActiveDispatchTier();
   console.log(
-    `🚀 Starting PARALLEL processing of ${pagePaths.length} pages with ${totalEngines} engines...`,
+    `🚀 Starting PARALLEL processing of ${pagePaths.length} pages with ${totalEngines} engines (tier: ${dispatchTier})...`,
   );
   console.log(
     `⚡ Using ${
@@ -621,7 +759,10 @@ export async function processPagesBatch(
     // Process this batch in parallel
     const batchPromises = batchPaths.map(async (pagePath, batchIndex) => {
       const pageIndex = batchStart + batchIndex;
-      const engineIndex = batchIndex % totalEngines;
+      const assignedEngine = dispatchPool.length
+        ? dispatchPool[batchIndex % dispatchPool.length]
+        : null;
+      const engineIndex = assignedEngine?.index ?? batchIndex % totalEngines;
 
       let success = false;
       let retries = 0;
@@ -642,18 +783,26 @@ export async function processPagesBatch(
 
         // Find an available engine (try assigned first, then any available)
         let useEngineIndex = engineIndex;
-        const assignedStatus = apiKeyStatus.get(
-          engines.get(useEngineIndex)?.apiKey,
-        );
 
-        // If assigned engine is exhausted, find another
-        if (assignedStatus?.status === "exhausted") {
-          for (let e = 0; e < totalEngines; e++) {
-            const status = apiKeyStatus.get(engines.get(e)?.apiKey);
-            if (status?.status === "active") {
-              useEngineIndex = e;
-              break;
-            }
+        const assignedEngineRef = engines.get(useEngineIndex);
+        const assignedStatus = apiKeyStatus.get(assignedEngineRef?.apiKey);
+
+        // If assigned engine is unavailable, find another engine from dispatch pool.
+        if (
+          !assignedEngineRef ||
+          assignedEngineRef.busy ||
+          assignedStatus?.status !== "active"
+        ) {
+          const availableDispatchEngines = getDispatchEngines(true);
+          if (availableDispatchEngines.length > 0) {
+            availableDispatchEngines.sort((a, b) => {
+              const statusA = apiKeyStatus.get(a.apiKey);
+              const statusB = apiKeyStatus.get(b.apiKey);
+              return (
+                (statusA?.requestCount || 0) - (statusB?.requestCount || 0)
+              );
+            });
+            useEngineIndex = availableDispatchEngines[0].index;
           }
         }
 

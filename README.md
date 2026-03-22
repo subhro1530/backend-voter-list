@@ -94,6 +94,83 @@ Response:
 }
 ```
 
+## Frontend Prompt (Copy-Paste) - Free -> Paid Fallback UX
+
+Use this prompt in your frontend repository with Copilot to build a clean production UX for engine fallback:
+
+```md
+You are working in an existing frontend app for the Voter List OCR backend.
+
+Goal:
+Implement OCR engine observability UI where FREE Gemini keys are used first, and PAID keys are automatically used only when free pool is unavailable.
+
+Do NOT hardcode API keys in frontend.
+Read only from backend APIs.
+
+Backend contracts:
+
+1. GET /api-keys/status (admin auth)
+2. GET /sessions/:id/status (admin auth)
+3. POST /sessions and POST /sessions/:id/resume already run with backend auto-retry logic.
+
+Important status fields from /api-keys/status:
+
+- totalEngines, activeEngines, rateLimitedEngines, exhaustedEngines, busyEngines, availableEngines
+- activeDispatchTier: "free" | "paid"
+- pools.free and pools.paid with: total, active, rateLimited, exhausted, busy, available
+- engines[] with: engineId, tier, status, busy, keyPreview, metrics.totalRequests, metrics.successCount
+
+UI requirements:
+
+1. Add a "Gemini Engine Monitor" card in admin upload/session screen.
+2. Show top badges:
+
+- Current Tier: FREE or PAID
+- Free Pool: available/active/rate_limited/exhausted
+- Paid Pool: available/active/rate_limited/exhausted
+
+3. If activeDispatchTier === "paid", show a prominent warning/info strip:
+
+- "Paid Gemini fallback is active. Free pool is unavailable."
+
+4. Add table columns: Engine, Tier, Status, Busy, Requests, Success.
+5. Add color coding:
+
+- active=green
+- rate_limited=amber
+- exhausted=red
+- busy=true adds spinner/dot pulse
+
+6. Poll /api-keys/status every 5 seconds while a session is processing.
+7. Stop polling when session status becomes completed/failed and keep last snapshot.
+8. For session cards, add line:
+
+- "Dispatch tier used: FREE/PAID" (based on latest status payload)
+
+9. In upload/resume success toasts, include automaticRetryRounds when present.
+
+Implementation constraints:
+
+- Keep existing design system/components intact.
+- Use existing auth token handling.
+- Add strict TypeScript types/interfaces for status payload.
+- Handle API failures gracefully with retry + backoff (2s, 4s, 8s max 30s).
+- Never expose full keys; show backend-provided masked keyPreview only.
+
+Deliverables:
+
+1. Engine monitor component
+2. Hook/service for polling status
+3. Type definitions for status payload
+4. Session UI integration (tier badge + retry rounds)
+5. Minimal tests for mapper/state transitions (if test setup exists)
+```
+
+Recommended frontend mapping for `activeDispatchTier`:
+
+- `free` -> `FREE (Primary)`
+- `paid` -> `PAID (Fallback Active)`
+
 ## Authentication
 
 The API uses JWT-based authentication with two roles:

@@ -1653,11 +1653,18 @@ app.post("/chat", authenticate, async (req, res) => {
       formattedResponse += `- **Active:** ${status.activeEngines}\n`;
       formattedResponse += `- **Exhausted:** ${status.exhaustedEngines}\n`;
       formattedResponse += `- **Busy:** ${status.busyEngines}\n\n`;
-      formattedResponse += "| Engine | Status | Requests | Success |\n";
-      formattedResponse += "|--------|--------|----------|--------|\n";
+      if (status.activeDispatchTier) {
+        formattedResponse += `- **Current Dispatch Tier:** ${status.activeDispatchTier}\n`;
+      }
+      if (status.pools) {
+        formattedResponse += `- **Free Pool:** ${status.pools.free?.available || 0} available / ${status.pools.free?.active || 0} active\n`;
+        formattedResponse += `- **Paid Pool:** ${status.pools.paid?.available || 0} available / ${status.pools.paid?.active || 0} active\n\n`;
+      }
+      formattedResponse += "| Engine | Tier | Status | Requests | Success |\n";
+      formattedResponse += "|--------|------|--------|----------|--------|\n";
       status.engines.forEach((e) => {
         const statusIcon = e.status === "active" ? "✅" : "❌";
-        formattedResponse += `| ${e.engineId} | ${statusIcon} ${e.status} | ${e.metrics.totalRequests} | ${e.metrics.successCount} |\n`;
+        formattedResponse += `| ${e.engineId} | ${e.tier || "free"} | ${statusIcon} ${e.status} | ${e.metrics.totalRequests} | ${e.metrics.successCount} |\n`;
       });
     }
 
