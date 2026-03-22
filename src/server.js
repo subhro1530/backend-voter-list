@@ -149,6 +149,21 @@ async function getPendingPagePaths(sessionId, allPagePaths, pathToPageNumber) {
   );
 }
 
+async function syncSessionProcessedPages(sessionId) {
+  const countRes = await query(
+    "SELECT COUNT(*)::int AS pages_done FROM session_pages WHERE session_id=$1",
+    [sessionId],
+  );
+  const pagesDone = countRes.rows[0]?.pages_done || 0;
+
+  await query(
+    "UPDATE sessions SET processed_pages=$1, updated_at=now() WHERE id=$2",
+    [pagesDone, sessionId],
+  );
+
+  return pagesDone;
+}
+
 // CORS configuration with proper origin validation for production
 const corsConfig = {
   origin: function (origin, callback) {
@@ -361,7 +376,6 @@ app.post(
       );
 
       // Track progress
-      let processedCount = 0;
       let errorCount = 0;
       let keySwitchCount = 0;
       let lastKeyUsed = null;
@@ -369,6 +383,16 @@ app.post(
       // Process pages and save to database immediately on completion
       const savePageToDatabase = async (pageIndex, result, pagePath) => {
         const { text, keyUsed } = result;
+        const pageNumber = pageIndex + 1;
+
+        const existingPage = await query(
+          "SELECT id FROM session_pages WHERE session_id=$1 AND page_number=$2 LIMIT 1",
+          [sessionId, pageNumber],
+        );
+        if (existingPage.rowCount > 0) {
+          await syncSessionProcessedPages(sessionId);
+          return;
+        }
 
         if (lastKeyUsed && keyUsed !== lastKeyUsed) {
           keySwitchCount++;
@@ -413,7 +437,7 @@ app.post(
 
         const pageRes = await query(
           "INSERT INTO session_pages (session_id, page_number, page_path, raw_text, structured_json) VALUES ($1, $2, $3, $4, $5) RETURNING id",
-          [sessionId, pageIndex + 1, pagePath, text, structured],
+          [sessionId, pageNumber, pagePath, text, structured],
         );
 
         const pageId = pageRes.rows[0].id;
@@ -482,7 +506,7 @@ app.post(
             [
               sessionId,
               pageId,
-              pageIndex + 1,
+              pageNumber,
               assembly,
               partNumber,
               section,
@@ -500,16 +524,10 @@ app.post(
           );
         }
 
-        processedCount++;
-        await query(
-          "UPDATE sessions SET processed_pages=$1, updated_at=now() WHERE id=$2",
-          [processedCount, sessionId],
-        );
+        const pagesDone = await syncSessionProcessedPages(sessionId);
 
         console.log(
-          `✅ Page ${pageIndex + 1}/${pagePaths.length} saved to database (${
-            voters.length
-          } voters)`,
+          `✅ Page ${pageNumber}/${pagePaths.length} saved to database (${voters.length} voters). Progress: ${pagesDone}/${pagePaths.length}`,
         );
       };
 
@@ -591,7 +609,7 @@ app.post(
         `📊 Session ${sessionId}: ${finalProcessed}/${pagePaths.length} pages processed, ${errorCount} errors`,
       );
 
-      if (finalProcessed < pagePaths.length || errorCount > 0) {
+      if (finalProcessed < pagePaths.length) {
         await query(
           "UPDATE sessions SET status=$1, updated_at=now() WHERE id=$2",
           ["paused", sessionId],
@@ -1137,12 +1155,24 @@ app.post("/sessions/:id/resume", authenticate, adminOnly, async (req, res) => {
 
     let keySwitchCount = 0;
     let lastKeyUsed = null;
-    let processedCount = session.processed_pages || 0;
 
     // Save page to database immediately when completed
     const savePageToDatabase = async (pagePath, result) => {
       const { text, keyUsed } = result;
       const pageNumber = pageNumberMap.get(pagePath);
+
+      if (!pageNumber) {
+        return;
+      }
+
+      const existingPage = await query(
+        "SELECT id FROM session_pages WHERE session_id=$1 AND page_number=$2 LIMIT 1",
+        [id, pageNumber],
+      );
+      if (existingPage.rowCount > 0) {
+        await syncSessionProcessedPages(id);
+        return;
+      }
 
       if (lastKeyUsed && keyUsed !== lastKeyUsed) {
         keySwitchCount++;
@@ -1263,14 +1293,10 @@ app.post("/sessions/:id/resume", authenticate, adminOnly, async (req, res) => {
         );
       }
 
-      processedCount++;
-      await query(
-        "UPDATE sessions SET processed_pages=$1, updated_at=now() WHERE id=$2",
-        [processedCount, id],
-      );
+      const pagesDone = await syncSessionProcessedPages(id);
 
       console.log(
-        `✅ Resume: Page ${pageNumber} saved to DB (${voters.length} voters)`,
+        `✅ Resume: Page ${pageNumber} saved to DB (${voters.length} voters). Progress: ${pagesDone}/${allPagePaths.length}`,
       );
     };
 
