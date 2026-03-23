@@ -73,6 +73,10 @@ const autoResumeDelayMs = Math.max(
   Number(process.env.AUTO_RESUME_DELAY_MS || 5000),
   1000,
 );
+const bulkProcessingWorkers = Math.max(
+  Number(process.env.BULK_PROCESSING_WORKERS || 4),
+  1,
+);
 const voterPhotoPlaceholderUrl =
   process.env.VOTER_PHOTO_PLACEHOLDER_URL || "placeholder://voter-photo";
 const enableReligionClassification =
@@ -270,6 +274,27 @@ function sessionIdMiddleware(req, _res, next) {
   next();
 }
 
+function isAcceptedBulkFileFieldName(fieldName) {
+  const normalized = String(fieldName || "")
+    .trim()
+    .toLowerCase();
+  return (
+    normalized === "files" ||
+    normalized === "file" ||
+    /^files\[\d*\]$/.test(normalized)
+  );
+}
+
+function getBulkFieldCounts(reqFiles) {
+  const counts = {};
+  for (const item of reqFiles || []) {
+    const key = String(item?.fieldname || "");
+    if (!key) continue;
+    counts[key] = (counts[key] || 0) + 1;
+  }
+  return counts;
+}
+
 const upload = multer({
   storage: multer.diskStorage({
     destination: (req, _file, cb) => {
@@ -296,6 +321,315 @@ const upload = multer({
   },
   limits: { fileSize: maxUploadBytes },
 });
+
+const bulkUpload = multer({
+  storage: multer.diskStorage({
+    destination: async (req, _file, cb) => {
+      try {
+        const requestId = req.bulkRequestId || uuidv4();
+        req.bulkRequestId = requestId;
+        const dest = path.join(storageRoot, "voter-slips", "jobs", requestId);
+        await fs.ensureDir(dest);
+        cb(null, dest);
+      } catch (err) {
+        cb(err);
+      }
+    },
+    filename: (_req, file, cb) => {
+      const safeBaseName = path.basename(file.originalname || "upload.pdf");
+      const uniquePrefix = `${Date.now()}-${Math.round(Math.random() * 1e9)}`;
+      cb(null, `${uniquePrefix}-${safeBaseName}`);
+    },
+  }),
+  fileFilter: (_req, file, cb) => {
+    if (file.mimetype !== "application/pdf") {
+      cb(new Error("Only PDF uploads are allowed"));
+    } else {
+      cb(null, true);
+    }
+  },
+  limits: { fileSize: maxUploadBytes },
+});
+
+async function processUploadedSessionFile({
+  sessionId,
+  pdfPath,
+  originalName,
+  apiKey,
+  dispatchMode,
+}) {
+  const boothNoFromFilename = extractBoothNoFromFilename(originalName);
+
+  try {
+    await query(
+      "INSERT INTO sessions (id, original_filename, status, processed_pages, booth_no) VALUES ($1, $2, $3, $4, $5)",
+      [sessionId, originalName, "processing", 0, boothNoFromFilename || null],
+    );
+
+    if (boothNoFromFilename) {
+      console.log(
+        `🏷️ Booth number inferred from filename: booth_no="${boothNoFromFilename}" (${originalName})`,
+      );
+    }
+
+    const pageDir = path.join(storageRoot, sessionId, "pages");
+    const pagePaths = await splitPdfToPages(pdfPath, pageDir);
+    const pagePathToNumber = new Map(
+      pagePaths.map((pagePath, idx) => [pagePath, idx + 1]),
+    );
+    await query(
+      "UPDATE sessions SET total_pages=$1, processed_pages=0, updated_at=now() WHERE id=$2",
+      [pagePaths.length, sessionId],
+    );
+
+    console.log(
+      `📄 Processing ${pagePaths.length} pages with parallel engines...`,
+    );
+
+    let errorCount = 0;
+    let keySwitchCount = 0;
+    let lastKeyUsed = null;
+
+    const savePageToDatabase = async (pageIndex, result, pagePath) => {
+      const { text, keyUsed } = result;
+      const pageNumber = pageIndex + 1;
+
+      const existingPage = await query(
+        "SELECT id FROM session_pages WHERE session_id=$1 AND page_number=$2 LIMIT 1",
+        [sessionId, pageNumber],
+      );
+      if (existingPage.rowCount > 0) {
+        await syncSessionProcessedPages(sessionId);
+        return;
+      }
+
+      if (lastKeyUsed && keyUsed !== lastKeyUsed) {
+        keySwitchCount++;
+      }
+      lastKeyUsed = keyUsed;
+
+      const structured = parseGeminiStructured(text);
+
+      if (pageIndex === 0) {
+        const firstAssembly = structured.assembly || "";
+        const firstBoothNo = normalizeBoothNo(structured.partNumber || "");
+
+        await query(
+          `UPDATE sessions
+           SET booth_name = COALESCE(NULLIF($1,''), booth_name),
+               assembly_name = COALESCE(NULLIF($2,''), assembly_name),
+               booth_no = COALESCE(NULLIF($3,''), booth_no),
+               updated_at = now()
+           WHERE id = $4`,
+          [structured.boothName || "", firstAssembly, firstBoothNo, sessionId],
+        );
+
+        if (firstBoothNo || structured.boothName) {
+          console.log(
+            `🏫 Session tagged: assembly="${firstAssembly}", booth_no="${firstBoothNo}", booth_name="${structured.boothName || ""}"`,
+          );
+        }
+      }
+
+      const pageRes = await query(
+        "INSERT INTO session_pages (session_id, page_number, page_path, raw_text, structured_json) VALUES ($1, $2, $3, $4, $5) RETURNING id",
+        [sessionId, pageNumber, pagePath, text, structured],
+      );
+
+      const pageId = pageRes.rows[0].id;
+      const assembly = structured.assembly || "";
+      const partNumber = structured.partNumber || "";
+      const section = structured.section || "";
+      const voters = Array.isArray(structured.voters) ? structured.voters : [];
+
+      let religions = [];
+      if (enableReligionClassification && voters.length > 0) {
+        const religionResult = await classifyReligionByNames(voters, apiKey, {
+          dispatchMode,
+        });
+        religions = religionResult.religions;
+      }
+
+      for (let i = 0; i < voters.length; i++) {
+        const voter = voters[i];
+        const religion = religions[i] || "Other";
+        const ageValue = voter.age ? Number.parseInt(voter.age, 10) : null;
+        const age = Number.isNaN(ageValue) ? null : ageValue;
+        const photoUrl = resolvePlaceholderPhotoUrl();
+
+        const cleanVoterId = sanitizeVoterId(voter.voterId);
+
+        await query(
+          "INSERT INTO session_voters (session_id, page_id, page_number, assembly, part_number, section, serial_number, voter_id, name, relation_type, relation_name, house_number, age, gender, religion, photo_url) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)",
+          [
+            sessionId,
+            pageId,
+            pageNumber,
+            assembly,
+            partNumber,
+            section,
+            voter.serialNumber || "",
+            cleanVoterId,
+            voter.name || "",
+            voter.relationType || "",
+            voter.relationName || "",
+            voter.houseNumber || "",
+            age,
+            voter.gender || "",
+            religion,
+            photoUrl,
+          ],
+        );
+      }
+
+      const pagesDone = await syncSessionProcessedPages(sessionId);
+
+      console.log(
+        `✅ Page ${pageNumber}/${pagePaths.length} saved to database (${voters.length} voters). Progress: ${pagesDone}/${pagePaths.length}`,
+      );
+    };
+
+    const batchResult = await processPagesBatch(
+      pagePaths,
+      0,
+      async (progress) => {
+        if (progress.type === "page_complete" && progress.result) {
+          try {
+            await savePageToDatabase(
+              progress.pageIndex,
+              progress.result,
+              progress.pagePath,
+            );
+          } catch (err) {
+            console.error(
+              `Failed to save page ${progress.pageIndex + 1}:`,
+              err.message,
+            );
+            errorCount++;
+          }
+        }
+      },
+      { dispatchMode },
+    );
+
+    let remainingPagePaths = await getPendingPagePaths(
+      sessionId,
+      pagePaths,
+      pagePathToNumber,
+    );
+    let roundsDone = 0;
+
+    while (remainingPagePaths.length > 0 && roundsDone < autoResumeRounds) {
+      roundsDone++;
+      console.log(
+        `🔁 Auto-resume round ${roundsDone}/${autoResumeRounds}: ${remainingPagePaths.length} pages remaining`,
+      );
+
+      await sleep(autoResumeDelayMs);
+
+      await processPagesBatch(
+        remainingPagePaths,
+        0,
+        async (progress) => {
+          if (progress.type === "page_complete" && progress.result) {
+            const pageNumber = pagePathToNumber.get(progress.pagePath);
+            if (pageNumber) {
+              try {
+                await savePageToDatabase(
+                  pageNumber - 1,
+                  progress.result,
+                  progress.pagePath,
+                );
+              } catch (err) {
+                console.error(
+                  `Auto-resume save failed for page ${pageNumber}:`,
+                  err.message,
+                );
+                errorCount++;
+              }
+            }
+          }
+        },
+        { dispatchMode },
+      );
+
+      remainingPagePaths = await getPendingPagePaths(
+        sessionId,
+        pagePaths,
+        pagePathToNumber,
+      );
+    }
+
+    const finalStatus = await query(
+      "SELECT processed_pages FROM sessions WHERE id=$1",
+      [sessionId],
+    );
+    const finalProcessed = finalStatus.rows[0]?.processed_pages || 0;
+
+    console.log(
+      `📊 Session ${sessionId}: ${finalProcessed}/${pagePaths.length} pages processed, ${errorCount} errors`,
+    );
+
+    if (finalProcessed < pagePaths.length) {
+      await query(
+        "UPDATE sessions SET status=$1, updated_at=now() WHERE id=$2",
+        ["paused", sessionId],
+      );
+
+      return {
+        statusCode: 207,
+        payload: {
+          sessionId,
+          pages: pagePaths.length,
+          processedPages: finalProcessed,
+          errorPages: errorCount,
+          status: "paused",
+          dispatchMode: dispatchMode || getGlobalDispatchMode(),
+          message:
+            "Session partially completed after automatic retries. Use POST /sessions/:id/resume to continue.",
+          keySwitchCount,
+          automaticRetryRounds: roundsDone,
+          batchResult,
+          apiKeyStatus: getApiKeyStatuses(),
+        },
+      };
+    }
+
+    await query("UPDATE sessions SET status=$1, updated_at=now() WHERE id=$2", [
+      "completed",
+      sessionId,
+    ]);
+
+    return {
+      statusCode: 201,
+      payload: {
+        sessionId,
+        pages: pagePaths.length,
+        status: "completed",
+        dispatchMode: dispatchMode || getGlobalDispatchMode(),
+        keySwitchCount,
+        automaticRetryRounds: roundsDone,
+        apiKeyStatus: getApiKeyStatuses(),
+      },
+    };
+  } catch (err) {
+    await query("UPDATE sessions SET status=$1, updated_at=now() WHERE id=$2", [
+      "failed",
+      sessionId,
+    ]).catch(() => {});
+    console.error("Session processing failed:", err.message);
+    return {
+      statusCode: 500,
+      payload: {
+        sessionId,
+        status: "failed",
+        error: "Processing failed",
+        details: err.message,
+        apiKeyStatus: getApiKeyStatuses(),
+      },
+    };
+  }
+}
 
 function buildVoterFilter(params, startIndex = 1) {
   const where = [];
@@ -411,7 +745,6 @@ app.post(
     const sessionId = req.sessionId;
     const pdfPath = req.file?.path;
     const originalName = req.file?.originalname || "upload.pdf";
-    const boothNoFromFilename = extractBoothNoFromFilename(originalName);
     const apiKey = req.body?.apiKey || req.body?.geminiApiKey;
     const requestedDispatchMode = req.body?.dispatchMode;
     const dispatchMode = requestedDispatchMode
@@ -428,279 +761,160 @@ app.post(
       return res.status(400).json({ error: "PDF file is required" });
     }
 
-    // API key is now optional - will use fallback keys
-    try {
-      await query(
-        "INSERT INTO sessions (id, original_filename, status, processed_pages, booth_no) VALUES ($1, $2, $3, $4, $5)",
-        [sessionId, originalName, "processing", 0, boothNoFromFilename || null],
-      );
+    const result = await processUploadedSessionFile({
+      sessionId,
+      pdfPath,
+      originalName,
+      apiKey,
+      dispatchMode,
+    });
 
-      if (boothNoFromFilename) {
-        console.log(
-          `🏷️ Booth number inferred from filename: booth_no="${boothNoFromFilename}" (${originalName})`,
-        );
-      }
+    res.status(result.statusCode).json(result.payload);
+  },
+);
 
-      const pageDir = path.join(storageRoot, sessionId, "pages");
-      const pagePaths = await splitPdfToPages(pdfPath, pageDir);
-      const pagePathToNumber = new Map(
-        pagePaths.map((pagePath, idx) => [pagePath, idx + 1]),
-      );
-      await query(
-        "UPDATE sessions SET total_pages=$1, processed_pages=0, updated_at=now() WHERE id=$2",
-        [pagePaths.length, sessionId],
-      );
+// Bulk session upload - Admin only
+app.post(
+  "/sessions/bulk",
+  authenticate,
+  adminOnly,
+  (req, _res, next) => {
+    req.bulkRequestId = uuidv4();
+    next();
+  },
+  bulkUpload.any(),
+  async (req, res) => {
+    const incomingFiles = Array.isArray(req.files) ? req.files : [];
+    const files = incomingFiles.filter((file) =>
+      isAcceptedBulkFileFieldName(file?.fieldname),
+    );
+    const fieldCounts = getBulkFieldCounts(incomingFiles);
+    const apiKey = req.body?.apiKey || req.body?.geminiApiKey;
+    const requestedDispatchMode = req.body?.dispatchMode;
+    const dispatchMode = requestedDispatchMode
+      ? parseDispatchMode(requestedDispatchMode)
+      : null;
+    const workerCount = bulkProcessingWorkers;
+    const expectedFileCountRaw = req.body?.expectedFileCount;
+    const expectedFileCount = Number.isFinite(Number(expectedFileCountRaw))
+      ? Number(expectedFileCountRaw)
+      : null;
 
-      console.log(
-        `📄 Processing ${pagePaths.length} pages with parallel engines...`,
-      );
-
-      // Track progress
-      let errorCount = 0;
-      let keySwitchCount = 0;
-      let lastKeyUsed = null;
-
-      // Process pages and save to database immediately on completion
-      const savePageToDatabase = async (pageIndex, result, pagePath) => {
-        const { text, keyUsed } = result;
-        const pageNumber = pageIndex + 1;
-
-        const existingPage = await query(
-          "SELECT id FROM session_pages WHERE session_id=$1 AND page_number=$2 LIMIT 1",
-          [sessionId, pageNumber],
-        );
-        if (existingPage.rowCount > 0) {
-          await syncSessionProcessedPages(sessionId);
-          return;
-        }
-
-        if (lastKeyUsed && keyUsed !== lastKeyUsed) {
-          keySwitchCount++;
-        }
-        lastKeyUsed = keyUsed;
-
-        const structured = parseGeminiStructured(text);
-
-        // First page carries authoritative booth + assembly metadata.
-        if (pageIndex === 0) {
-          const firstAssembly = structured.assembly || "";
-          const firstBoothNo = normalizeBoothNo(structured.partNumber || "");
-
-          await query(
-            `UPDATE sessions
-             SET booth_name = COALESCE(NULLIF($1,''), booth_name),
-                 assembly_name = COALESCE(NULLIF($2,''), assembly_name),
-                 booth_no = COALESCE(NULLIF($3,''), booth_no),
-                 updated_at = now()
-             WHERE id = $4`,
-            [
-              structured.boothName || "",
-              firstAssembly,
-              firstBoothNo,
-              sessionId,
-            ],
-          );
-
-          if (firstBoothNo || structured.boothName) {
-            console.log(
-              `🏫 Session tagged: assembly="${firstAssembly}", booth_no="${firstBoothNo}", booth_name="${structured.boothName || ""}"`,
-            );
-          }
-        }
-
-        const pageRes = await query(
-          "INSERT INTO session_pages (session_id, page_number, page_path, raw_text, structured_json) VALUES ($1, $2, $3, $4, $5) RETURNING id",
-          [sessionId, pageNumber, pagePath, text, structured],
-        );
-
-        const pageId = pageRes.rows[0].id;
-        const assembly = structured.assembly || "";
-        const partNumber = structured.partNumber || "";
-        const section = structured.section || "";
-        const voters = Array.isArray(structured.voters)
-          ? structured.voters
-          : [];
-
-        // Classify religion for all voters on this page
-        let religions = [];
-        if (enableReligionClassification && voters.length > 0) {
-          const religionResult = await classifyReligionByNames(voters, apiKey, {
-            dispatchMode,
-          });
-          religions = religionResult.religions;
-        }
-
-        for (let i = 0; i < voters.length; i++) {
-          const voter = voters[i];
-          const religion = religions[i] || "Other";
-          const ageValue = voter.age ? Number.parseInt(voter.age, 10) : null;
-          const age = Number.isNaN(ageValue) ? null : ageValue;
-          const photoUrl = resolvePlaceholderPhotoUrl();
-
-          const cleanVoterId = sanitizeVoterId(voter.voterId);
-
-          await query(
-            "INSERT INTO session_voters (session_id, page_id, page_number, assembly, part_number, section, serial_number, voter_id, name, relation_type, relation_name, house_number, age, gender, religion, photo_url) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)",
-            [
-              sessionId,
-              pageId,
-              pageNumber,
-              assembly,
-              partNumber,
-              section,
-              voter.serialNumber || "",
-              cleanVoterId,
-              voter.name || "",
-              voter.relationType || "",
-              voter.relationName || "",
-              voter.houseNumber || "",
-              age,
-              voter.gender || "",
-              religion,
-              photoUrl,
-            ],
-          );
-        }
-
-        const pagesDone = await syncSessionProcessedPages(sessionId);
-
-        console.log(
-          `✅ Page ${pageNumber}/${pagePaths.length} saved to database (${voters.length} voters). Progress: ${pagesDone}/${pagePaths.length}`,
-        );
-      };
-
-      // Use sequential batch processing with immediate database saves
-      const batchResult = await processPagesBatch(
-        pagePaths,
-        0,
-        async (progress) => {
-          if (progress.type === "page_complete" && progress.result) {
-            try {
-              await savePageToDatabase(
-                progress.pageIndex,
-                progress.result,
-                progress.pagePath,
-              );
-            } catch (err) {
-              console.error(
-                `Failed to save page ${progress.pageIndex + 1}:`,
-                err.message,
-              );
-              errorCount++;
-            }
-          }
-        },
-        { dispatchMode },
-      );
-
-      // Automatic recovery rounds: keep resuming until all pages are done.
-      let remainingPagePaths = await getPendingPagePaths(
-        sessionId,
-        pagePaths,
-        pagePathToNumber,
-      );
-      let roundsDone = 0;
-
-      while (remainingPagePaths.length > 0 && roundsDone < autoResumeRounds) {
-        roundsDone++;
-        console.log(
-          `🔁 Auto-resume round ${roundsDone}/${autoResumeRounds}: ${remainingPagePaths.length} pages remaining`,
-        );
-
-        await sleep(autoResumeDelayMs);
-
-        await processPagesBatch(
-          remainingPagePaths,
-          0,
-          async (progress) => {
-            if (progress.type === "page_complete" && progress.result) {
-              const pageNumber = pagePathToNumber.get(progress.pagePath);
-              if (pageNumber) {
-                try {
-                  await savePageToDatabase(
-                    pageNumber - 1,
-                    progress.result,
-                    progress.pagePath,
-                  );
-                } catch (err) {
-                  console.error(
-                    `Auto-resume save failed for page ${pageNumber}:`,
-                    err.message,
-                  );
-                  errorCount++;
-                }
-              }
-            }
-          },
-          { dispatchMode },
-        );
-
-        remainingPagePaths = await getPendingPagePaths(
-          sessionId,
-          pagePaths,
-          pagePathToNumber,
-        );
-      }
-
-      // Check final status
-      const finalStatus = await query(
-        "SELECT processed_pages FROM sessions WHERE id=$1",
-        [sessionId],
-      );
-      const finalProcessed = finalStatus.rows[0]?.processed_pages || 0;
-
-      console.log(
-        `📊 Session ${sessionId}: ${finalProcessed}/${pagePaths.length} pages processed, ${errorCount} errors`,
-      );
-
-      if (finalProcessed < pagePaths.length) {
-        await query(
-          "UPDATE sessions SET status=$1, updated_at=now() WHERE id=$2",
-          ["paused", sessionId],
-        );
-
-        return res.status(207).json({
-          sessionId,
-          pages: pagePaths.length,
-          processedPages: finalProcessed,
-          errorPages: errorCount,
-          status: "paused",
-          dispatchMode: dispatchMode || getGlobalDispatchMode(),
-          message:
-            "Session partially completed after automatic retries. Use POST /sessions/:id/resume to continue.",
-          keySwitchCount,
-          automaticRetryRounds: roundsDone,
-          batchResult,
-          apiKeyStatus: getApiKeyStatuses(),
-        });
-      }
-
-      await query(
-        "UPDATE sessions SET status=$1, updated_at=now() WHERE id=$2",
-        ["completed", sessionId],
-      );
-
-      res.status(201).json({
-        sessionId,
-        pages: pagePaths.length,
-        status: "completed",
-        dispatchMode: dispatchMode || getGlobalDispatchMode(),
-        keySwitchCount,
-        automaticRetryRounds: roundsDone,
-        apiKeyStatus: getApiKeyStatuses(),
-      });
-    } catch (err) {
-      await query(
-        "UPDATE sessions SET status=$1, updated_at=now() WHERE id=$2",
-        ["failed", sessionId],
-      ).catch(() => {});
-      console.error("Session processing failed:", err.message);
-      res.status(500).json({
-        error: "Processing failed",
-        details: err.message,
-        apiKeyStatus: getApiKeyStatuses(),
+    if (requestedDispatchMode && !dispatchMode) {
+      return res.status(400).json({
+        error: `Invalid dispatchMode. Allowed: ${getAllowedDispatchModes().join(", ")}`,
       });
     }
+
+    if (files.length === 0) {
+      return res.status(400).json({
+        error:
+          "At least one PDF is required under multipart field names like 'files', 'files[]', or 'files[0]'.",
+        receivedFields: fieldCounts,
+      });
+    }
+
+    if (
+      expectedFileCount !== null &&
+      expectedFileCount > 0 &&
+      files.length !== expectedFileCount
+    ) {
+      return res.status(400).json({
+        error:
+          "Uploaded file count mismatch. Retry upload with the same field name for all selected files.",
+        expectedFileCount,
+        receivedFileCount: files.length,
+        receivedFields: fieldCounts,
+      });
+    }
+
+    const tasks = files.map((file, index) => ({ file, index }));
+    const taskResults = [];
+    let cursor = 0;
+
+    async function worker() {
+      while (cursor < tasks.length) {
+        const nextIndex = cursor;
+        cursor += 1;
+
+        const task = tasks[nextIndex];
+        if (!task) break;
+
+        const sessionId = uuidv4();
+        const safeOriginalName =
+          path.basename(task.file.originalname || "upload.pdf") || "upload.pdf";
+        const pdfPath = task.file.path;
+
+        try {
+          const result = await processUploadedSessionFile({
+            sessionId,
+            pdfPath,
+            originalName: safeOriginalName,
+            apiKey,
+            dispatchMode,
+          });
+
+          taskResults[task.index] = {
+            uploadIndex: task.index,
+            fileName: safeOriginalName,
+            ...result.payload,
+            httpStatus: result.statusCode,
+          };
+
+          await fs.remove(pdfPath).catch(() => {});
+        } catch (err) {
+          console.error(
+            `Bulk upload failed for file ${safeOriginalName}:`,
+            err.message,
+          );
+          taskResults[task.index] = {
+            uploadIndex: task.index,
+            fileName: safeOriginalName,
+            status: "failed",
+            error: "Bulk file handling failed",
+            details: err.message,
+            httpStatus: 500,
+          };
+
+          await fs.remove(pdfPath).catch(() => {});
+        }
+      }
+    }
+
+    await Promise.all(Array.from({ length: workerCount }, () => worker()));
+
+    const completed = taskResults.filter(
+      (r) => r?.status === "completed",
+    ).length;
+    const paused = taskResults.filter((r) => r?.status === "paused").length;
+    const failed = taskResults.filter((r) => r?.status === "failed").length;
+
+    const allCompleted = completed === taskResults.length;
+    const responseCode = allCompleted ? 201 : 207;
+    const requestUploadDir = path.join(
+      storageRoot,
+      "voter-slips",
+      "jobs",
+      req.bulkRequestId || "",
+    );
+
+    await fs.remove(requestUploadDir).catch(() => {});
+
+    return res.status(responseCode).json({
+      uploadBatchId: req.bulkRequestId,
+      totalFiles: files.length,
+      acceptedFileCount: files.length,
+      receivedFields: fieldCounts,
+      dispatchMode: dispatchMode || getGlobalDispatchMode(),
+      workerCount,
+      summary: {
+        completed,
+        paused,
+        failed,
+      },
+      sessions: taskResults,
+      apiKeyStatus: getApiKeyStatuses(),
+    });
   },
 );
 
