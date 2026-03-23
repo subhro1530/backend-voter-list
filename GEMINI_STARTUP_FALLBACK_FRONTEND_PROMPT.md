@@ -1,125 +1,107 @@
-# Gemini Startup Check + Smart Fallback Frontend Prompt
+# Gemini Startup Fallback + Lightspeed OCR Frontend Prompt
 
 Use this prompt directly in your frontend repository.
 
 ---
 
 You are working in an existing frontend app for the voter-list backend.
-Implement a next-gen Gemini engine monitor that reflects startup key assessment and free->paid fallback clearly.
+Implement a speed-first OCR control plane that prioritizes throughput and zero-waste API behavior.
 
-## Goal
+## Core Objective
 
-Minimize user-visible OCR delays by making dispatch behavior transparent:
+Deliver the fastest possible end-to-end OCR while reducing retries and unnecessary API usage.
 
-1. Free keys are primary.
-2. Exhausted/rate-limited keys are skipped based on backend startup assessment.
-3. If free pool is unavailable, backend auto-switches to paid pool.
-4. UI must explain this instantly during upload/session processing.
+1. Remove all image/photo extraction logic from live OCR flow.
+2. Use placeholder image rendering only in UI.
+3. Let admin force dispatch mode (`paid-only`, `free-only`, `auto`) instantly.
+4. Keep polling lean and adaptive to avoid frontend overhead.
 
-## Backend Behavior You Must Reflect
+## Backend Facts You Must Respect
 
-Backend now does:
-
-1. Startup key assessment script before server start (`scripts/checkGeminiKeysOnStartup.js`).
-2. Persists key state to DB and skips unusable keys quickly.
-3. Uses adaptive cooldown (not fixed 15s) for temporary rate limits.
-4. Uses dispatch tier policy:
-   - Prefer `free`
-   - Fall back to `paid` when free not available
+1. Backend runs startup Gemini key assessment before server boot.
+2. Backend persists key state and skips unhealthy keys.
+3. Backend supports dispatch modes:
+   - `auto` (free first, paid fallback)
+   - `free-only`
+   - `paid-only`
+4. OCR flow is photo-free now (no Cloudinary extraction/upload in hot path).
+5. Voter photo field should be treated as placeholder metadata.
 
 ## APIs to Use
 
 1. `GET /api-keys/status` (admin)
 2. `GET /api-keys/dispatch-status` (authenticated)
-3. `GET /sessions/:id/status` (admin)
-4. `GET /api-keys/dispatch-mode` (authenticated)
-5. `PATCH /api-keys/dispatch-mode` (admin, body: `{ "mode": "auto|free-only|paid-only" }`)
-6. `POST /sessions` with optional `dispatchMode`
-7. `POST /sessions/:id/resume` with optional `dispatchMode`
+3. `GET /api-keys/dispatch-mode` (authenticated)
+4. `PATCH /api-keys/dispatch-mode` (admin, body: `{ "mode": "auto|free-only|paid-only" }`)
+5. `POST /sessions` (optional `dispatchMode`)
+6. `POST /sessions/:id/resume` (optional `dispatchMode`)
+7. `GET /sessions/:id/status` (admin)
 
-## Required UI
+## Required UX Changes
 
-### A) Dispatch Banner
+### 1) Turbo Dispatch Control
 
-Show a top banner in OCR/session pages:
+Add a segmented control at upload/resume level:
 
-1. If `activeDispatchTier === "free"`: `Using FREE Gemini pool`
-2. If `activeDispatchTier === "paid"`: `FREE pool unavailable. Using PAID fallback pool`
+1. `Paid Only (Turbo)`
+2. `Auto`
+3. `Free Only`
 
-Also show current configured dispatch mode:
+Rules:
 
-1. `auto`
-2. `free-only`
-3. `paid-only`
+1. Default to backend current mode from `GET /api-keys/dispatch-mode`.
+2. On selection change, call `PATCH /api-keys/dispatch-mode`.
+3. Include selected mode in every `POST /sessions` and `POST /sessions/:id/resume` request payload.
+4. Show toast for each change:
+   - `Turbo mode enabled: paid-only`
+   - `Auto mode enabled`
+   - `Free-only mode enabled`
 
-### A1) Dispatch Mode Toggle (Required)
+### 2) No-Image OCR Policy in UI
 
-Add a segmented toggle in admin upload/session controls:
+Remove/disable UI features that suggest live photo extraction during OCR.
 
-1. `Auto (Free -> Paid Fallback)`
-2. `Free Only`
-3. `Paid Only (Fastest)`
+1. Do not show progress for photo extraction/upload.
+2. Do not trigger any client flow that uploads voter photos during session processing.
+3. Render voter photo with static placeholder strategy:
+   - If `photo_url` starts with `placeholder://`, render local placeholder asset.
+   - If `photo_url` is empty/null, render same placeholder.
 
-Behavior:
+### 3) Status Panel (High Signal, Low Noise)
 
-1. Read current mode from `GET /api-keys/dispatch-mode`
-2. On toggle change call `PATCH /api-keys/dispatch-mode`
-3. Refresh `/api-keys/status` snapshot immediately
-4. Show toast:
+Display only the metrics that matter for speed decisions:
 
-- `Dispatch mode set to paid-only`
-- `Dispatch mode set to free-only`
-- `Dispatch mode set to auto`
+1. `configuredDispatchMode`
+2. `activeDispatchTier`
+3. Free pool `available/rateLimited/exhausted`
+4. Paid pool `available/rateLimited/exhausted`
+5. `allExhausted`
 
-When starting/resuming a session, include selected mode in payload:
+Do not overload UI with verbose per-engine details by default.
 
-1. `POST /sessions` -> include `dispatchMode`
-2. `POST /sessions/:id/resume` -> include `dispatchMode`
-
-### B) Startup Assessment Snapshot
-
-After page load, fetch `GET /api-keys/dispatch-status` immediately and render:
-
-1. Active dispatch tier
-2. Free pool counters (available/active/rateLimited/exhausted)
-3. Paid pool counters (available/active/rateLimited/exhausted)
-
-### C) Processing-Aware Polling
+### 4) Smart Polling
 
 While session is `processing`:
 
-1. Poll `/api-keys/status` every 5s (admin) or `/api-keys/dispatch-status` every 5s (non-admin)
-2. Poll `/sessions/:id/status` every 3s
-3. Stop polling once session is `completed|failed|paused`
+1. Poll `GET /sessions/:id/status` every 2s.
+2. Poll `GET /api-keys/dispatch-status` every 4s.
+3. Pause both polls when tab is hidden.
+4. Resume immediately on tab focus.
+5. Stop all polls once status becomes `completed|failed|paused`.
 
-### D) Explain Delays Properly
+### 5) Actionable Delay Messages
 
-When many keys are rate-limited:
+1. If `dispatchMode=free-only` and free pool unavailable, show CTA: `Switch to Paid Only (Turbo)`.
+2. If `dispatchMode=paid-only` and paid pool cooling down, show: `Paid keys cooling down, retrying automatically.`
+3. Never show fixed retry text like `retry after 15s`.
 
-1. Show info text: `Backend is waiting for key cooldown windows; retries are adaptive.`
-2. Do NOT show misleading fixed timer like `retry after 15s`
-
-If mode is `free-only` and pool is heavily limited, show CTA:
-
-1. `Switch to paid-only for faster OCR`
-
-### E) Engine Table (Admin)
-
-Columns:
-
-1. Engine
-2. Tier
-3. Status (`active|rate_limited|exhausted`)
-4. Busy
-5. Requests
-6. Success
-7. Recovery time
-
-## Suggested Frontend Types
+## Suggested Types
 
 ```ts
+type DispatchMode = "auto" | "free-only" | "paid-only";
+
 type DispatchStatus = {
-  configuredDispatchMode: "auto" | "free-only" | "paid-only";
+  configuredDispatchMode: DispatchMode;
   activeDispatchTier: "free" | "paid";
   paidFallbackActive: boolean;
   totalEngines: number;
@@ -146,18 +128,11 @@ type PoolCounters = {
 };
 ```
 
-## Error and Edge Cases
-
-1. If status API fails, keep last snapshot and show `Engine status temporarily unavailable`.
-2. If `allExhausted === true`, show CTA: `Wait for quota recovery or add more paid keys`.
-3. If dispatch tier flips free->paid during processing, show toast `Switched to paid fallback for continuity`.
-4. If mode is `paid-only` but paid pool has no available keys, show `Paid pool currently cooling down`.
-
 ## Acceptance Criteria
 
-1. User can clearly see why OCR is waiting or switching pools.
-2. UI reflects startup key assessment result at app load.
-3. UI reflects live tier transitions during processing.
-4. No hardcoded `15s` messaging anywhere.
-5. Admin can inspect per-engine recovery states in table.
-6. Admin can force `paid-only` mode from UI and start/resume sessions with that mode.
+1. Admin can force `paid-only` in one click and upload/resume with that mode.
+2. UI no longer includes photo extraction/upload behavior in OCR workflow.
+3. Placeholder image is consistently used for voter cards/lists.
+4. Polling is efficient and auto-pauses when tab is hidden.
+5. Session processing UX explains pool/mode transitions clearly.
+6. No hardcoded fixed-delay messaging anywhere.

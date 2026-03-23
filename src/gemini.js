@@ -1057,17 +1057,15 @@ async function processWithEngine(engineIndex, filePath, retryCount = 0) {
       "relationName": "relation name",
       "houseNumber": "house number",
       "age": "age",
-      "gender": "male|female",
-      "hasPhoto": true or false (whether this voter entry has a photograph/image visible)
+      "gender": "male|female"
     }
   ]
 }
 
 IMPORTANT:
-1. For each voter, check if there is a passport-size photograph/image next to their details. Set "hasPhoto" to true if yes, false if no photo is visible.
-2. The "boothName" is typically the name of the building/location used as the polling booth, often found near the top of the first page after "Part No." section.
-3. "voterId" MUST be the EPIC number (e.g. XFB2313997, ABC1234567). It is printed below or near the voter's photo. Do NOT use location codes like "WB/01/003/000070" — those are NOT voter IDs. If the EPIC number is not clearly readable, return an empty string "".
-4. No prose - ONLY valid JSON.`,
+1. The "boothName" is typically the name of the building/location used as the polling booth, often found near the top of the first page after "Part No." section.
+2. "voterId" MUST be the EPIC number (e.g. XFB2313997, ABC1234567). It is printed below or near the voter's photo. Do NOT use location codes like "WB/01/003/000070" — those are NOT voter IDs. If the EPIC number is not clearly readable, return an empty string "".
+3. No prose - ONLY valid JSON.`,
             },
             {
               inline_data: {
@@ -1679,8 +1677,7 @@ export async function callGeminiWithFile(filePath, apiKeyFromRequest) {
       "relationName": "relation name",
       "houseNumber": "house number",
       "age": "age",
-      "gender": "male|female",
-      "hasPhoto": true or false
+      "gender": "male|female"
     }
   ]
 }

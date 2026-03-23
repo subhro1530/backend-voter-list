@@ -35,11 +35,6 @@ import electionResultRoutes from "./routes/electionResults.js";
 import affidavitRoutes from "./routes/affidavit.js";
 import nominationRoutes from "./routes/nomination.js";
 import {
-  isCloudinaryConfigured,
-  uploadBase64Image,
-  extractVoterPhotosFromPage,
-} from "./cloudinary.js";
-import {
   normalizeBoothNo,
   extractBoothNoFromFilename,
   extractAssemblyNameFromFilename,
@@ -78,6 +73,12 @@ const autoResumeDelayMs = Math.max(
   Number(process.env.AUTO_RESUME_DELAY_MS || 5000),
   1000,
 );
+const voterPhotoPlaceholderUrl =
+  process.env.VOTER_PHOTO_PLACEHOLDER_URL || "placeholder://voter-photo";
+const enableReligionClassification =
+  String(process.env.OCR_ENABLE_RELIGION_CLASSIFICATION || "false")
+    .trim()
+    .toLowerCase() === "true";
 
 // Parse CORS origins from environment variable
 const allowedOrigins = process.env.CORS_ORIGINS
@@ -90,14 +91,57 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+const dispatchModeAliasMap = new Map([
+  ["auto", "auto"],
+  ["balanced", "auto"],
+  ["balanced auto", "auto"],
+  ["free", "free-only"],
+  ["free only", "free-only"],
+  ["cost save", "free-only"],
+  ["cost-save", "free-only"],
+  ["paid", "paid-only"],
+  ["paid only", "paid-only"],
+  ["turbo", "paid-only"],
+  ["turbo mode", "paid-only"],
+]);
+
 function parseDispatchMode(input) {
-  const normalized = String(input || "")
+  const normalizedRaw = String(input || "")
     .trim()
-    .toLowerCase();
-  if (!normalized) return null;
+    .toLowerCase()
+    .replace(/[\u2012\u2013\u2014\u2015]/g, "-");
+
+  if (!normalizedRaw) return null;
+
   const allowed = getAllowedDispatchModes();
-  if (!allowed.includes(normalized)) return null;
-  return normalized;
+  if (allowed.includes(normalizedRaw)) return normalizedRaw;
+
+  const extracted = normalizedRaw.match(
+    /\b(auto|free[\s-]*only|paid[\s-]*only)\b/,
+  );
+  if (extracted?.[1]) {
+    const canonical = extracted[1].replace(/\s+/g, "-");
+    if (allowed.includes(canonical)) return canonical;
+  }
+
+  const compact = normalizedRaw
+    .replace(/[()]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  const aliasResolved = dispatchModeAliasMap.get(compact);
+  if (aliasResolved && allowed.includes(aliasResolved)) {
+    return aliasResolved;
+  }
+
+  const dashCompact = compact.replace(/\s+/g, "-");
+  if (allowed.includes(dashCompact)) return dashCompact;
+
+  return null;
+}
+
+function resolvePlaceholderPhotoUrl() {
+  return voterPhotoPlaceholderUrl;
 }
 
 function extractOriginHost(originValue) {
@@ -479,28 +523,11 @@ app.post(
 
         // Classify religion for all voters on this page
         let religions = [];
-        if (voters.length > 0) {
+        if (enableReligionClassification && voters.length > 0) {
           const religionResult = await classifyReligionByNames(voters, apiKey, {
             dispatchMode,
           });
           religions = religionResult.religions;
-        }
-
-        // Extract voter photos from the page PDF via Cloudinary
-        let photoMap = new Map();
-        if (isCloudinaryConfigured() && voters.some((v) => v.hasPhoto)) {
-          try {
-            photoMap = await extractVoterPhotosFromPage(
-              pagePath,
-              voters,
-              sessionId,
-              pageIndex + 1,
-            );
-          } catch (photoErr) {
-            console.warn(
-              `⚠️ Photo extraction failed for page ${pageIndex + 1}: ${photoErr.message}`,
-            );
-          }
         }
 
         for (let i = 0; i < voters.length; i++) {
@@ -508,27 +535,7 @@ app.post(
           const religion = religions[i] || "Other";
           const ageValue = voter.age ? Number.parseInt(voter.age, 10) : null;
           const age = Number.isNaN(ageValue) ? null : ageValue;
-
-          // Get photo URL from extraction (or fallback to base64 upload if somehow available)
-          let photoUrl = photoMap.get(i) || null;
-          if (
-            !photoUrl &&
-            voter.hasPhoto &&
-            voter.photoBase64 &&
-            isCloudinaryConfigured()
-          ) {
-            try {
-              const cloudResult = await uploadBase64Image(voter.photoBase64, {
-                folder: `voter-list/${sessionId}`,
-                publicId: `voter_${voter.voterId || voter.serialNumber || i}`,
-              });
-              photoUrl = cloudResult?.secure_url || null;
-            } catch (photoErr) {
-              console.warn(
-                `⚠️ Photo upload failed for voter ${voter.name}: ${photoErr.message}`,
-              );
-            }
-          }
+          const photoUrl = resolvePlaceholderPhotoUrl();
 
           const cleanVoterId = sanitizeVoterId(voter.voterId);
 
@@ -1395,28 +1402,11 @@ app.post("/sessions/:id/resume", authenticate, adminOnly, async (req, res) => {
       const voters = Array.isArray(structured.voters) ? structured.voters : [];
 
       let religions = [];
-      if (voters.length > 0) {
+      if (enableReligionClassification && voters.length > 0) {
         const religionResult = await classifyReligionByNames(voters, apiKey, {
           dispatchMode,
         });
         religions = religionResult.religions;
-      }
-
-      // Extract voter photos from the page PDF via Cloudinary
-      let photoMap = new Map();
-      if (isCloudinaryConfigured() && voters.some((v) => v.hasPhoto)) {
-        try {
-          photoMap = await extractVoterPhotosFromPage(
-            pagePath,
-            voters,
-            id,
-            pageNumber,
-          );
-        } catch (photoErr) {
-          console.warn(
-            `⚠️ Photo extraction failed for page ${pageNumber}: ${photoErr.message}`,
-          );
-        }
       }
 
       for (let i = 0; i < voters.length; i++) {
@@ -1424,25 +1414,7 @@ app.post("/sessions/:id/resume", authenticate, adminOnly, async (req, res) => {
         const religion = religions[i] || "Other";
         const ageValue = voter.age ? Number.parseInt(voter.age, 10) : null;
         const age = Number.isNaN(ageValue) ? null : ageValue;
-
-        // Get photo URL from extraction
-        let photoUrl = photoMap.get(i) || null;
-        if (
-          !photoUrl &&
-          voter.hasPhoto &&
-          voter.photoBase64 &&
-          isCloudinaryConfigured()
-        ) {
-          try {
-            const cloudResult = await uploadBase64Image(voter.photoBase64, {
-              folder: `voter-list/${id}`,
-              publicId: `voter_${voter.voterId || voter.serialNumber || i}`,
-            });
-            photoUrl = cloudResult?.secure_url || null;
-          } catch (photoErr) {
-            console.warn(`⚠️ Photo upload failed: ${photoErr.message}`);
-          }
-        }
+        const photoUrl = resolvePlaceholderPhotoUrl();
 
         const cleanVoterId = sanitizeVoterId(voter.voterId);
 
