@@ -11,10 +11,11 @@ import {
   classifyReligionByNames,
   getApiKeyStatuses,
   resetAllApiKeys,
-  initializeKeyStatus,
   processPagesBatch,
   chatWithGemini,
-  getAvailableEngines,
+  setGlobalDispatchMode,
+  getGlobalDispatchMode,
+  getAllowedDispatchModes,
 } from "./gemini.js";
 import { parseGeminiStructured } from "./parser.js";
 import { pool, query } from "./db.js";
@@ -40,9 +41,10 @@ import {
 } from "./cloudinary.js";
 import {
   normalizeBoothNo,
+  extractBoothNoFromFilename,
+  extractAssemblyNameFromFilename,
   normalizeAssemblyName,
   assemblyLooksRelated,
-  autoSessionName,
 } from "./boothLinking.js";
 
 /**
@@ -86,6 +88,16 @@ const allowedOrigins = process.env.CORS_ORIGINS
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function parseDispatchMode(input) {
+  const normalized = String(input || "")
+    .trim()
+    .toLowerCase();
+  if (!normalized) return null;
+  const allowed = getAllowedDispatchModes();
+  if (!allowed.includes(normalized)) return null;
+  return normalized;
 }
 
 function extractOriginHost(originValue) {
@@ -324,8 +336,15 @@ async function getSessionBoothMeta(sessionId) {
   if (result.rowCount === 0) return null;
 
   const row = result.rows[0];
-  const assembly = row.assembly_name || row.fallback_assembly || "";
-  const boothNo = normalizeBoothNo(row.booth_no || row.fallback_booth || "");
+  const assembly =
+    row.assembly_name ||
+    row.fallback_assembly ||
+    extractAssemblyNameFromFilename(row.original_filename) ||
+    "";
+  const boothFromFilename = extractBoothNoFromFilename(row.original_filename);
+  const boothNo = normalizeBoothNo(
+    row.booth_no || row.fallback_booth || boothFromFilename || "",
+  );
 
   return {
     id: row.id,
@@ -348,7 +367,18 @@ app.post(
     const sessionId = req.sessionId;
     const pdfPath = req.file?.path;
     const originalName = req.file?.originalname || "upload.pdf";
+    const boothNoFromFilename = extractBoothNoFromFilename(originalName);
     const apiKey = req.body?.apiKey || req.body?.geminiApiKey;
+    const requestedDispatchMode = req.body?.dispatchMode;
+    const dispatchMode = requestedDispatchMode
+      ? parseDispatchMode(requestedDispatchMode)
+      : null;
+
+    if (requestedDispatchMode && !dispatchMode) {
+      return res.status(400).json({
+        error: `Invalid dispatchMode. Allowed: ${getAllowedDispatchModes().join(", ")}`,
+      });
+    }
 
     if (!pdfPath) {
       return res.status(400).json({ error: "PDF file is required" });
@@ -357,9 +387,15 @@ app.post(
     // API key is now optional - will use fallback keys
     try {
       await query(
-        "INSERT INTO sessions (id, original_filename, status, processed_pages) VALUES ($1, $2, $3, $4)",
-        [sessionId, originalName, "processing", 0],
+        "INSERT INTO sessions (id, original_filename, status, processed_pages, booth_no) VALUES ($1, $2, $3, $4, $5)",
+        [sessionId, originalName, "processing", 0, boothNoFromFilename || null],
       );
+
+      if (boothNoFromFilename) {
+        console.log(
+          `🏷️ Booth number inferred from filename: booth_no="${boothNoFromFilename}" (${originalName})`,
+        );
+      }
 
       const pageDir = path.join(storageRoot, sessionId, "pages");
       const pagePaths = await splitPdfToPages(pdfPath, pageDir);
@@ -405,25 +441,18 @@ app.post(
         if (pageIndex === 0) {
           const firstAssembly = structured.assembly || "";
           const firstBoothNo = normalizeBoothNo(structured.partNumber || "");
-          const generatedName = autoSessionName(
-            firstAssembly,
-            firstBoothNo,
-            originalName,
-          );
 
           await query(
             `UPDATE sessions
              SET booth_name = COALESCE(NULLIF($1,''), booth_name),
                  assembly_name = COALESCE(NULLIF($2,''), assembly_name),
                  booth_no = COALESCE(NULLIF($3,''), booth_no),
-                 original_filename = $4,
                  updated_at = now()
-             WHERE id = $5`,
+             WHERE id = $4`,
             [
               structured.boothName || "",
               firstAssembly,
               firstBoothNo,
-              generatedName,
               sessionId,
             ],
           );
@@ -451,7 +480,9 @@ app.post(
         // Classify religion for all voters on this page
         let religions = [];
         if (voters.length > 0) {
-          const religionResult = await classifyReligionByNames(voters, apiKey);
+          const religionResult = await classifyReligionByNames(voters, apiKey, {
+            dispatchMode,
+          });
           religions = religionResult.religions;
         }
 
@@ -552,6 +583,7 @@ app.post(
             }
           }
         },
+        { dispatchMode },
       );
 
       // Automatic recovery rounds: keep resuming until all pages are done.
@@ -570,26 +602,31 @@ app.post(
 
         await sleep(autoResumeDelayMs);
 
-        await processPagesBatch(remainingPagePaths, 0, async (progress) => {
-          if (progress.type === "page_complete" && progress.result) {
-            const pageNumber = pagePathToNumber.get(progress.pagePath);
-            if (pageNumber) {
-              try {
-                await savePageToDatabase(
-                  pageNumber - 1,
-                  progress.result,
-                  progress.pagePath,
-                );
-              } catch (err) {
-                console.error(
-                  `Auto-resume save failed for page ${pageNumber}:`,
-                  err.message,
-                );
-                errorCount++;
+        await processPagesBatch(
+          remainingPagePaths,
+          0,
+          async (progress) => {
+            if (progress.type === "page_complete" && progress.result) {
+              const pageNumber = pagePathToNumber.get(progress.pagePath);
+              if (pageNumber) {
+                try {
+                  await savePageToDatabase(
+                    pageNumber - 1,
+                    progress.result,
+                    progress.pagePath,
+                  );
+                } catch (err) {
+                  console.error(
+                    `Auto-resume save failed for page ${pageNumber}:`,
+                    err.message,
+                  );
+                  errorCount++;
+                }
               }
             }
-          }
-        });
+          },
+          { dispatchMode },
+        );
 
         remainingPagePaths = await getPendingPagePaths(
           sessionId,
@@ -621,6 +658,7 @@ app.post(
           processedPages: finalProcessed,
           errorPages: errorCount,
           status: "paused",
+          dispatchMode: dispatchMode || getGlobalDispatchMode(),
           message:
             "Session partially completed after automatic retries. Use POST /sessions/:id/resume to continue.",
           keySwitchCount,
@@ -639,6 +677,7 @@ app.post(
         sessionId,
         pages: pagePaths.length,
         status: "completed",
+        dispatchMode: dispatchMode || getGlobalDispatchMode(),
         keySwitchCount,
         automaticRetryRounds: roundsDone,
         apiKeyStatus: getApiKeyStatuses(),
@@ -705,6 +744,7 @@ app.get("/sessions/:id/status", authenticate, adminOnly, async (req, res) => {
     status === "processing" && total_pages
       ? Math.min(processed_pages + 1, total_pages)
       : null;
+  const dispatchStatus = getApiKeyStatuses();
 
   res.json({
     sessionId: id,
@@ -715,6 +755,8 @@ app.get("/sessions/:id/status", authenticate, adminOnly, async (req, res) => {
     last_page_processed,
     current_page,
     voter_count,
+    activeDispatchTier: dispatchStatus.activeDispatchTier,
+    paidFallbackActive: dispatchStatus.activeDispatchTier === "paid",
     created_at,
     updated_at,
   });
@@ -744,6 +786,95 @@ app.get("/sessions/:id", authenticate, adminOnly, async (req, res) => {
     voters: voters.rows,
   });
 });
+
+// Session metadata correction - Admin only
+app.patch(
+  "/sessions/:id/metadata",
+  authenticate,
+  adminOnly,
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+      const sessionCheck = await query(
+        "SELECT id, original_filename FROM sessions WHERE id=$1",
+        [id],
+      );
+      if (sessionCheck.rowCount === 0) {
+        return res.status(404).json({ error: "Session not found" });
+      }
+
+      const assemblyNameInput = req.body?.assemblyName;
+      const boothNoInput = req.body?.boothNo;
+      const boothNameInput = req.body?.boothName;
+
+      const hasAssembly = assemblyNameInput !== undefined;
+      const hasBoothNo = boothNoInput !== undefined;
+      const hasBoothName = boothNameInput !== undefined;
+
+      if (!hasAssembly && !hasBoothNo && !hasBoothName) {
+        return res.status(400).json({
+          error: "Provide at least one field: assemblyName, boothNo, boothName",
+        });
+      }
+
+      const assemblyName = hasAssembly
+        ? String(assemblyNameInput || "").trim()
+        : null;
+      const boothNo = hasBoothNo ? normalizeBoothNo(boothNoInput) : null;
+      const boothName = hasBoothName
+        ? String(boothNameInput || "").trim()
+        : null;
+
+      if (hasBoothNo && !boothNo) {
+        return res.status(400).json({
+          error:
+            "Invalid boothNo. Expected digits with optional suffix (e.g. 7, 45A)",
+        });
+      }
+
+      const updates = [];
+      const values = [];
+      let idx = 1;
+
+      if (hasAssembly) {
+        updates.push(`assembly_name = $${idx}`);
+        values.push(assemblyName || null);
+        idx += 1;
+      }
+      if (hasBoothNo) {
+        updates.push(`booth_no = $${idx}`);
+        values.push(boothNo || null);
+        idx += 1;
+      }
+      if (hasBoothName) {
+        updates.push(`booth_name = $${idx}`);
+        values.push(boothName || null);
+        idx += 1;
+      }
+
+      updates.push(`updated_at = now()`);
+      values.push(id);
+
+      const updated = await query(
+        `UPDATE sessions
+       SET ${updates.join(", ")}
+       WHERE id = $${idx}
+       RETURNING id, original_filename, assembly_name, booth_no, booth_name, updated_at`,
+        values,
+      );
+
+      const meta = await getSessionBoothMeta(id);
+
+      return res.json({
+        message: "Session metadata updated",
+        session: updated.rows[0],
+        mappingMeta: meta,
+      });
+    } catch (err) {
+      return res.status(500).json({ error: err.message });
+    }
+  },
+);
 
 // Session voters - Admin only
 app.get("/sessions/:id/voters", authenticate, adminOnly, async (req, res) => {
@@ -996,6 +1127,51 @@ app.get("/api-keys/status", authenticate, adminOnly, (_req, res) => {
   res.json(status);
 });
 
+// Current dispatch mode - Authenticated users
+app.get("/api-keys/dispatch-mode", authenticate, (_req, res) => {
+  res.json({
+    mode: getGlobalDispatchMode(),
+    allowedModes: getAllowedDispatchModes(),
+  });
+});
+
+// Set dispatch mode globally at runtime - Admin only
+app.patch("/api-keys/dispatch-mode", authenticate, adminOnly, (req, res) => {
+  const mode = parseDispatchMode(req.body?.mode);
+  if (!mode) {
+    return res.status(400).json({
+      error: `Invalid mode. Allowed: ${getAllowedDispatchModes().join(", ")}`,
+    });
+  }
+
+  const applied = setGlobalDispatchMode(mode);
+  const status = getApiKeyStatuses();
+  return res.json({
+    message: `Dispatch mode set to ${applied}`,
+    mode: applied,
+    status,
+  });
+});
+
+// Frontend-safe Gemini dispatch status (no key previews) - Authenticated users
+app.get("/api-keys/dispatch-status", authenticate, (_req, res) => {
+  const status = getApiKeyStatuses();
+  res.json({
+    configuredDispatchMode: status.configuredDispatchMode,
+    activeDispatchTier: status.activeDispatchTier,
+    paidFallbackActive: status.activeDispatchTier === "paid",
+    totalEngines: status.totalEngines,
+    activeEngines: status.activeEngines,
+    rateLimitedEngines: status.rateLimitedEngines,
+    exhaustedEngines: status.exhaustedEngines,
+    busyEngines: status.busyEngines,
+    availableEngines: status.availableEngines,
+    pools: status.pools,
+    allExhausted: status.allExhausted,
+    updatedAt: new Date().toISOString(),
+  });
+});
+
 // Reset all API keys (useful when quota resets daily) - Admin only
 app.post("/api-keys/reset", authenticate, adminOnly, (_req, res) => {
   const status = resetAllApiKeys();
@@ -1053,6 +1229,16 @@ app.post("/sessions/:id/stop", authenticate, adminOnly, async (req, res) => {
 app.post("/sessions/:id/resume", authenticate, adminOnly, async (req, res) => {
   const { id } = req.params;
   const apiKey = req.body?.apiKey || req.body?.geminiApiKey;
+  const requestedDispatchMode = req.body?.dispatchMode;
+  const dispatchMode = requestedDispatchMode
+    ? parseDispatchMode(requestedDispatchMode)
+    : null;
+
+  if (requestedDispatchMode && !dispatchMode) {
+    return res.status(400).json({
+      error: `Invalid dispatchMode. Allowed: ${getAllowedDispatchModes().join(", ")}`,
+    });
+  }
 
   try {
     // Check if session exists and is paused or failed
@@ -1185,27 +1371,15 @@ app.post("/sessions/:id/resume", authenticate, adminOnly, async (req, res) => {
       if (pageNumber === 1) {
         const firstAssembly = structured.assembly || "";
         const firstBoothNo = normalizeBoothNo(structured.partNumber || "");
-        const generatedName = autoSessionName(
-          firstAssembly,
-          firstBoothNo,
-          session.original_filename,
-        );
 
         await query(
           `UPDATE sessions
            SET booth_name = COALESCE(NULLIF($1,''), booth_name),
                assembly_name = COALESCE(NULLIF($2,''), assembly_name),
                booth_no = COALESCE(NULLIF($3,''), booth_no),
-               original_filename = $4,
                updated_at = now()
-           WHERE id = $5`,
-          [
-            structured.boothName || "",
-            firstAssembly,
-            firstBoothNo,
-            generatedName,
-            id,
-          ],
+           WHERE id = $4`,
+          [structured.boothName || "", firstAssembly, firstBoothNo, id],
         );
       }
 
@@ -1222,7 +1396,9 @@ app.post("/sessions/:id/resume", authenticate, adminOnly, async (req, res) => {
 
       let religions = [];
       if (voters.length > 0) {
-        const religionResult = await classifyReligionByNames(voters, apiKey);
+        const religionResult = await classifyReligionByNames(voters, apiKey, {
+          dispatchMode,
+        });
         religions = religionResult.religions;
       }
 
@@ -1312,6 +1488,7 @@ app.post("/sessions/:id/resume", authenticate, adminOnly, async (req, res) => {
           }
         }
       },
+      { dispatchMode },
     );
 
     // Automatic recovery rounds during resume flow.
@@ -1330,18 +1507,23 @@ app.post("/sessions/:id/resume", authenticate, adminOnly, async (req, res) => {
 
       await sleep(autoResumeDelayMs);
 
-      await processPagesBatch(remainingPagePaths, 0, async (progress) => {
-        if (progress.type === "page_complete" && progress.result) {
-          try {
-            await savePageToDatabase(progress.pagePath, progress.result);
-          } catch (err) {
-            console.error(
-              "Failed to save page during resume auto-round:",
-              err.message,
-            );
+      await processPagesBatch(
+        remainingPagePaths,
+        0,
+        async (progress) => {
+          if (progress.type === "page_complete" && progress.result) {
+            try {
+              await savePageToDatabase(progress.pagePath, progress.result);
+            } catch (err) {
+              console.error(
+                "Failed to save page during resume auto-round:",
+                err.message,
+              );
+            }
           }
-        }
-      });
+        },
+        { dispatchMode },
+      );
 
       remainingPagePaths = await getPendingPagePaths(
         id,
@@ -1364,6 +1546,7 @@ app.post("/sessions/:id/resume", authenticate, adminOnly, async (req, res) => {
         errors: remainingPagePaths.length,
         total_remaining: remainingPagePaths.length,
         status: "paused",
+        dispatchMode: dispatchMode || getGlobalDispatchMode(),
         automaticRetryRounds: roundsDone,
         keySwitchCount,
         apiKeyStatus: getApiKeyStatuses(),
@@ -1381,6 +1564,7 @@ app.post("/sessions/:id/resume", authenticate, adminOnly, async (req, res) => {
       resumed_from_page: resumedFromPage,
       total_pages: pagePaths.length,
       status: "completed",
+      dispatchMode: dispatchMode || getGlobalDispatchMode(),
       automaticRetryRounds: roundsDone,
       keySwitchCount,
     });

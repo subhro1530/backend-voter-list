@@ -4,9 +4,74 @@
 */
 
 function normalizeBoothNo(value) {
-  return String(value || "")
+  const bengaliToAsciiDigits = {
+    "০": "0",
+    "১": "1",
+    "২": "2",
+    "৩": "3",
+    "৪": "4",
+    "৫": "5",
+    "৬": "6",
+    "৭": "7",
+    "৮": "8",
+    "৯": "9",
+  };
+
+  const ascii = String(value || "")
+    .split("")
+    .map((ch) => bengaliToAsciiDigits[ch] || ch)
+    .join("")
     .toUpperCase()
     .replace(/[^A-Z0-9]/g, "");
+
+  if (!ascii) return "";
+
+  const match = ascii.match(/(\d{1,4}[A-Z]?)/);
+  return match ? match[1] : ascii;
+}
+
+function extractBoothNoFromFilename(filename) {
+  const text = String(filename || "")
+    .replace(/[_-]+/g, " ")
+    .trim();
+  if (!text) return "";
+
+  const explicit = text.match(
+    /\b(?:booth|part|ps|polling\s*station)\s*(?:no|number)?\s*[:#-]?\s*(\d{1,4}[A-Z]?)\b/i,
+  );
+  if (explicit?.[1]) return normalizeBoothNo(explicit[1]);
+
+  const fallback = text.match(/\b(\d{1,4}[A-Z]?)\b/i);
+  return fallback?.[1] ? normalizeBoothNo(fallback[1]) : "";
+}
+
+export function resolveSessionBoothNo(sessionLike, responseSessionLike) {
+  const fromSession = normalizeBoothNo(
+    sessionLike?.booth_no || sessionLike?.boothNo || "",
+  );
+  if (fromSession) {
+    return { boothNo: fromSession, source: "session" };
+  }
+
+  const fromResponse = normalizeBoothNo(
+    responseSessionLike?.booth_no || responseSessionLike?.boothNo || "",
+  );
+  if (fromResponse) {
+    return { boothNo: fromResponse, source: "response" };
+  }
+
+  const fromFilename = extractBoothNoFromFilename(
+    sessionLike?.original_filename ||
+      sessionLike?.originalFilename ||
+      responseSessionLike?.original_filename ||
+      responseSessionLike?.originalFilename ||
+      "",
+  );
+  if (fromFilename) {
+    return { boothNo: fromFilename, source: "filename" };
+  }
+
+  return { boothNo: "", source: "missing" };
 }
 
 function getSelectionKey(electionSessionId, boothNo) {
@@ -42,10 +107,17 @@ async function fetchBoothVoters({
   includeVoters = true,
   fetchImpl = window.fetch.bind(window),
 }) {
+  const canonicalBoothNo = normalizeBoothNo(boothNo);
+  if (!canonicalBoothNo) {
+    const error = new Error("Booth number is required");
+    error.status = 400;
+    throw error;
+  }
+
   const url = new URL(
     `${apiBaseUrl.replace(/\/$/, "")}/election-results/sessions/${encodeURIComponent(electionSessionId)}/booths/voter-list`,
   );
-  url.searchParams.set("boothNo", String(boothNo || ""));
+  url.searchParams.set("boothNo", canonicalBoothNo);
   url.searchParams.set("limit", String(limit));
   url.searchParams.set("includeVoters", includeVoters ? "1" : "0");
   if (voterSessionId) {
@@ -92,13 +164,17 @@ export async function openBoothVoters({
   onError,
   fetchImpl,
 }) {
-  const remembered = readRememberedSelection(electionSessionId, boothNo);
+  const canonicalBoothNo = normalizeBoothNo(boothNo);
+  const remembered = readRememberedSelection(
+    electionSessionId,
+    canonicalBoothNo,
+  );
 
   try {
     if (typeof onStart === "function") {
       onStart({
         electionSessionId,
-        boothNo,
+        boothNo: canonicalBoothNo,
         rememberedVoterSessionId: remembered || null,
       });
     }
@@ -108,7 +184,7 @@ export async function openBoothVoters({
         apiBaseUrl,
         token,
         electionSessionId,
-        boothNo,
+        boothNo: canonicalBoothNo,
         voterSessionId: remembered || "",
         limit: 0,
         includeVoters: false,
@@ -118,7 +194,7 @@ export async function openBoothVoters({
       if (meta?.selectedSession?.id) {
         writeRememberedSelection(
           electionSessionId,
-          boothNo,
+          canonicalBoothNo,
           meta.selectedSession.id,
         );
       }
@@ -135,7 +211,7 @@ export async function openBoothVoters({
         apiBaseUrl,
         token,
         electionSessionId,
-        boothNo,
+        boothNo: canonicalBoothNo,
         voterSessionId: selectedId,
         limit,
         includeVoters: true,
@@ -145,7 +221,7 @@ export async function openBoothVoters({
       if (fullData?.selectedSession?.id) {
         writeRememberedSelection(
           electionSessionId,
-          boothNo,
+          canonicalBoothNo,
           fullData.selectedSession.id,
         );
       }
@@ -165,7 +241,7 @@ export async function openBoothVoters({
       apiBaseUrl,
       token,
       electionSessionId,
-      boothNo,
+      boothNo: canonicalBoothNo,
       voterSessionId: remembered || "",
       limit,
       includeVoters: true,
@@ -175,7 +251,7 @@ export async function openBoothVoters({
     if (data?.selectedSession?.id) {
       writeRememberedSelection(
         electionSessionId,
-        boothNo,
+        canonicalBoothNo,
         data.selectedSession.id,
       );
     }
@@ -204,7 +280,7 @@ export async function openBoothVoters({
       apiBaseUrl,
       token,
       electionSessionId,
-      boothNo,
+      boothNo: canonicalBoothNo,
       voterSessionId: "",
       limit,
       includeVoters: true,
@@ -214,7 +290,7 @@ export async function openBoothVoters({
     if (retryData?.selectedSession?.id) {
       writeRememberedSelection(
         electionSessionId,
-        boothNo,
+        canonicalBoothNo,
         retryData.selectedSession.id,
       );
     }
@@ -242,11 +318,12 @@ export async function switchBoothVoterSession({
   limit = 200,
   fetchImpl,
 }) {
+  const canonicalBoothNo = normalizeBoothNo(boothNo);
   const data = await fetchBoothVoters({
     apiBaseUrl,
     token,
     electionSessionId,
-    boothNo,
+    boothNo: canonicalBoothNo,
     voterSessionId,
     limit,
     includeVoters: true,
@@ -256,7 +333,7 @@ export async function switchBoothVoterSession({
   if (data?.selectedSession?.id) {
     writeRememberedSelection(
       electionSessionId,
-      boothNo,
+      canonicalBoothNo,
       data.selectedSession.id,
     );
   }

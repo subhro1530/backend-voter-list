@@ -27,6 +27,12 @@ import {
   getVoterSlipTemplatePublicHint,
 } from "../voterSlipTemplate.js";
 import {
+  normalizeBoothNo,
+  extractBoothNoFromFilename,
+  extractAssemblyNameFromFilename,
+  canonicalizeAssemblyName,
+} from "../boothLinking.js";
+import {
   getCalibrationState,
   getManualProfiles,
   saveCalibrationState,
@@ -113,6 +119,40 @@ function makeMassJobPublicView(job) {
 function normalizeText(value) {
   if (value === null || value === undefined) return "";
   return String(value).trim();
+}
+
+function isUuidLike(value) {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+    String(value || ""),
+  );
+}
+
+function cleanAssemblyDisplayLabel(value) {
+  const text = normalizeText(value);
+  if (!text) return "";
+
+  return text
+    .replace(/[_-]+/g, " ")
+    .replace(/\b(?:booth|part|no|number|ps)\b\s*[:#-]?\s*\d{1,4}[a-z]?/gi, " ")
+    .replace(
+      /(?:^|\s)(?:বুথ|পার্ট)\s*(?:নং|নম্বর)?\s*[:#-]?\s*\d{1,4}[a-z]?/gi,
+      " ",
+    )
+    .replace(/^\s*\d{1,4}[a-z]?\s*/i, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function resolveAssemblyLabelFromRow(row) {
+  const sessionAssembly = cleanAssemblyDisplayLabel(row.session_assembly);
+  if (sessionAssembly) return sessionAssembly;
+
+  const voterAssembly = cleanAssemblyDisplayLabel(row.voter_assembly);
+  if (voterAssembly) return voterAssembly;
+
+  return cleanAssemblyDisplayLabel(
+    extractAssemblyNameFromFilename(row.original_filename),
+  );
 }
 
 function isAdminUser(req) {
@@ -331,6 +371,149 @@ async function getMassSlipVoters(filters) {
   return result.rows.map(mapRowToSlipVoter);
 }
 
+async function getSessionForMassSlip(sessionId) {
+  const result = await query(
+    `SELECT id, status, total_pages, processed_pages, assembly_name, booth_no, booth_name,
+            original_filename,
+            created_at, updated_at
+     FROM sessions
+     WHERE id = $1
+     LIMIT 1`,
+    [sessionId],
+  );
+
+  if (result.rowCount === 0) return null;
+  return result.rows[0];
+}
+
+function buildSessionMassFilters(sessionId) {
+  return {
+    sessionId: normalizeText(sessionId),
+    boothNo: "",
+    partNumber: "",
+    assembly: "",
+    section: "",
+  };
+}
+
+async function queueMassVoterSlipJob({
+  voters,
+  filters,
+  requestedBy,
+  boothNoForName,
+}) {
+  const fileName = buildMassSlipFilename(boothNoForName);
+  const jobId = uuidv4();
+  const filePath = path.join(voterSlipJobsRoot, jobId, fileName);
+
+  const job = {
+    id: jobId,
+    status: "queued",
+    total: voters.length,
+    processed: 0,
+    startedAt: new Date().toISOString(),
+    finishedAt: null,
+    error: null,
+    filters,
+    fileName,
+    filePath,
+    downloadedAt: null,
+    downloadFailedAt: null,
+    requestedBy,
+  };
+  voterSlipJobs.set(jobId, job);
+
+  setImmediate(async () => {
+    try {
+      job.status = "processing";
+      await buildMassVoterSlipPdfFile(voters, filePath, {
+        onProgress: (processed, total) => {
+          job.processed = processed;
+          job.total = total;
+        },
+      });
+      job.status = "completed";
+      job.finishedAt = new Date().toISOString();
+    } catch (error) {
+      job.status = "failed";
+      job.error = error.message || "Mass slip generation failed";
+      job.finishedAt = new Date().toISOString();
+    }
+  });
+
+  return job;
+}
+
+async function startMassVoterSlipBySession(req, res, sessionIdInput) {
+  await cleanupOldVoterSlipJobs();
+
+  const hasTemplate = await ensureVoterSlipTemplateExists();
+  if (!hasTemplate) {
+    return res.status(500).json({
+      error: "Voter slip template not found",
+      expectedPath: getVoterSlipTemplatePublicHint(),
+    });
+  }
+
+  const sessionId = normalizeText(sessionIdInput);
+  if (!sessionId) {
+    return res.status(400).json({
+      error: "sessionId is required",
+      example:
+        "POST /user/voterslips/mass/sessions/:sessionId/start or body: { sessionId }",
+    });
+  }
+
+  const session = await getSessionForMassSlip(sessionId);
+  if (!session) {
+    return res.status(404).json({
+      error: "Session not found",
+      sessionId,
+    });
+  }
+
+  const filters = buildSessionMassFilters(sessionId);
+  const voters = await getMassSlipVoters(filters);
+  if (!voters.length) {
+    return res.status(404).json({
+      error: "No voters found for this session",
+      sessionId,
+    });
+  }
+
+  const boothNoForName =
+    normalizeBoothNo(
+      session.booth_no ||
+        extractBoothNoFromFilename(session.original_filename) ||
+        voters[0]?.boothNo ||
+        voters[0]?.partNumber ||
+        "",
+    ) || "unknown";
+
+  const job = await queueMassVoterSlipJob({
+    voters,
+    filters,
+    requestedBy: req.user.id,
+    boothNoForName,
+  });
+
+  return res.status(202).json({
+    message: "Mass voter slip generation started for session",
+    session: {
+      id: session.id,
+      status: session.status,
+      totalPages: session.total_pages,
+      processedPages: session.processed_pages,
+      assemblyName: session.assembly_name,
+      boothNo: session.booth_no,
+      boothName: session.booth_name,
+      createdAt: session.created_at,
+      updatedAt: session.updated_at,
+    },
+    job: makeMassJobPublicView(job),
+  });
+}
+
 // All user routes require authentication
 router.use(authenticate);
 
@@ -350,17 +533,77 @@ function resolveVoterIdParam(idParam) {
  * Get all available assemblies (for dropdown/selection)
  * Users can search across all assemblies, regardless of sessions
  */
-router.get("/assemblies", async (_req, res) => {
+router.get("/assemblies", async (req, res) => {
   try {
+    const sessionId = normalizeText(req.query?.sessionId);
+    if (sessionId && !isUuidLike(sessionId)) {
+      return res.status(400).json({ error: "Invalid sessionId" });
+    }
+
+    const values = [];
+    let where = "";
+    if (sessionId) {
+      values.push(sessionId);
+      where = "WHERE s.id = $1";
+    }
+
     const sql = `
-      SELECT DISTINCT assembly, COUNT(*)::int as voter_count
-      FROM session_voters
-      WHERE assembly IS NOT NULL AND assembly != ''
-      GROUP BY assembly
-      ORDER BY assembly;
+      SELECT s.id AS session_id,
+             s.original_filename,
+             s.assembly_name AS session_assembly,
+             v.assembly AS voter_assembly,
+             COUNT(v.id)::int AS voter_count
+      FROM sessions s
+      LEFT JOIN session_voters v ON v.session_id = s.id
+      ${where}
+      GROUP BY s.id, s.original_filename, s.assembly_name, v.assembly
+      ORDER BY s.created_at DESC;
     `;
-    const result = await query(sql);
-    res.json({ assemblies: result.rows });
+    const result = await query(sql, values);
+
+    const grouped = new Map();
+    for (const row of result.rows) {
+      const label = resolveAssemblyLabelFromRow(row);
+      const key = canonicalizeAssemblyName(label);
+      if (!key) continue;
+
+      const existing = grouped.get(key);
+      if (!existing) {
+        grouped.set(key, {
+          assembly: label,
+          voter_count: Number(row.voter_count || 0),
+          session_count: 1,
+          canonical_key: key,
+        });
+        continue;
+      }
+
+      existing.voter_count += Number(row.voter_count || 0);
+      existing.session_count += 1;
+
+      // Prefer shorter, cleaner labels when duplicates exist.
+      if (
+        label &&
+        (existing.assembly.length > label.length ||
+          existing.assembly.includes("-") ||
+          existing.assembly.includes("_") ||
+          /\d/.test(existing.assembly))
+      ) {
+        existing.assembly = label;
+      }
+    }
+
+    const assemblies = [...grouped.values()].sort((a, b) =>
+      a.assembly.localeCompare(b.assembly, undefined, { sensitivity: "base" }),
+    );
+
+    res.json({
+      assemblies,
+      meta: {
+        source: sessionId ? "session-scoped" : "global",
+        sessionId: sessionId || null,
+      },
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -372,15 +615,67 @@ router.get("/assemblies", async (_req, res) => {
 router.get("/assemblies/:assembly/parts", async (req, res) => {
   try {
     const { assembly } = req.params;
+    const sessionId = normalizeText(req.query?.sessionId);
+    if (sessionId && !isUuidLike(sessionId)) {
+      return res.status(400).json({ error: "Invalid sessionId" });
+    }
+
+    const targetKey = canonicalizeAssemblyName(assembly);
+    if (!targetKey) {
+      return res.json({ parts: [] });
+    }
+
     const sql = `
-      SELECT DISTINCT part_number, COUNT(*)::int as voter_count
-      FROM session_voters
-      WHERE LOWER(assembly) = LOWER($1) AND part_number IS NOT NULL AND part_number != ''
-      GROUP BY part_number
-      ORDER BY part_number;
+      SELECT v.part_number,
+             v.assembly AS voter_assembly,
+             s.assembly_name AS session_assembly,
+             s.original_filename,
+             COUNT(v.id)::int AS voter_count
+      FROM session_voters v
+      LEFT JOIN sessions s ON s.id = v.session_id
+      WHERE v.part_number IS NOT NULL AND v.part_number != ''
+        AND ($1::uuid IS NULL OR v.session_id = $1)
+      GROUP BY v.part_number, v.assembly, s.assembly_name, s.original_filename
+      ORDER BY v.part_number;
     `;
-    const result = await query(sql, [assembly]);
-    res.json({ parts: result.rows });
+    const result = await query(sql, [sessionId || null]);
+
+    const grouped = new Map();
+    for (const row of result.rows) {
+      const label = resolveAssemblyLabelFromRow(row);
+      const key = canonicalizeAssemblyName(label);
+      if (key !== targetKey) continue;
+
+      const normalizedPart = normalizeBoothNo(row.part_number);
+      if (!normalizedPart) continue;
+
+      const existing = grouped.get(normalizedPart) || {
+        part_number: normalizedPart,
+        voter_count: 0,
+      };
+      existing.voter_count += Number(row.voter_count || 0);
+      grouped.set(normalizedPart, existing);
+    }
+
+    const parts = [...grouped.values()].sort((a, b) => {
+      const aNum = Number.parseInt(String(a.part_number).match(/\d+/)?.[0], 10);
+      const bNum = Number.parseInt(String(b.part_number).match(/\d+/)?.[0], 10);
+
+      if (!Number.isNaN(aNum) && !Number.isNaN(bNum) && aNum !== bNum) {
+        return aNum - bNum;
+      }
+
+      return String(a.part_number).localeCompare(String(b.part_number));
+    });
+
+    res.json({
+      parts,
+      meta: {
+        assembly,
+        canonicalKey: targetKey,
+        sessionId: sessionId || null,
+      },
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -1159,49 +1454,41 @@ router.post("/voterslips/mass/start", async (req, res) => {
 
     const boothNoForName =
       filters.boothNo || filters.partNumber || voters[0].boothNo;
-    const fileName = buildMassSlipFilename(boothNoForName);
-    const jobId = uuidv4();
-    const filePath = path.join(voterSlipJobsRoot, jobId, fileName);
-
-    const job = {
-      id: jobId,
-      status: "queued",
-      total: voters.length,
-      processed: 0,
-      startedAt: new Date().toISOString(),
-      finishedAt: null,
-      error: null,
+    const job = await queueMassVoterSlipJob({
+      voters,
       filters,
-      fileName,
-      filePath,
-      downloadedAt: null,
-      downloadFailedAt: null,
       requestedBy: req.user.id,
-    };
-    voterSlipJobs.set(jobId, job);
-
-    setImmediate(async () => {
-      try {
-        job.status = "processing";
-        await buildMassVoterSlipPdfFile(voters, filePath, {
-          onProgress: (processed, total) => {
-            job.processed = processed;
-            job.total = total;
-          },
-        });
-        job.status = "completed";
-        job.finishedAt = new Date().toISOString();
-      } catch (error) {
-        job.status = "failed";
-        job.error = error.message || "Mass slip generation failed";
-        job.finishedAt = new Date().toISOString();
-      }
+      boothNoForName,
     });
 
     return res.status(202).json({
       message: "Mass voter slip generation started",
       job: makeMassJobPublicView(job),
     });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * Start async mass generation for an exact voter-list session.
+ * This route does not require assembly/part/section in request body.
+ */
+router.post("/voterslips/mass/sessions/:sessionId/start", async (req, res) => {
+  try {
+    return await startMassVoterSlipBySession(req, res, req.params.sessionId);
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * Body-based alias for frontend flows that already keep sessionId in state.
+ * Body example: { sessionId: "uuid" }
+ */
+router.post("/voterslips/mass/current-session/start", async (req, res) => {
+  try {
+    return await startMassVoterSlipBySession(req, res, req.body?.sessionId);
   } catch (err) {
     return res.status(500).json({ error: err.message });
   }

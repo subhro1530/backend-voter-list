@@ -72,6 +72,26 @@ CREATE INDEX IF NOT EXISTS idx_session_voters_name ON session_voters(LOWER(name)
 CREATE INDEX IF NOT EXISTS idx_session_voters_part_section ON session_voters(part_number, section);
 CREATE INDEX IF NOT EXISTS idx_session_voters_assembly ON session_voters(assembly);
 
+-- Gemini API key runtime state (persists quota/rate-limit status across restarts)
+CREATE TABLE IF NOT EXISTS gemini_api_key_states (
+  key_hash TEXT PRIMARY KEY,
+  key_preview TEXT,
+  env_name TEXT,
+  tier TEXT CHECK (tier IN ('free', 'paid')) DEFAULT 'free',
+  status TEXT CHECK (status IN ('active', 'rate_limited', 'exhausted')) DEFAULT 'active',
+  exhausted_at TIMESTAMPTZ,
+  recovery_time TIMESTAMPTZ,
+  last_error TEXT,
+  request_count INT DEFAULT 0,
+  success_count INT DEFAULT 0,
+  failure_count INT DEFAULT 0,
+  last_used TIMESTAMPTZ,
+  updated_at TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_gemini_api_key_states_status ON gemini_api_key_states(status);
+CREATE INDEX IF NOT EXISTS idx_gemini_api_key_states_tier ON gemini_api_key_states(tier);
+
 -- ============================================
 -- ELECTION RESULT TABLES (Separate Entity)
 -- ============================================

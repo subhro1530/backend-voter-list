@@ -51,6 +51,14 @@ Backend API to ingest PDF voter lists, split them into per-page PDFs, process pa
    ```
    Server defaults to `http://localhost:4000`.
 
+`npm start` now runs a Gemini startup assessment before boot:
+
+1. `scripts/initDb.js`
+2. `scripts/checkGeminiKeysOnStartup.js`
+3. `src/server.js`
+
+This pre-marks exhausted/rate-limited keys and reduces wasteful retry cycles.
+
 ## 🤖 Chatbot
 
 The intelligent chatbot understands natural language and executes role-based actions:
@@ -110,12 +118,17 @@ Read only from backend APIs.
 Backend contracts:
 
 1. GET /api-keys/status (admin auth)
-2. GET /sessions/:id/status (admin auth)
-3. POST /sessions and POST /sessions/:id/resume already run with backend auto-retry logic.
+2. GET /api-keys/dispatch-status (authenticated; frontend-safe)
+3. GET /api-keys/dispatch-mode (authenticated)
+4. PATCH /api-keys/dispatch-mode (admin auth; body: `{ mode: "auto" | "free-only" | "paid-only" }`)
+5. GET /sessions/:id/status (admin auth)
+6. POST /sessions and POST /sessions/:id/resume support optional `dispatchMode` and run with backend auto-retry logic.
+7. Exhausted keys are persisted in DB and skipped until recovery window (daily reset).
 
 Important status fields from /api-keys/status:
 
 - totalEngines, activeEngines, rateLimitedEngines, exhaustedEngines, busyEngines, availableEngines
+- configuredDispatchMode: "auto" | "free-only" | "paid-only"
 - activeDispatchTier: "free" | "paid"
 - pools.free and pools.paid with: total, active, rateLimited, exhausted, busy, available
 - engines[] with: engineId, tier, status, busy, keyPreview, metrics.totalRequests, metrics.successCount
@@ -132,6 +145,10 @@ UI requirements:
 3. If activeDispatchTier === "paid", show a prominent warning/info strip:
 
 - "Paid Gemini fallback is active. Free pool is unavailable."
+
+Also support reading the same fallback flag from /api-keys/dispatch-status:
+
+- paidFallbackActive: boolean
 
 4. Add table columns: Engine, Tier, Status, Busy, Requests, Success.
 5. Add color coding:
@@ -216,6 +233,8 @@ Users can search across ALL assemblies regardless of which session they were upl
 
 - `GET /user/assemblies` - List all available assemblies
 - `GET /user/assemblies/:assembly/parts` - Get part numbers for an assembly
+- `GET /user/assemblies?sessionId=<sessionId>` - Session-scoped, cleaned assembly list for current session UI
+- `GET /user/assemblies/:assembly/parts?sessionId=<sessionId>` - Session-scoped booth/part list for selected assembly
 - `GET /user/voters/search` - Search voters (params: name, voterId, assembly, partNumber, section, relationName)
 - `GET /user/voters/:id` - Get voter details by database ID
 - `GET /user/voters/by-voter-id/:voterId` - Get voter by their voter ID
@@ -223,6 +242,8 @@ Users can search across ALL assemblies regardless of which session they were upl
 - `GET /user/voters/voterslip.pdf?id=<idOrVoterId>` - Download single voter slip PDF in the latest template
 - `GET /user/voters/:id/voterslip.pdf` - Alternate path for single voter slip PDF
 - `POST /user/voterslips/mass/start` - Start async mass voter slip PDF generation (returns job id)
+- `POST /user/voterslips/mass/sessions/:sessionId/start` - One-click mass generation for a specific session (no extra filters required)
+- `POST /user/voterslips/mass/current-session/start` - Body-based alias for one-click session generation (`{ sessionId }`)
 - `GET /user/voterslips/mass/jobs/:jobId` - Poll mass-generation status/progress
 - `GET /user/voterslips/mass/jobs/:jobId/download` - Download generated mass voter slip PDF
 - `GET /user/voterslips/layout` - Get active voter slip field-box layout + metadata
@@ -237,6 +258,7 @@ Users can search across ALL assemblies regardless of which session they were upl
 - `POST /user/voters/:id/print` - Mark voter as printed
 - `GET /user/profile` - Get own profile
 - `PATCH /user/profile` - Update own profile
+- `PATCH /sessions/:id/metadata` - Admin-only manual correction for `assembly_name`, `booth_no`, `booth_name` used in election-result mapping
 
 ### Mass Voter Slip Job Flow
 
@@ -258,6 +280,37 @@ Users can search across ALL assemblies regardless of which session they were upl
      "http://localhost:4000/user/voterslips/mass/jobs/<jobId>/download" \
      -o voterslips.pdf
    ```
+
+### One-Click Session Mass Slip Flow
+
+Start directly from current voter-list session id (no assembly/part/section needed):
+
+```sh
+curl -X POST "http://localhost:4000/user/voterslips/mass/sessions/<sessionId>/start" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+Or body-based alias:
+
+```sh
+curl -X POST "http://localhost:4000/user/voterslips/mass/current-session/start" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"sessionId":"<sessionId>"}'
+```
+
+Booth number reliability notes:
+
+1. Backend stores `sessions.booth_no` from OCR page-1 part number when available.
+2. If OCR misses booth number, backend now infers booth number from uploaded filename (renamed files supported).
+3. Linked election-result mapping and session-based mass voter slip flows use this persisted/fallback booth number.
+4. Booth normalization now supports Bengali digits, so booth numbers like ১..৭ normalize correctly.
+
+Assembly/booth dropdown quality notes:
+
+1. Use `sessionId` query on assemblies/parts endpoints to avoid global noisy values.
+2. Backend deduplicates assembly variants using canonical normalization and filename/session fallbacks.
+3. If session metadata is wrong, update it via `PATCH /sessions/:id/metadata` and refresh mapping.
 
 ### Voter Slip Calibration Flow (Admin)
 
@@ -335,17 +388,19 @@ Template location used by voter-slip rendering:
 #### Engine Management
 
 - `GET /api-keys/status` - Get status of all 7 engines with metrics
+- `GET /api-keys/dispatch-mode` - Get configured dispatch mode (`auto`, `free-only`, `paid-only`)
+- `PATCH /api-keys/dispatch-mode` - Set dispatch mode (`auto`, `free-only`, `paid-only`)
 - `POST /api-keys/reset` - Reset all engines to active
 
 #### Session Management
 
-- `POST /sessions` - Upload PDF (processed with 7 parallel engines!)
+- `POST /sessions` - Upload PDF (processed with 7 parallel engines; optional `dispatchMode`)
 - `GET /sessions` - List all sessions
 - `GET /sessions/:id` - Get session details
 - `GET /sessions/:id/status` - Get session processing status
 - `GET /sessions/:id/voters` - Get voters in session with filtering
 - `DELETE /sessions/:id` - Delete session and all data
-- `POST /sessions/:id/resume` - Resume paused session
+- `POST /sessions/:id/resume` - Resume paused session (optional `dispatchMode`)
 
 #### Voter Management
 
@@ -369,6 +424,8 @@ Template location used by voter-slip rendering:
 #### API Key Management
 
 - `GET /api-keys/status` - Check API key status
+- `GET /api-keys/dispatch-mode` - Check configured dispatch mode
+- `PATCH /api-keys/dispatch-mode` - Update dispatch mode
 - `POST /api-keys/reset` - Reset all keys to active
 
 ## Creating the First Admin

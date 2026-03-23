@@ -1,5 +1,7 @@
 import fs from "fs/promises";
 import path from "path";
+import crypto from "crypto";
+import { query } from "./db.js";
 
 const model = process.env.GEMINI_MODEL || "gemini-2.0-pro-exp";
 
@@ -15,7 +17,239 @@ const KEY_TIERS = {
   PAID: "paid",
 };
 
+const DISPATCH_MODES = {
+  AUTO: "auto",
+  FREE_ONLY: "free-only",
+  PAID_ONLY: "paid-only",
+};
+
+const KEY_STATE_TABLE = "gemini_api_key_states";
+let keyStateHydrationPromise = null;
+let startupAssessmentPromise = null;
+
+const RATE_LIMIT_BASE_DELAY_MS = Math.max(
+  Number.parseInt(process.env.GEMINI_RATE_LIMIT_BASE_DELAY_MS || "15000", 10),
+  5000,
+);
+const RATE_LIMIT_MAX_DELAY_MS = Math.max(
+  Number.parseInt(process.env.GEMINI_RATE_LIMIT_MAX_DELAY_MS || "180000", 10),
+  RATE_LIMIT_BASE_DELAY_MS,
+);
+const STARTUP_KEY_CHECK_ENABLED =
+  String(process.env.GEMINI_STARTUP_KEY_CHECK || "true").toLowerCase() !==
+  "false";
+const STARTUP_KEY_CHECK_CONCURRENCY = Math.max(
+  Number.parseInt(process.env.GEMINI_STARTUP_KEY_CHECK_CONCURRENCY || "4", 10),
+  1,
+);
+const STARTUP_KEY_CHECK_TIMEOUT_MS = Math.max(
+  Number.parseInt(
+    process.env.GEMINI_STARTUP_KEY_CHECK_TIMEOUT_MS || "7000",
+    10,
+  ),
+  3000,
+);
+
+let globalDispatchMode = (() => {
+  const raw = String(process.env.GEMINI_DISPATCH_MODE || "auto")
+    .trim()
+    .toLowerCase();
+  if (
+    raw === DISPATCH_MODES.AUTO ||
+    raw === DISPATCH_MODES.FREE_ONLY ||
+    raw === DISPATCH_MODES.PAID_ONLY
+  ) {
+    return raw;
+  }
+  return DISPATCH_MODES.AUTO;
+})();
+
 const keyMetaByApiKey = new Map();
+
+function getKeyHash(apiKey) {
+  return crypto.createHash("sha256").update(apiKey).digest("hex");
+}
+
+function nextQuotaResetTimeIso() {
+  const resetHour = Number.parseInt(
+    process.env.GEMINI_DAILY_RESET_HOUR_UTC || "0",
+    10,
+  );
+  const resetMinute = Number.parseInt(
+    process.env.GEMINI_DAILY_RESET_MINUTE_UTC || "0",
+    10,
+  );
+
+  const normalizedHour = Number.isFinite(resetHour)
+    ? Math.min(Math.max(resetHour, 0), 23)
+    : 0;
+  const normalizedMinute = Number.isFinite(resetMinute)
+    ? Math.min(Math.max(resetMinute, 0), 59)
+    : 0;
+
+  const now = new Date();
+  const next = new Date(
+    Date.UTC(
+      now.getUTCFullYear(),
+      now.getUTCMonth(),
+      now.getUTCDate(),
+      normalizedHour,
+      normalizedMinute,
+      0,
+      0,
+    ),
+  );
+
+  if (now >= next) {
+    next.setUTCDate(next.getUTCDate() + 1);
+  }
+
+  return next.toISOString();
+}
+
+async function persistSingleKeyState(apiKey) {
+  const status = apiKeyStatus.get(apiKey);
+  if (!status) return;
+
+  const meta = keyMetaByApiKey.get(apiKey) || {};
+  const keyPreview = `${apiKey.slice(0, 10)}...${apiKey.slice(-4)}`;
+
+  await query(
+    `INSERT INTO ${KEY_STATE_TABLE} (
+       key_hash,
+       key_preview,
+       env_name,
+       tier,
+       status,
+       exhausted_at,
+       recovery_time,
+       last_error,
+       request_count,
+       success_count,
+       failure_count,
+       last_used,
+       updated_at
+     ) VALUES (
+       $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, now()
+     )
+     ON CONFLICT (key_hash)
+     DO UPDATE SET
+       key_preview = EXCLUDED.key_preview,
+       env_name = EXCLUDED.env_name,
+       tier = EXCLUDED.tier,
+       status = EXCLUDED.status,
+       exhausted_at = EXCLUDED.exhausted_at,
+       recovery_time = EXCLUDED.recovery_time,
+       last_error = EXCLUDED.last_error,
+       request_count = EXCLUDED.request_count,
+       success_count = EXCLUDED.success_count,
+       failure_count = EXCLUDED.failure_count,
+       last_used = EXCLUDED.last_used,
+       updated_at = now()`,
+    [
+      getKeyHash(apiKey),
+      keyPreview,
+      meta.envName || null,
+      meta.tier || KEY_TIERS.FREE,
+      status.status || "active",
+      status.exhaustedAt || null,
+      status.recoveryTime || null,
+      status.lastError || null,
+      status.requestCount || 0,
+      status.successCount || 0,
+      status.failureCount || 0,
+      status.lastUsed || null,
+    ],
+  );
+}
+
+function queuePersistKeyState(apiKey) {
+  void persistSingleKeyState(apiKey).catch((err) => {
+    // DB persistence must never block OCR processing.
+    console.warn("⚠️ Failed to persist Gemini key status:", err.message);
+  });
+}
+
+export async function persistAllApiKeyStates() {
+  if (API_KEYS.length === 0) return;
+
+  await Promise.all(
+    API_KEYS.map((key) =>
+      persistSingleKeyState(key).catch((err) => {
+        console.warn(
+          `⚠️ Failed to persist key state for ${key.slice(0, 10)}...: ${err.message}`,
+        );
+      }),
+    ),
+  );
+}
+
+function hydrateKeyStatusesFromDb() {
+  if (keyStateHydrationPromise) return keyStateHydrationPromise;
+
+  keyStateHydrationPromise = (async () => {
+    if (API_KEYS.length === 0) return;
+
+    const hashToKey = new Map(API_KEYS.map((key) => [getKeyHash(key), key]));
+    const hashes = [...hashToKey.keys()];
+
+    try {
+      const res = await query(
+        `SELECT key_hash, status, exhausted_at, recovery_time, last_error,
+                request_count, success_count, failure_count, last_used
+         FROM ${KEY_STATE_TABLE}
+         WHERE key_hash = ANY($1::text[])`,
+        [hashes],
+      );
+
+      const now = Date.now();
+      let restored = 0;
+
+      for (const row of res.rows) {
+        const apiKey = hashToKey.get(row.key_hash);
+        if (!apiKey) continue;
+
+        const existing = apiKeyStatus.get(apiKey);
+        if (!existing) continue;
+
+        const recoveryMs = row.recovery_time
+          ? new Date(row.recovery_time).getTime()
+          : null;
+        const canRecoverNow = recoveryMs !== null && recoveryMs <= now;
+
+        const nextStatus =
+          (row.status === "rate_limited" || row.status === "exhausted") &&
+          !canRecoverNow
+            ? row.status
+            : "active";
+
+        apiKeyStatus.set(apiKey, {
+          ...existing,
+          status: nextStatus,
+          exhaustedAt: row.exhausted_at || null,
+          recoveryTime:
+            nextStatus === "active" ? null : row.recovery_time || null,
+          lastError: nextStatus === "active" ? null : row.last_error || null,
+          requestCount: row.request_count || 0,
+          successCount: row.success_count || 0,
+          failureCount: row.failure_count || 0,
+          lastUsed: row.last_used || null,
+        });
+
+        restored++;
+      }
+
+      if (restored > 0) {
+        console.log(`💾 Restored ${restored} Gemini key states from database`);
+      }
+    } catch (err) {
+      // First run may happen before DB migration creates the table.
+      console.warn("⚠️ Gemini key state hydration skipped:", err.message);
+    }
+  })();
+
+  return keyStateHydrationPromise;
+}
 
 /**
  * Load API keys from environment variables.
@@ -156,11 +390,54 @@ export function initializeKeyStatus() {
   console.log(
     `🚀 Initialized ${API_KEYS.length} API engines for parallel processing`,
   );
+
+  keyStateHydrationPromise = null;
+  void hydrateKeyStatusesFromDb().then(() => {
+    void runStartupApiKeyAssessment().catch((err) => {
+      console.warn("⚠️ Startup key assessment failed:", err.message);
+    });
+  });
+
   return API_KEYS.length;
 }
 
 function getKeyTier(apiKey) {
   return keyMetaByApiKey.get(apiKey)?.tier || KEY_TIERS.FREE;
+}
+
+export function getAllowedDispatchModes() {
+  return Object.values(DISPATCH_MODES);
+}
+
+function normalizeDispatchMode(mode) {
+  const normalized = String(mode || "")
+    .trim()
+    .toLowerCase();
+  if (getAllowedDispatchModes().includes(normalized)) {
+    return normalized;
+  }
+  return null;
+}
+
+function resolveDispatchMode(modeOverride) {
+  const normalized = normalizeDispatchMode(modeOverride);
+  if (normalized) return normalized;
+  return globalDispatchMode;
+}
+
+export function getGlobalDispatchMode() {
+  return globalDispatchMode;
+}
+
+export function setGlobalDispatchMode(mode) {
+  const normalized = normalizeDispatchMode(mode);
+  if (!normalized) {
+    throw new Error(
+      `Invalid dispatch mode. Allowed: ${getAllowedDispatchModes().join(", ")}`,
+    );
+  }
+  globalDispatchMode = normalized;
+  return globalDispatchMode;
 }
 
 function getTierBreakdown() {
@@ -199,15 +476,21 @@ function getTierBreakdown() {
   return pools;
 }
 
-function getActiveDispatchTier() {
+function getActiveDispatchTier(modeOverride = null) {
   const pools = getTierBreakdown();
+  const mode = resolveDispatchMode(modeOverride);
+
+  if (mode === DISPATCH_MODES.FREE_ONLY) return KEY_TIERS.FREE;
+  if (mode === DISPATCH_MODES.PAID_ONLY) return KEY_TIERS.PAID;
+
   if (pools.free.available > 0 || pools.free.active > 0) return KEY_TIERS.FREE;
   if (pools.paid.available > 0 || pools.paid.active > 0) return KEY_TIERS.PAID;
   return KEY_TIERS.FREE;
 }
 
-function getDispatchEngines(availableOnly = false) {
+function getDispatchEngines(availableOnly = false, options = {}) {
   tryRecoverExhaustedKeys();
+  const mode = resolveDispatchMode(options.dispatchMode);
 
   const activeEngines = [];
   engines.forEach((engine, index) => {
@@ -222,7 +505,16 @@ function getDispatchEngines(availableOnly = false) {
   const freeEngines = activeEngines.filter(
     (engine) => engine.tier === KEY_TIERS.FREE,
   );
+  const paidEngines = activeEngines.filter(
+    (engine) => engine.tier === KEY_TIERS.PAID,
+  );
+
+  if (mode === DISPATCH_MODES.FREE_ONLY) return freeEngines;
+  if (mode === DISPATCH_MODES.PAID_ONLY) return paidEngines;
+
   if (freeEngines.length > 0) return freeEngines;
+
+  if (paidEngines.length > 0) return paidEngines;
 
   return activeEngines;
 }
@@ -277,6 +569,16 @@ function isQuotaExhaustedError(statusCode, errorText) {
   return { permanent: false, temporary: false };
 }
 
+function computeRateLimitDelayMs(status) {
+  const failures = Math.max(Number(status?.failureCount || 0), 0);
+  const multiplier = Math.min(1 + failures, 6);
+  const nextDelay = RATE_LIMIT_BASE_DELAY_MS * multiplier;
+  return Math.max(
+    RATE_LIMIT_BASE_DELAY_MS,
+    Math.min(nextDelay, RATE_LIMIT_MAX_DELAY_MS),
+  );
+}
+
 /**
  * Mark an API key as rate limited (temporary) or exhausted (permanent)
  */
@@ -284,24 +586,26 @@ function markKeyRateLimited(apiKey, errorMessage, isPermanent = false) {
   const status = apiKeyStatus.get(apiKey);
   if (status) {
     if (isPermanent) {
-      // Permanent exhaustion - don't auto-recover
+      // Daily quota exhaustion - recover after next configured reset window.
+      const recoveryTime = nextQuotaResetTimeIso();
       apiKeyStatus.set(apiKey, {
         ...status,
         status: "exhausted",
         exhaustedAt: new Date().toISOString(),
         lastError: errorMessage,
-        recoveryTime: null, // Manual reset required
+        recoveryTime,
         failureCount: (status.failureCount || 0) + 1,
       });
       console.log(
         `❌ API Key ${apiKey.slice(
           0,
           10,
-        )}... PERMANENTLY EXHAUSTED (daily quota reached)`,
+        )}... EXHAUSTED (daily quota reached, retry after ${recoveryTime})`,
       );
     } else {
-      // Temporary rate limit - recover after 15 seconds (shorter for different projects)
-      const recoveryTime = new Date(Date.now() + 15000).toISOString();
+      // Adaptive cooldown avoids hammering temporarily blocked keys repeatedly.
+      const delayMs = computeRateLimitDelayMs(status);
+      const recoveryTime = new Date(Date.now() + delayMs).toISOString();
       apiKeyStatus.set(apiKey, {
         ...status,
         status: "rate_limited",
@@ -313,15 +617,176 @@ function markKeyRateLimited(apiKey, errorMessage, isPermanent = false) {
         `⏳ API Key ${apiKey.slice(
           0,
           10,
-        )}... rate limited (will retry after 15s)`,
+        )}... rate limited (will retry after ${Math.ceil(delayMs / 1000)}s)`,
       );
     }
+
+    queuePersistKeyState(apiKey);
   }
 }
 
 // Keep the old function name for backward compatibility
 function markKeyExhausted(apiKey, errorMessage) {
   markKeyRateLimited(apiKey, errorMessage, true);
+}
+
+async function assessSingleApiKeyAtStartup(apiKey) {
+  const status = apiKeyStatus.get(apiKey);
+  if (!status) return { apiKey, checked: false, reason: "missing-status" };
+
+  // Respect persisted cooldown/exhaustion instead of forcing immediate probe.
+  if (
+    (status.status === "rate_limited" || status.status === "exhausted") &&
+    status.recoveryTime &&
+    Date.now() < new Date(status.recoveryTime).getTime()
+  ) {
+    return {
+      apiKey,
+      checked: false,
+      reason: `${status.status}-until-${status.recoveryTime}`,
+    };
+  }
+
+  const controller = new AbortController();
+  const timeout = setTimeout(
+    () => controller.abort(),
+    STARTUP_KEY_CHECK_TIMEOUT_MS,
+  );
+
+  try {
+    const probePayload = {
+      contents: [{ parts: [{ text: "ping" }] }],
+      generationConfig: { maxOutputTokens: 1, temperature: 0 },
+    };
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+
+    const response = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(probePayload),
+      signal: controller.signal,
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      const quota = isQuotaExhaustedError(response.status, errorText);
+
+      if (quota.permanent) {
+        markKeyExhausted(
+          apiKey,
+          `startup-check status ${response.status}: ${errorText.slice(0, 180)}`,
+        );
+        return { apiKey, checked: true, status: "exhausted" };
+      }
+
+      if (quota.temporary) {
+        markKeyRateLimited(
+          apiKey,
+          `startup-check status ${response.status}: ${errorText.slice(0, 180)}`,
+          false,
+        );
+        return { apiKey, checked: true, status: "rate_limited" };
+      }
+
+      return {
+        apiKey,
+        checked: true,
+        status: "active",
+        note: `non-quota error ignored (${response.status})`,
+      };
+    }
+
+    const current = apiKeyStatus.get(apiKey) || status;
+    apiKeyStatus.set(apiKey, {
+      ...current,
+      status: "active",
+      exhaustedAt: null,
+      lastError: null,
+      recoveryTime: null,
+    });
+    queuePersistKeyState(apiKey);
+
+    return { apiKey, checked: true, status: "active" };
+  } catch (error) {
+    if (error?.name === "AbortError") {
+      markKeyRateLimited(apiKey, "startup-check timeout", false);
+      return { apiKey, checked: true, status: "rate_limited", note: "timeout" };
+    }
+
+    return {
+      apiKey,
+      checked: true,
+      status: "active",
+      note: `startup-check skipped: ${error.message}`,
+    };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+export async function runStartupApiKeyAssessment() {
+  if (!STARTUP_KEY_CHECK_ENABLED) {
+    return {
+      skipped: true,
+      reason: "GEMINI_STARTUP_KEY_CHECK=false",
+      status: getApiKeyStatuses(),
+    };
+  }
+
+  if (startupAssessmentPromise) {
+    return startupAssessmentPromise;
+  }
+
+  startupAssessmentPromise = (async () => {
+    if (API_KEYS.length === 0) {
+      return {
+        skipped: true,
+        reason: "no-api-keys",
+        status: getApiKeyStatuses(),
+      };
+    }
+
+    await hydrateKeyStatusesFromDb();
+
+    const queue = [...API_KEYS];
+    const checks = [];
+    const workers = Array.from(
+      { length: Math.min(STARTUP_KEY_CHECK_CONCURRENCY, queue.length) },
+      async () => {
+        while (queue.length) {
+          const key = queue.shift();
+          if (!key) break;
+          const result = await assessSingleApiKeyAtStartup(key);
+          checks.push(result);
+        }
+      },
+    );
+
+    await Promise.all(workers);
+    await persistAllApiKeyStates();
+
+    const status = getApiKeyStatuses();
+    const summary = {
+      checked: checks.filter((c) => c.checked).length,
+      skipped: checks.filter((c) => !c.checked).length,
+      activeDispatchTier: status.activeDispatchTier,
+      freeAvailable: status.pools?.free?.available || 0,
+      paidAvailable: status.pools?.paid?.available || 0,
+      allExhausted: status.allExhausted,
+    };
+
+    console.log(
+      `🧪 Startup Gemini key assessment complete: checked=${summary.checked}, skipped=${summary.skipped}, dispatch=${summary.activeDispatchTier}, freeAvailable=${summary.freeAvailable}, paidAvailable=${summary.paidAvailable}`,
+    );
+
+    return { skipped: false, checks, summary, status };
+  })();
+
+  try {
+    return await startupAssessmentPromise;
+  } finally {
+    startupAssessmentPromise = null;
+  }
 }
 
 /**
@@ -333,23 +798,27 @@ function tryRecoverExhaustedKeys() {
 
   API_KEYS.forEach((key) => {
     const status = apiKeyStatus.get(key);
-    // Recover rate_limited keys (temporary) after their recovery time
-    if (status?.status === "rate_limited" && status.recoveryTime) {
+    // Recover keys after recovery time (rate_limited or exhausted daily quota).
+    if (
+      (status?.status === "rate_limited" || status?.status === "exhausted") &&
+      status.recoveryTime
+    ) {
       const recoveryTime = new Date(status.recoveryTime);
       if (now >= recoveryTime) {
         apiKeyStatus.set(key, {
           ...status,
           status: "active",
+          exhaustedAt: null,
           lastError: null,
           recoveryTime: null,
         });
         console.log(
-          `✅ API Key ${key.slice(0, 10)}... recovered from rate limit`,
+          `✅ API Key ${key.slice(0, 10)}... recovered and returned to active`,
         );
+        queuePersistKeyState(key);
         recoveredCount++;
       }
     }
-    // Note: "exhausted" keys (permanent) don't auto-recover
   });
 
   return recoveredCount;
@@ -371,8 +840,8 @@ function getActiveKeys() {
 /**
  * Get available engines for parallel processing
  */
-export function getAvailableEngines() {
-  return getDispatchEngines(true);
+export function getAvailableEngines(options = {}) {
+  return getDispatchEngines(true, options);
 }
 
 /**
@@ -420,19 +889,28 @@ function getSoonestRecoveryWaitMs(defaultWaitMs = 15000) {
 /**
  * Get the current active API key (first one that's still active)
  */
-export function getCurrentApiKey() {
+export function getCurrentApiKey(options = {}) {
   if (API_KEYS.length === 0) {
     initializeKeyStatus();
   }
 
   tryRecoverExhaustedKeys();
 
-  const dispatchTier = getActiveDispatchTier();
+  const dispatchMode = resolveDispatchMode(options.dispatchMode);
+  const dispatchTier = getActiveDispatchTier(dispatchMode);
   let activeKey = API_KEYS.find(
     (key) =>
       apiKeyStatus.get(key)?.status === "active" &&
       getKeyTier(key) === dispatchTier,
   );
+
+  if (dispatchMode === DISPATCH_MODES.FREE_ONLY) {
+    return activeKey || null;
+  }
+
+  if (dispatchMode === DISPATCH_MODES.PAID_ONLY) {
+    return activeKey || null;
+  }
 
   // If the preferred pool is not available, use any active key.
   if (!activeKey) {
@@ -447,12 +925,13 @@ export function getCurrentApiKey() {
 /**
  * Get status of all API keys with enhanced metrics
  */
-export function getApiKeyStatuses() {
+export function getApiKeyStatuses(options = {}) {
   if (API_KEYS.length === 0) {
     initializeKeyStatus();
   }
 
   tryRecoverExhaustedKeys();
+  const dispatchMode = resolveDispatchMode(options.dispatchMode);
 
   const statuses = API_KEYS.map((key, index) => {
     const status = apiKeyStatus.get(key) || {
@@ -497,7 +976,7 @@ export function getApiKeyStatuses() {
   ).length;
   const busyCount = statuses.filter((s) => s.busy).length;
   const pools = getTierBreakdown();
-  const dispatchTier = getActiveDispatchTier();
+  const dispatchTier = getActiveDispatchTier(dispatchMode);
 
   return {
     totalEngines: API_KEYS.length,
@@ -506,6 +985,7 @@ export function getApiKeyStatuses() {
     exhaustedEngines: exhaustedCount,
     busyEngines: busyCount,
     availableEngines: activeCount - busyCount,
+    configuredDispatchMode: dispatchMode,
     activeDispatchTier: dispatchTier,
     pools,
     allExhausted: activeCount === 0 && rateLimitedCount === 0, // Only exhausted when no active and no rate-limited
@@ -518,6 +998,7 @@ export function getApiKeyStatuses() {
  */
 export function resetAllApiKeys() {
   initializeKeyStatus();
+  API_KEYS.forEach((key) => queuePersistKeyState(key));
   console.log(
     `🔄 All ${API_KEYS.length} API engines have been reset to active status`,
   );
@@ -607,6 +1088,7 @@ IMPORTANT:
       requestCount: (status.requestCount || 0) + 1,
       lastUsed: new Date().toISOString(),
     });
+    queuePersistKeyState(apiKey);
 
     console.log(
       `🔧 Engine ${engineIndex + 1} processing: ${path.basename(filePath)}`,
@@ -659,6 +1141,7 @@ IMPORTANT:
       ...currentStatus,
       successCount: (currentStatus.successCount || 0) + 1,
     });
+    queuePersistKeyState(apiKey);
 
     engine.totalProcessed++;
     engine.busy = false;
@@ -709,6 +1192,7 @@ export async function processPagesBatch(
   pagePaths,
   startIndex = 0,
   onProgress = null,
+  options = {},
 ) {
   const results = [];
   const errors = [];
@@ -716,7 +1200,7 @@ export async function processPagesBatch(
   // FAST processing - each key is from a different project with independent limits
   // 2-3 seconds between requests PER ENGINE is enough with different projects
   const PER_ENGINE_DELAY = parseInt(process.env.GEMINI_PAGE_DELAY_MS) || 2000; // 2 seconds per engine
-  const RATE_LIMIT_WAIT = 15000; // 15 seconds when rate limited (shorter since different projects)
+  const RATE_LIMIT_WAIT = RATE_LIMIT_BASE_DELAY_MS;
   const MAX_RETRIES_PER_PAGE = Math.max(
     parseInt(process.env.GEMINI_MAX_RETRIES_PER_PAGE || "8", 10),
     3,
@@ -727,11 +1211,12 @@ export async function processPagesBatch(
   );
 
   // Select dispatch pool (free first, paid fallback).
-  const dispatchPool = getDispatchEngines(false);
+  const dispatchMode = resolveDispatchMode(options.dispatchMode);
+  const dispatchPool = getDispatchEngines(false, { dispatchMode });
   const totalEngines = dispatchPool.length || engines.size;
-  const dispatchTier = getActiveDispatchTier();
+  const dispatchTier = getActiveDispatchTier(dispatchMode);
   console.log(
-    `🚀 Starting PARALLEL processing of ${pagePaths.length} pages with ${totalEngines} engines (tier: ${dispatchTier})...`,
+    `🚀 Starting PARALLEL processing of ${pagePaths.length} pages with ${totalEngines} engines (tier: ${dispatchTier}, mode: ${dispatchMode})...`,
   );
   console.log(
     `⚡ Using ${
@@ -793,7 +1278,9 @@ export async function processPagesBatch(
           assignedEngineRef.busy ||
           assignedStatus?.status !== "active"
         ) {
-          const availableDispatchEngines = getDispatchEngines(true);
+          const availableDispatchEngines = getDispatchEngines(true, {
+            dispatchMode,
+          });
           if (availableDispatchEngines.length > 0) {
             availableDispatchEngines.sort((a, b) => {
               const statusA = apiKeyStatus.get(a.apiKey);
@@ -893,12 +1380,19 @@ export async function processPagesBatch(
           lastError = err.message;
 
           if (err.message.includes("ENGINE_RATE_LIMITED")) {
+            const status = apiKeyStatus.get(engine.apiKey);
+            const waitMs = status?.recoveryTime
+              ? Math.max(
+                  0,
+                  new Date(status.recoveryTime).getTime() - Date.now(),
+                )
+              : RATE_LIMIT_WAIT;
             console.log(
-              `⚠️ Engine ${useEngineIndex + 1} rate limited, waiting ${
-                RATE_LIMIT_WAIT / 1000
-              }s...`,
+              `⚠️ Engine ${useEngineIndex + 1} rate limited, waiting ${Math.ceil(
+                waitMs / 1000,
+              )}s...`,
             );
-            await staggeredDelay(RATE_LIMIT_WAIT);
+            await staggeredDelay(Math.max(waitMs, 500));
           } else if (err.message.includes("ENGINE_EXHAUSTED")) {
             console.log(
               `❌ Engine ${useEngineIndex + 1} exhausted, trying another...`,
@@ -978,10 +1472,14 @@ export async function processPagesBatch(
 /**
  * Classify religion based on names using Gemini API with engine rotation
  */
-export async function classifyReligionByNames(voters, apiKeyFromRequest) {
+export async function classifyReligionByNames(
+  voters,
+  apiKeyFromRequest,
+  options = {},
+) {
   if (!voters || voters.length === 0) return { religions: [], keyUsed: null };
 
-  let apiKeyToUse = getCurrentApiKey();
+  let apiKeyToUse = getCurrentApiKey(options);
 
   if (!apiKeyToUse) {
     apiKeyToUse = apiKeyFromRequest || process.env.GEMINI_API_KEY;
@@ -1043,12 +1541,27 @@ Respond with ONLY the JSON array, no explanation.`;
       if (!res.ok) {
         const errorText = await res.text();
 
-        if (isQuotaExhaustedError(res.status, errorText)) {
+        const quotaError = isQuotaExhaustedError(res.status, errorText);
+        if (quotaError.permanent) {
           markKeyExhausted(
             apiKeyToUse,
             `Status ${res.status}: ${errorText.slice(0, 200)}`,
           );
-          const nextKey = getCurrentApiKey();
+          const nextKey = getCurrentApiKey(options);
+
+          if (nextKey && nextKey !== apiKeyToUse) {
+            apiKeyToUse = nextKey;
+            continue;
+          }
+        }
+
+        if (quotaError.temporary) {
+          markKeyRateLimited(
+            apiKeyToUse,
+            `Status ${res.status}: ${errorText.slice(0, 200)}`,
+            false,
+          );
+          const nextKey = getCurrentApiKey(options);
 
           if (nextKey && nextKey !== apiKeyToUse) {
             apiKeyToUse = nextKey;
@@ -1090,7 +1603,7 @@ Respond with ONLY the JSON array, no explanation.`;
       return { religions: voters.map(() => "Other"), keyUsed: apiKeyToUse };
     } catch (err) {
       console.error("Religion classification attempt failed:", err.message);
-      const nextKey = getCurrentApiKey();
+      const nextKey = getCurrentApiKey(options);
       if (nextKey && nextKey !== apiKeyToUse && attempt < maxRetries - 1) {
         apiKeyToUse = nextKey;
         continue;
@@ -1195,12 +1708,23 @@ No prose - ONLY valid JSON.`,
 
   if (!res.ok) {
     const errorText = await res.text();
-    if (isQuotaExhaustedError(res.status, errorText)) {
+    const quotaError = isQuotaExhaustedError(res.status, errorText);
+    if (quotaError.permanent) {
       markKeyExhausted(
         apiKeyToUse,
         `Status ${res.status}: ${errorText.slice(0, 200)}`,
       );
       throw new Error("ALL_KEYS_EXHAUSTED: API key exhausted");
+    }
+    if (quotaError.temporary) {
+      markKeyRateLimited(
+        apiKeyToUse,
+        `Status ${res.status}: ${errorText.slice(0, 200)}`,
+        false,
+      );
+      throw new Error(
+        "ALL_KEYS_RATE_LIMITED: API key temporarily rate limited",
+      );
     }
     throw new Error(`Gemini error ${res.status}: ${errorText}`);
   }
@@ -1280,8 +1804,14 @@ Respond in this JSON format:
 
       if (!res.ok) {
         const errorText = await res.text();
-        if (isQuotaExhaustedError(res.status, errorText)) {
+        const quotaError = isQuotaExhaustedError(res.status, errorText);
+        if (quotaError.permanent) {
           markKeyExhausted(apiKeyToUse, errorText.slice(0, 200));
+          apiKeyToUse = getCurrentApiKey();
+          if (apiKeyToUse) continue;
+        }
+        if (quotaError.temporary) {
+          markKeyRateLimited(apiKeyToUse, errorText.slice(0, 200), false);
           apiKeyToUse = getCurrentApiKey();
           if (apiKeyToUse) continue;
         }

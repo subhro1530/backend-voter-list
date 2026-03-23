@@ -4,7 +4,7 @@
   "type": "module",
   "scripts": {
     "dev": "node src/server.js",
-    "start": "node scripts/initDb.js && node src/server.js",
+    "start": "node scripts/initDb.js && node scripts/checkGeminiKeysOnStartup.js && node src/server.js",
     "db:init": "node scripts/initDb.js",
     "create-admin": "node scripts/createAdmin.js",
     "voterslip:calibrate": "node scripts/calibrateVoterSlipLayout.js"
