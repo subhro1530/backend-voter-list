@@ -41,6 +41,12 @@ import {
   getVoterSlipCalibrationStatePath,
   getVoterSlipManualProfilesPath,
 } from "../voterSlipCalibrationStore.js";
+import {
+  buildPaginationMeta,
+  buildVoterFilterClause,
+  parsePaginationParams,
+  VOTER_DEFAULT_ORDER_SQL,
+} from "../voterSearchFilters.js";
 
 const router = express.Router();
 const execFileAsync = promisify(execFile);
@@ -683,106 +689,38 @@ router.get("/assemblies/:assembly/parts", async (req, res) => {
 
 /**
  * Search voters across all sessions (User accessible)
- * Limited to: assembly, partNumber, section, name, voterId, relationName
+ * Supports global voter filters with pagination.
  * Does NOT expose session information to users
  */
 router.get("/voters/search", async (req, res) => {
   try {
-    const {
-      name,
-      voterId,
-      assembly,
-      partNumber,
-      section,
-      relationName,
-      page = 1,
-      limit = 50,
-    } = req.query;
-
-    // At least one search parameter is required
-    if (
-      !name &&
-      !voterId &&
-      !assembly &&
-      !partNumber &&
-      !section &&
-      !relationName
-    ) {
-      return res.status(400).json({
-        error: "At least one search parameter is required",
-        hint: "Use: name, voterId, assembly, partNumber, section, or relationName",
-      });
-    }
-
-    const where = [];
-    const values = [];
-    let idx = 1;
-
-    if (name) {
-      where.push(`LOWER(name) LIKE $${idx}`);
-      values.push(`%${name.toLowerCase()}%`);
-      idx++;
-    }
-
-    if (voterId) {
-      where.push(`voter_id = $${idx}`);
-      values.push(voterId);
-      idx++;
-    }
-
-    if (assembly) {
-      where.push(`LOWER(assembly) LIKE $${idx}`);
-      values.push(`%${assembly.toLowerCase()}%`);
-      idx++;
-    }
-
-    if (partNumber) {
-      where.push(`part_number = $${idx}`);
-      values.push(partNumber);
-      idx++;
-    }
-
-    if (section) {
-      where.push(`LOWER(section) LIKE $${idx}`);
-      values.push(`%${section.toLowerCase()}%`);
-      idx++;
-    }
-
-    if (relationName) {
-      where.push(`LOWER(relation_name) LIKE $${idx}`);
-      values.push(`%${relationName.toLowerCase()}%`);
-      idx++;
-    }
-
+    const { page, limit, offset } = parsePaginationParams(req.query, {
+      defaultPage: 1,
+      defaultLimit: 50,
+      maxLimit: 200,
+    });
+    const { where, values, nextIndex } = buildVoterFilterClause(req.query, {
+      startIndex: 1,
+    });
     const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : "";
-    const offset = (parseInt(page) - 1) * parseInt(limit);
 
-    // Count total results
     const countSql = `SELECT COUNT(*)::int as total FROM session_voters ${whereSql}`;
     const countResult = await query(countSql, values);
     const total = countResult.rows[0].total;
 
-    // Get paginated results - only expose necessary fields to users
     const sql = `
       SELECT id, assembly, part_number, section, serial_number, voter_id, name, 
              relation_type, relation_name, house_number, age, gender, photo_url
       FROM session_voters
       ${whereSql}
-      ORDER BY assembly, part_number, serial_number
-      LIMIT $${idx} OFFSET $${idx + 1};
+      ORDER BY ${VOTER_DEFAULT_ORDER_SQL}
+      LIMIT $${nextIndex} OFFSET $${nextIndex + 1};
     `;
-    values.push(parseInt(limit), offset);
-
-    const result = await query(sql, values);
+    const result = await query(sql, [...values, limit, offset]);
 
     res.json({
       voters: result.rows,
-      pagination: {
-        page: parseInt(page),
-        limit: parseInt(limit),
-        total,
-        totalPages: Math.ceil(total / parseInt(limit)),
-      },
+      pagination: buildPaginationMeta({ page, limit, total }),
     });
   } catch (err) {
     res.status(500).json({ error: err.message });

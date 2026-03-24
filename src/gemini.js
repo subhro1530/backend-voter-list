@@ -49,6 +49,10 @@ const STARTUP_KEY_CHECK_TIMEOUT_MS = Math.max(
   ),
   3000,
 );
+const ALLOW_PAID_FALLBACK_IN_AUTO =
+  String(process.env.GEMINI_ALLOW_PAID_FALLBACK || "false")
+    .trim()
+    .toLowerCase() === "true";
 
 let globalDispatchMode = (() => {
   const raw = String(process.env.GEMINI_DISPATCH_MODE || "auto")
@@ -425,6 +429,13 @@ function resolveDispatchMode(modeOverride) {
   return globalDispatchMode;
 }
 
+function isPaidAllowedForDispatchMode(modeOverride = null) {
+  const mode = resolveDispatchMode(modeOverride);
+  if (mode === DISPATCH_MODES.PAID_ONLY) return true;
+  if (mode === DISPATCH_MODES.FREE_ONLY) return false;
+  return ALLOW_PAID_FALLBACK_IN_AUTO;
+}
+
 export function getGlobalDispatchMode() {
   return globalDispatchMode;
 }
@@ -479,18 +490,22 @@ function getTierBreakdown() {
 function getActiveDispatchTier(modeOverride = null) {
   const pools = getTierBreakdown();
   const mode = resolveDispatchMode(modeOverride);
+  const allowPaid = isPaidAllowedForDispatchMode(mode);
 
   if (mode === DISPATCH_MODES.FREE_ONLY) return KEY_TIERS.FREE;
   if (mode === DISPATCH_MODES.PAID_ONLY) return KEY_TIERS.PAID;
 
   if (pools.free.available > 0 || pools.free.active > 0) return KEY_TIERS.FREE;
-  if (pools.paid.available > 0 || pools.paid.active > 0) return KEY_TIERS.PAID;
+  if (allowPaid && (pools.paid.available > 0 || pools.paid.active > 0)) {
+    return KEY_TIERS.PAID;
+  }
   return KEY_TIERS.FREE;
 }
 
 function getDispatchEngines(availableOnly = false, options = {}) {
   tryRecoverExhaustedKeys();
   const mode = resolveDispatchMode(options.dispatchMode);
+  const allowPaid = isPaidAllowedForDispatchMode(mode);
 
   const activeEngines = [];
   engines.forEach((engine, index) => {
@@ -514,9 +529,9 @@ function getDispatchEngines(availableOnly = false, options = {}) {
 
   if (freeEngines.length > 0) return freeEngines;
 
-  if (paidEngines.length > 0) return paidEngines;
+  if (allowPaid && paidEngines.length > 0) return paidEngines;
 
-  return activeEngines;
+  return [];
 }
 
 // Initialize all keys as active on startup
@@ -897,6 +912,7 @@ export function getCurrentApiKey(options = {}) {
   tryRecoverExhaustedKeys();
 
   const dispatchMode = resolveDispatchMode(options.dispatchMode);
+  const allowPaid = isPaidAllowedForDispatchMode(dispatchMode);
   const dispatchTier = getActiveDispatchTier(dispatchMode);
   let activeKey = API_KEYS.find(
     (key) =>
@@ -913,7 +929,7 @@ export function getCurrentApiKey(options = {}) {
   }
 
   // If the preferred pool is not available, use any active key.
-  if (!activeKey) {
+  if (!activeKey && allowPaid) {
     activeKey = API_KEYS.find(
       (key) => apiKeyStatus.get(key)?.status === "active",
     );
@@ -932,6 +948,7 @@ export function getApiKeyStatuses(options = {}) {
 
   tryRecoverExhaustedKeys();
   const dispatchMode = resolveDispatchMode(options.dispatchMode);
+  const allowPaid = isPaidAllowedForDispatchMode(dispatchMode);
 
   const statuses = API_KEYS.map((key, index) => {
     const status = apiKeyStatus.get(key) || {
@@ -986,6 +1003,8 @@ export function getApiKeyStatuses(options = {}) {
     busyEngines: busyCount,
     availableEngines: activeCount - busyCount,
     configuredDispatchMode: dispatchMode,
+    paidFallbackEnabledInAuto: ALLOW_PAID_FALLBACK_IN_AUTO,
+    paidAllowedForCurrentMode: allowPaid,
     activeDispatchTier: dispatchTier,
     pools,
     allExhausted: activeCount === 0 && rateLimitedCount === 0, // Only exhausted when no active and no rate-limited
@@ -1211,8 +1230,40 @@ export async function processPagesBatch(
   // Select dispatch pool (free first, paid fallback).
   const dispatchMode = resolveDispatchMode(options.dispatchMode);
   const dispatchPool = getDispatchEngines(false, { dispatchMode });
-  const totalEngines = dispatchPool.length || engines.size;
+  const totalEngines = dispatchPool.length;
   const dispatchTier = getActiveDispatchTier(dispatchMode);
+
+  if (totalEngines === 0) {
+    const status = getApiKeyStatuses({ dispatchMode });
+    const noFreeAvailable = (status.pools?.free?.active || 0) === 0;
+    const paidBlocked =
+      dispatchMode === DISPATCH_MODES.AUTO &&
+      !status.paidAllowedForCurrentMode &&
+      (status.pools?.paid?.active || 0) > 0;
+
+    const reason = paidBlocked
+      ? "Free pool unavailable and paid fallback is disabled (GEMINI_ALLOW_PAID_FALLBACK=false)."
+      : noFreeAvailable
+        ? "No active engines available in selected dispatch mode."
+        : "No engines available for processing.";
+
+    return {
+      results: [],
+      errors: pagePaths.map((pagePath, index) => ({
+        success: false,
+        pageIndex: startIndex + index,
+        error: reason,
+        pagePath,
+        canRetryLater: true,
+      })),
+      processedCount: 0,
+      errorCount: pagePaths.length,
+      totalCount: pagePaths.length,
+      allKeysExhausted: status.allExhausted,
+      blockedByCostGuard: paidBlocked,
+    };
+  }
+
   console.log(
     `🚀 Starting PARALLEL processing of ${pagePaths.length} pages with ${totalEngines} engines (tier: ${dispatchTier}, mode: ${dispatchMode})...`,
   );

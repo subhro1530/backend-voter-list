@@ -41,6 +41,12 @@ import {
   normalizeAssemblyName,
   assemblyLooksRelated,
 } from "./boothLinking.js";
+import {
+  buildPaginationMeta,
+  buildVoterFilterClause,
+  parsePaginationParams,
+  VOTER_DEFAULT_ORDER_SQL,
+} from "./voterSearchFilters.js";
 
 /**
  * Sanitize voter ID: if it contains slashes (like WB/01/003/000070) it's
@@ -632,62 +638,7 @@ async function processUploadedSessionFile({
 }
 
 function buildVoterFilter(params, startIndex = 1) {
-  const where = [];
-  const values = [];
-  let idx = startIndex;
-
-  if (params.sessionId) {
-    where.push(`session_id = $${idx}`);
-    values.push(params.sessionId);
-    idx += 1;
-  }
-
-  const maybeAdd = (field, column, comparator = "=") => {
-    if (field !== undefined && field !== "") {
-      where.push(`${column} ${comparator} $${idx}`);
-      values.push(field);
-      idx += 1;
-    }
-  };
-
-  if (params.name) {
-    where.push(`LOWER(name) LIKE $${idx}`);
-    values.push(`%${params.name.toLowerCase()}%`);
-    idx += 1;
-  }
-
-  maybeAdd(params.voterId, "voter_id");
-  maybeAdd(
-    params.gender ? params.gender.toLowerCase() : undefined,
-    "LOWER(gender)",
-    "=",
-  );
-  maybeAdd(params.houseNumber, "house_number");
-  maybeAdd(params.relationType, "relation_type");
-  maybeAdd(params.partNumber, "part_number");
-  maybeAdd(params.section, "section");
-  maybeAdd(params.assembly, "assembly");
-  maybeAdd(params.serialNumber, "serial_number");
-  maybeAdd(params.religion, "religion");
-
-  if (params.minAge !== undefined && params.minAge !== "") {
-    const val = Number(params.minAge);
-    if (!Number.isNaN(val)) {
-      where.push(`age >= $${idx}`);
-      values.push(val);
-      idx += 1;
-    }
-  }
-  if (params.maxAge !== undefined && params.maxAge !== "") {
-    const val = Number(params.maxAge);
-    if (!Number.isNaN(val)) {
-      where.push(`age <= $${idx}`);
-      values.push(val);
-      idx += 1;
-    }
-  }
-
-  return { where, values };
+  return buildVoterFilterClause(params, { startIndex });
 }
 
 async function getSessionBoothMeta(sessionId) {
@@ -1105,16 +1056,33 @@ app.get("/sessions/:id/voters", authenticate, adminOnly, async (req, res) => {
     return res.status(404).json({ error: "Session not found" });
   }
 
-  const { where, values } = buildVoterFilter({ ...req.query, sessionId: id });
+  const { page, limit, offset } = parsePaginationParams(req.query, {
+    defaultPage: 1,
+    defaultLimit: 50,
+    maxLimit: 200,
+  });
+  const { where, values, nextIndex } = buildVoterFilterClause(req.query, {
+    startIndex: 1,
+    forceSessionId: id,
+  });
   const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : "";
+
+  const countSql = `SELECT COUNT(*)::int as total FROM session_voters ${whereSql}`;
+  const countResult = await query(countSql, values);
+  const total = countResult.rows[0].total;
+
   const sql = `
     SELECT page_number, assembly, part_number, section, serial_number, voter_id, name, relation_type, relation_name, house_number, age, gender, religion, photo_url, created_at
     FROM session_voters
     ${whereSql}
-    ORDER BY page_number, serial_number;
+    ORDER BY ${VOTER_DEFAULT_ORDER_SQL}
+    LIMIT $${nextIndex} OFFSET $${nextIndex + 1};
   `;
-  const result = await query(sql, values);
-  res.json({ voters: result.rows });
+  const result = await query(sql, [...values, limit, offset]);
+  res.json({
+    voters: result.rows,
+    pagination: buildPaginationMeta({ page, limit, total }),
+  });
 });
 
 // Linked election results for the same assembly + booth as this voter session
@@ -1243,17 +1211,30 @@ app.get(
 
 // Admin: Global voters search with full filtering
 app.get("/voters/search", authenticate, adminOnly, async (req, res) => {
-  const { where, values } = buildVoterFilter({ ...req.query });
+  const { page, limit, offset } = parsePaginationParams(req.query, {
+    defaultPage: 1,
+    defaultLimit: 50,
+    maxLimit: 200,
+  });
+  const { where, values, nextIndex } = buildVoterFilter({ ...req.query });
   const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : "";
+
+  const countSql = `SELECT COUNT(*)::int as total FROM session_voters ${whereSql}`;
+  const countResult = await query(countSql, values);
+  const total = countResult.rows[0].total;
+
   const sql = `
     SELECT id, session_id, page_number, assembly, part_number, section, serial_number, voter_id, name, relation_type, relation_name, house_number, age, gender, religion, is_printed, created_at
     FROM session_voters
     ${whereSql}
-    ORDER BY created_at DESC, session_id, page_number, serial_number
-    LIMIT 500;
+    ORDER BY ${VOTER_DEFAULT_ORDER_SQL}
+    LIMIT $${nextIndex} OFFSET $${nextIndex + 1};
   `;
-  const result = await query(sql, values);
-  res.json({ voters: result.rows });
+  const result = await query(sql, [...values, limit, offset]);
+  res.json({
+    voters: result.rows,
+    pagination: buildPaginationMeta({ page, limit, total }),
+  });
 });
 
 // Session religion stats - Admin only
@@ -1379,6 +1360,8 @@ app.get("/api-keys/dispatch-status", authenticate, (_req, res) => {
   const status = getApiKeyStatuses();
   res.json({
     configuredDispatchMode: status.configuredDispatchMode,
+    paidFallbackEnabledInAuto: status.paidFallbackEnabledInAuto,
+    paidAllowedForCurrentMode: status.paidAllowedForCurrentMode,
     activeDispatchTier: status.activeDispatchTier,
     paidFallbackActive: status.activeDispatchTier === "paid",
     totalEngines: status.totalEngines,

@@ -35,9 +35,11 @@ Backend API to ingest PDF voter lists, split them into per-page PDFs, process pa
      - `DATABASE_URL` (Neon connection string)
      - `GEMINI_API_KEY_1` through `GEMINI_API_KEY_7` (7 keys for parallel processing)
      - `GEMINI_MODEL` (default works)
-     - `JWT_SECRET` (change this in production!)
 
-   **7 Parallel API Engines**: Add 7 Gemini API keys for maximum parallel processing. Each key becomes an independent engine that can process pages simultaneously.
+- `GEMINI_ALLOW_PAID_FALLBACK=false` to prevent automatic paid-key usage in `auto` mode
+  - `JWT_SECRET` (change this in production!)
+
+  **7 Parallel API Engines**: Add 7 Gemini API keys for maximum parallel processing. Each key becomes an independent engine that can process pages simultaneously.
 
 3. **Initialize DB schema**
 
@@ -58,6 +60,12 @@ Backend API to ingest PDF voter lists, split them into per-page PDFs, process pa
 3. `src/server.js`
 
 This pre-marks exhausted/rate-limited keys and reduces wasteful retry cycles.
+
+## Cost Control (Recommended)
+
+- Keep `GEMINI_DISPATCH_MODE=auto` for normal operation, but set `GEMINI_ALLOW_PAID_FALLBACK=false` so paid keys are not used automatically.
+- Use `PATCH /api-keys/dispatch-mode` with `paid-only` only when you explicitly want to spend paid quota for urgent workloads.
+- Keep `OCR_ENABLE_RELIGION_CLASSIFICATION=false` unless that field is required, since it adds extra AI calls per page.
 
 ## 🤖 Chatbot
 
