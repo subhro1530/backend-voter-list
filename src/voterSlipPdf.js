@@ -16,6 +16,12 @@ const localFontPath = path.join(
   "NotoSansBengali-Regular.ttf",
 );
 
+const repoFontPath = path.join(
+  process.cwd(),
+  "fonts",
+  "NotoSansBengali-Regular.ttf",
+);
+
 let templateBytesPromise = null;
 let templateBytesPath = null;
 
@@ -91,6 +97,7 @@ function getUnicodeFontCandidates() {
 
   return [
     ...configured,
+    repoFontPath,
     localFontPath,
     "C:/Windows/Fonts/Nirmala.ttf",
     "C:/Program Files/Microsoft Office/root/vfs/Fonts/private/NIRMALA.TTF",
