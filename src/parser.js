@@ -17,6 +17,64 @@ function pullValue(pattern, source) {
   return match ? match[1].trim() : "";
 }
 
+function parseBooleanish(value) {
+  if (typeof value === "boolean") return value;
+  if (typeof value === "number") return value !== 0;
+  if (typeof value !== "string") return null;
+
+  const normalized = value.trim().toLowerCase();
+  if (!normalized) return null;
+
+  if (["true", "yes", "y", "1", "under adjudication"].includes(normalized)) {
+    return true;
+  }
+
+  if (
+    ["false", "no", "n", "0", "not under adjudication"].includes(normalized)
+  ) {
+    return false;
+  }
+
+  return null;
+}
+
+function detectAdjudicationFromText(value) {
+  if (typeof value !== "string") return false;
+  return /\badjudication\b/i.test(value);
+}
+
+function normalizeVoter(voter) {
+  const safeVoter = voter && typeof voter === "object" ? voter : {};
+
+  const explicitFlag =
+    parseBooleanish(safeVoter.underAdjudication) ??
+    parseBooleanish(safeVoter.under_adjudication) ??
+    parseBooleanish(safeVoter.isUnderAdjudication) ??
+    parseBooleanish(safeVoter.adjudication);
+
+  if (explicitFlag !== null) {
+    return {
+      ...safeVoter,
+      underAdjudication: explicitFlag,
+    };
+  }
+
+  const textSignals = [
+    safeVoter.adjudicationText,
+    safeVoter.status,
+    safeVoter.remarks,
+    safeVoter.note,
+    safeVoter.name,
+  ];
+
+  const inferred = textSignals.some(detectAdjudicationFromText);
+
+  return {
+    ...safeVoter,
+    underAdjudication: inferred,
+  };
+}
+
 function parseVoterBlock(block) {
   const serial = pullValue(/^\s*(\d+)/m, block);
   const voterId = pullValue(/\b([A-Z0-9/]{5,})\b/, block);
@@ -37,6 +95,7 @@ function parseVoterBlock(block) {
     .trim();
   const age = pullValue(/Age\s*:\s*(\d{1,3})/i, block);
   const gender = pullValue(/Gender\s*:\s*([A-Za-z]+)/i, block);
+  const underAdjudication = /\badjudication\b/i.test(block);
 
   return {
     serialNumber: serial,
@@ -47,6 +106,7 @@ function parseVoterBlock(block) {
     houseNumber,
     age,
     gender,
+    underAdjudication,
   };
 }
 
@@ -83,7 +143,9 @@ export function parseGeminiStructured(text) {
       section: parsed.section || "",
       boothName:
         parsed.boothName || parsed.booth_name || parsed.pollingStation || "",
-      voters: Array.isArray(parsed.voters) ? parsed.voters : [],
+      voters: Array.isArray(parsed.voters)
+        ? parsed.voters.map(normalizeVoter)
+        : [],
     };
   } catch (err) {
     return parseFromPlainText(text);

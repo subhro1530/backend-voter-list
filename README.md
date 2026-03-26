@@ -415,6 +415,10 @@ Template location used by voter-slip rendering:
 - `GET /voters/search` - Global voter search with all filters
 - `GET /admin/voters` - Advanced voter search with all filters
 - `GET /admin/voters/:id` - Get voter full details
+- `PATCH /sessions/:id/voters/:voterId/adjudication` - Update voter adjudication flag (`{ "underAdjudication": true|false }`)
+- `PATCH /sessions/:id/voters/adjudication` - Batch adjudication updates (`{ updates: [{ voterId, underAdjudication }] }`)
+- `PATCH /sessions/:id/voters` - Bulk voter updates (supports adjudication and editable voter fields)
+- `PATCH /sessions/:id/voters/bulk` - Alias for bulk voter updates
 
 #### Statistics
 

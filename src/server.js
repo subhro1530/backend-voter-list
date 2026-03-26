@@ -61,6 +61,166 @@ function sanitizeVoterId(rawId) {
   return trimmed;
 }
 
+function normalizeUnderAdjudication(value) {
+  if (typeof value === "boolean") return value;
+  if (typeof value === "number") return value !== 0;
+  if (typeof value !== "string") return false;
+
+  const normalized = value.trim().toLowerCase();
+  if (!normalized) return false;
+  if (["true", "yes", "y", "1", "under adjudication"].includes(normalized)) {
+    return true;
+  }
+  if (
+    ["false", "no", "n", "0", "not under adjudication"].includes(normalized)
+  ) {
+    return false;
+  }
+
+  return /\badjudication\b/i.test(value);
+}
+
+function parseVoterBulkPayload(body) {
+  if (Array.isArray(body)) return body;
+  if (Array.isArray(body?.updates)) return body.updates;
+  if (Array.isArray(body?.voters)) return body.voters;
+  if (body && typeof body === "object") {
+    if (body.voterId !== undefined || body.id !== undefined) return [body];
+  }
+  return [];
+}
+
+function toNullableText(value) {
+  if (value === undefined) return undefined;
+  if (value === null) return null;
+  const text = String(value).trim();
+  return text.length ? text : null;
+}
+
+function toNullableInt(value) {
+  if (value === undefined) return undefined;
+  if (value === null || value === "") return null;
+  const parsed = Number.parseInt(String(value), 10);
+  return Number.isNaN(parsed) ? undefined : parsed;
+}
+
+function buildAllowedVoterUpdates(
+  rawUpdate,
+  { adjudicationOnly = false } = {},
+) {
+  const candidate = rawUpdate && typeof rawUpdate === "object" ? rawUpdate : {};
+  const updates = {};
+
+  if (
+    candidate.underAdjudication !== undefined ||
+    candidate.under_adjudication !== undefined ||
+    candidate.adjudication !== undefined
+  ) {
+    updates.under_adjudication = normalizeUnderAdjudication(
+      candidate.underAdjudication ??
+        candidate.under_adjudication ??
+        candidate.adjudication,
+    );
+  }
+
+  if (adjudicationOnly) return updates;
+
+  const textFieldMap = {
+    name: "name",
+    relationType: "relation_type",
+    relation_type: "relation_type",
+    relationName: "relation_name",
+    relation_name: "relation_name",
+    houseNumber: "house_number",
+    house_number: "house_number",
+    gender: "gender",
+    religion: "religion",
+    voterId: "voter_id",
+    voter_id: "voter_id",
+  };
+
+  for (const [clientKey, dbKey] of Object.entries(textFieldMap)) {
+    const value = toNullableText(candidate[clientKey]);
+    if (value !== undefined) {
+      updates[dbKey] = value;
+    }
+  }
+
+  const age = toNullableInt(candidate.age);
+  if (age !== undefined) {
+    updates.age = age;
+  }
+
+  return updates;
+}
+
+async function applySessionVoterUpdates(sessionId, rawUpdates, options = {}) {
+  const updatesList = parseVoterBulkPayload(rawUpdates);
+  if (updatesList.length === 0) {
+    return {
+      updatedCount: 0,
+      updatedVoters: [],
+      rejected: [{ reason: "No voter updates provided" }],
+    };
+  }
+
+  const client = await pool.connect();
+  const updatedVoters = [];
+  const rejected = [];
+
+  try {
+    await client.query("BEGIN");
+
+    for (const rawUpdate of updatesList) {
+      const voterId = rawUpdate?.voterId ?? rawUpdate?.id;
+      if (!voterId) {
+        rejected.push({ reason: "Missing voterId", payload: rawUpdate });
+        continue;
+      }
+
+      const allowed = buildAllowedVoterUpdates(rawUpdate, options);
+      const entries = Object.entries(allowed);
+      if (entries.length === 0) {
+        rejected.push({ reason: "No editable fields", voterId });
+        continue;
+      }
+
+      const setSql = entries.map(([key], i) => `${key} = $${i + 1}`).join(", ");
+      const values = entries.map(([, value]) => value);
+
+      values.push(sessionId, voterId);
+
+      const result = await client.query(
+        `UPDATE session_voters
+         SET ${setSql}
+         WHERE session_id = $${entries.length + 1} AND id = $${entries.length + 2}
+         RETURNING id, session_id, under_adjudication, name, relation_type, relation_name, house_number, age, gender, religion, voter_id`,
+        values,
+      );
+
+      if (result.rowCount === 0) {
+        rejected.push({ reason: "Voter not found in session", voterId });
+        continue;
+      }
+
+      updatedVoters.push(result.rows[0]);
+    }
+
+    await client.query("COMMIT");
+  } catch (err) {
+    await client.query("ROLLBACK");
+    throw err;
+  } finally {
+    client.release();
+  }
+
+  return {
+    updatedCount: updatedVoters.length,
+    updatedVoters,
+    rejected,
+  };
+}
+
 const app = express();
 const port = process.env.PORT || 3000;
 const storageRoot = path.join(process.cwd(), "storage");
@@ -462,11 +622,17 @@ async function processUploadedSessionFile({
         const ageValue = voter.age ? Number.parseInt(voter.age, 10) : null;
         const age = Number.isNaN(ageValue) ? null : ageValue;
         const photoUrl = resolvePlaceholderPhotoUrl();
+        const underAdjudication = normalizeUnderAdjudication(
+          voter.underAdjudication ??
+            voter.under_adjudication ??
+            voter.isUnderAdjudication ??
+            voter.adjudication,
+        );
 
         const cleanVoterId = sanitizeVoterId(voter.voterId);
 
         await query(
-          "INSERT INTO session_voters (session_id, page_id, page_number, assembly, part_number, section, serial_number, voter_id, name, relation_type, relation_name, house_number, age, gender, religion, photo_url) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)",
+          "INSERT INTO session_voters (session_id, page_id, page_number, assembly, part_number, section, serial_number, voter_id, name, relation_type, relation_name, house_number, age, gender, religion, under_adjudication, photo_url) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)",
           [
             sessionId,
             pageId,
@@ -483,6 +649,7 @@ async function processUploadedSessionFile({
             age,
             voter.gender || "",
             religion,
+            underAdjudication,
             photoUrl,
           ],
         );
@@ -948,7 +1115,7 @@ app.get("/sessions/:id", authenticate, adminOnly, async (req, res) => {
   );
 
   const voters = await query(
-    "SELECT id, page_number, assembly, part_number, section, serial_number, voter_id, name, relation_type, relation_name, house_number, age, gender, religion, photo_url, is_printed, printed_at, created_at FROM session_voters WHERE session_id=$1 ORDER BY page_number, serial_number",
+    "SELECT id, page_number, assembly, part_number, section, serial_number, voter_id, name, relation_type, relation_name, house_number, age, gender, religion, under_adjudication, photo_url, is_printed, printed_at, created_at FROM session_voters WHERE session_id=$1 ORDER BY page_number, serial_number",
     [id],
   );
 
@@ -1072,7 +1239,7 @@ app.get("/sessions/:id/voters", authenticate, adminOnly, async (req, res) => {
   const total = countResult.rows[0].total;
 
   const sql = `
-    SELECT page_number, assembly, part_number, section, serial_number, voter_id, name, relation_type, relation_name, house_number, age, gender, religion, photo_url, created_at
+    SELECT id, page_number, assembly, part_number, section, serial_number, voter_id, name, relation_type, relation_name, house_number, age, gender, religion, under_adjudication, photo_url, created_at
     FROM session_voters
     ${whereSql}
     ORDER BY ${VOTER_DEFAULT_ORDER_SQL}
@@ -1224,7 +1391,7 @@ app.get("/voters/search", authenticate, adminOnly, async (req, res) => {
   const total = countResult.rows[0].total;
 
   const sql = `
-    SELECT id, session_id, page_number, assembly, part_number, section, serial_number, voter_id, name, relation_type, relation_name, house_number, age, gender, religion, is_printed, created_at
+    SELECT id, session_id, page_number, assembly, part_number, section, serial_number, voter_id, name, relation_type, relation_name, house_number, age, gender, religion, under_adjudication, is_printed, created_at
     FROM session_voters
     ${whereSql}
     ORDER BY ${VOTER_DEFAULT_ORDER_SQL}
@@ -1236,6 +1403,131 @@ app.get("/voters/search", authenticate, adminOnly, async (req, res) => {
     pagination: buildPaginationMeta({ page, limit, total }),
   });
 });
+
+// Update voter adjudication flag - Admin only
+app.patch(
+  "/sessions/:id/voters/:voterId/adjudication",
+  authenticate,
+  adminOnly,
+  async (req, res) => {
+    const { id, voterId } = req.params;
+    const { underAdjudication } = req.body || {};
+
+    if (typeof underAdjudication !== "boolean") {
+      return res.status(400).json({
+        error: "underAdjudication must be a boolean",
+      });
+    }
+
+    const updated = await query(
+      `UPDATE session_voters
+       SET under_adjudication = $1
+       WHERE session_id = $2 AND id = $3
+       RETURNING id, session_id, under_adjudication`,
+      [underAdjudication, id, voterId],
+    );
+
+    if (updated.rowCount === 0) {
+      return res.status(404).json({ error: "Voter not found in this session" });
+    }
+
+    return res.json({
+      message: "Voter adjudication updated",
+      voter: updated.rows[0],
+    });
+  },
+);
+
+// Bulk/single adjudication update compatibility route - Admin only
+app.patch(
+  "/sessions/:id/voters/adjudication",
+  authenticate,
+  adminOnly,
+  async (req, res) => {
+    const { id } = req.params;
+
+    try {
+      const outcome = await applySessionVoterUpdates(id, req.body, {
+        adjudicationOnly: true,
+      });
+
+      if (outcome.updatedCount === 0) {
+        return res.status(400).json({
+          error: "No adjudication updates were applied",
+          rejected: outcome.rejected,
+        });
+      }
+
+      return res.json({
+        message: "Adjudication updates applied",
+        updatedCount: outcome.updatedCount,
+        voters: outcome.updatedVoters,
+        rejected: outcome.rejected,
+      });
+    } catch (err) {
+      return res.status(500).json({ error: err.message });
+    }
+  },
+);
+
+// Bulk voter updates (legacy/frontend compatibility) - Admin only
+app.patch("/sessions/:id/voters", authenticate, adminOnly, async (req, res) => {
+  const { id } = req.params;
+
+  try {
+    const outcome = await applySessionVoterUpdates(id, req.body, {
+      adjudicationOnly: false,
+    });
+
+    if (outcome.updatedCount === 0) {
+      return res.status(400).json({
+        error: "No voter updates were applied",
+        rejected: outcome.rejected,
+      });
+    }
+
+    return res.json({
+      message: "Voter updates applied",
+      updatedCount: outcome.updatedCount,
+      voters: outcome.updatedVoters,
+      rejected: outcome.rejected,
+    });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// Explicit bulk alias used by some frontend builds - Admin only
+app.patch(
+  "/sessions/:id/voters/bulk",
+  authenticate,
+  adminOnly,
+  async (req, res) => {
+    const { id } = req.params;
+
+    try {
+      const outcome = await applySessionVoterUpdates(id, req.body, {
+        adjudicationOnly: false,
+      });
+
+      if (outcome.updatedCount === 0) {
+        return res.status(400).json({
+          error: "No voter updates were applied",
+          rejected: outcome.rejected,
+        });
+      }
+
+      return res.json({
+        message: "Bulk voter updates applied",
+        updatedCount: outcome.updatedCount,
+        voters: outcome.updatedVoters,
+        rejected: outcome.rejected,
+      });
+    } catch (err) {
+      return res.status(500).json({ error: err.message });
+    }
+  },
+);
 
 // Session religion stats - Admin only
 app.get(

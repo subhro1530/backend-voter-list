@@ -59,6 +59,7 @@ CREATE TABLE IF NOT EXISTS session_voters (
   age INT,
   gender TEXT,
   religion TEXT DEFAULT 'Other',
+  under_adjudication BOOLEAN DEFAULT FALSE,
   photo_url TEXT,
   is_printed BOOLEAN DEFAULT FALSE,
   printed_at TIMESTAMPTZ,
@@ -204,6 +205,13 @@ BEGIN
     ALTER TABLE session_voters ADD COLUMN religion TEXT DEFAULT 'Other';
   END IF;
 
+  IF NOT EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_name = 'session_voters' AND column_name = 'under_adjudication'
+  ) THEN
+    ALTER TABLE session_voters ADD COLUMN under_adjudication BOOLEAN DEFAULT FALSE;
+  END IF;
+
   -- Add booth_name to sessions if it doesn't exist
   IF NOT EXISTS (
     SELECT 1 FROM information_schema.columns
@@ -289,6 +297,7 @@ WHERE (election_year IS NULL)
 
 -- Create indexes after columns are ensured to exist
 CREATE INDEX IF NOT EXISTS idx_session_voters_religion ON session_voters(religion);
+CREATE INDEX IF NOT EXISTS idx_session_voters_under_adjudication ON session_voters(under_adjudication);
 CREATE INDEX IF NOT EXISTS idx_session_voters_is_printed ON session_voters(is_printed);
 CREATE INDEX IF NOT EXISTS idx_session_voters_session_page_serial ON session_voters(session_id, page_number, serial_number);
 CREATE INDEX IF NOT EXISTS idx_session_voters_session_first_row ON session_voters(session_id, page_number, id);
