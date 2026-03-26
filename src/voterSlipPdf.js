@@ -20,6 +20,7 @@ let templateBytesPromise = null;
 let templateBytesPath = null;
 
 let unicodeFontBytesPromise = null;
+let unicodeFallbackWarned = false;
 
 function normalizeText(value) {
   if (value === null || value === undefined) return "";
@@ -121,6 +122,14 @@ function hasNonAscii(value) {
   return /[^\x00-\x7F]/.test(String(value ?? ""));
 }
 
+function toAsciiSafeText(value) {
+  const normalized = normalizeText(value);
+  if (!normalized) return "";
+
+  const asciiOnly = normalized.replace(/[^\x00-\x7F]+/g, " ").trim();
+  return asciiOnly || "-";
+}
+
 function voterNeedsUnicodeFont(voter) {
   return [
     voter?.partNumber,
@@ -140,18 +149,43 @@ async function embedSlipFont(pdfDoc, requiresUnicode = false) {
   pdfDoc.registerFontkit(fontkit);
   const unicodeBytes = await getUnicodeFontBytes();
   if (unicodeBytes) {
-    return pdfDoc.embedFont(unicodeBytes, { subset: true });
+    const font = await pdfDoc.embedFont(unicodeBytes, { subset: true });
+    return { font, unicodeEnabled: true };
   }
+
   if (requiresUnicode) {
-    throw new Error(
-      "Unicode font not found for Bengali text. Set VOTER_SLIP_FONT_PATH or place NotoSansBengali-Regular.ttf in storage/fonts.",
-    );
+    const strictUnicodeFont =
+      String(process.env.VOTER_SLIP_STRICT_UNICODE_FONT || "false")
+        .trim()
+        .toLowerCase() === "true";
+
+    if (strictUnicodeFont) {
+      throw new Error(
+        "Unicode font not found for Bengali text. Set VOTER_SLIP_FONT_PATH or place NotoSansBengali-Regular.ttf in storage/fonts.",
+      );
+    }
+
+    if (!unicodeFallbackWarned) {
+      console.warn(
+        "⚠️ Unicode font not found. Continuing with ASCII-safe voter slip output. Set VOTER_SLIP_FONT_PATH to restore Bengali rendering.",
+      );
+      unicodeFallbackWarned = true;
+    }
   }
-  return pdfDoc.embedFont(StandardFonts.Helvetica);
+
+  const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
+  return { font, unicodeEnabled: false };
 }
 
-function wrapTextToWidth(font, text, fontSize, maxWidth, maxLines) {
-  const safeText = normalizeText(text);
+function wrapTextToWidth(
+  font,
+  text,
+  fontSize,
+  maxWidth,
+  maxLines,
+  unicodeEnabled = true,
+) {
+  const safeText = unicodeEnabled ? normalizeText(text) : toAsciiSafeText(text);
   if (!safeText) return [];
 
   const words = safeText.split(" ");
@@ -187,6 +221,7 @@ function wrapTextToWidth(font, text, fontSize, maxWidth, maxLines) {
 function drawTextInBox(page, text, options) {
   const {
     font,
+    unicodeEnabled = true,
     x,
     y,
     width,
@@ -200,7 +235,7 @@ function drawTextInBox(page, text, options) {
     color = rgb(0, 0, 0),
   } = options;
 
-  const safeText = normalizeText(text);
+  const safeText = unicodeEnabled ? normalizeText(text) : toAsciiSafeText(text);
   if (!safeText) return;
 
   const contentWidth = Math.max(1, width - paddingX * 2);
@@ -210,7 +245,14 @@ function drawTextInBox(page, text, options) {
   let lines = [];
 
   while (fontSize >= minFontSize) {
-    lines = wrapTextToWidth(font, safeText, fontSize, contentWidth, maxLines);
+    lines = wrapTextToWidth(
+      font,
+      safeText,
+      fontSize,
+      contentWidth,
+      maxLines,
+      unicodeEnabled,
+    );
     const lineHeight = fontSize * 1.18;
     const totalHeight = lines.length * lineHeight;
     const widestLine = lines.reduce(
@@ -272,7 +314,18 @@ function mapSlipData(voter) {
   };
 }
 
-function drawSlipOnPage(page, image, font, x, y, width, height, voter, layout) {
+function drawSlipOnPage(
+  page,
+  image,
+  font,
+  unicodeEnabled,
+  x,
+  y,
+  width,
+  height,
+  voter,
+  layout,
+) {
   page.drawImage(image, {
     x,
     y,
@@ -299,6 +352,7 @@ function drawSlipOnPage(page, image, font, x, y, width, height, voter, layout) {
 
     drawTextInBox(page, value, {
       font,
+      unicodeEnabled,
       x: x + width * field.x,
       y: y + height * field.y,
       width: width * field.width,
@@ -326,7 +380,10 @@ async function buildTemplateEmbed(pdfDoc) {
 
 export async function buildSingleVoterSlipPdf(voter) {
   const pdfDoc = await PDFDocument.create();
-  const font = await embedSlipFont(pdfDoc, voterNeedsUnicodeFont(voter));
+  const { font, unicodeEnabled } = await embedSlipFont(
+    pdfDoc,
+    voterNeedsUnicodeFont(voter),
+  );
   const layout = await getVoterSlipLayout();
 
   const tpl = await buildTemplateEmbed(pdfDoc);
@@ -336,6 +393,7 @@ export async function buildSingleVoterSlipPdf(voter) {
     page,
     tpl.image,
     font,
+    unicodeEnabled,
     0,
     0,
     tpl.width,
@@ -371,7 +429,7 @@ export async function buildMassVoterSlipPdfFile(
   const requiresUnicode = orderedVoters.some(voterNeedsUnicodeFont);
 
   const pdfDoc = await PDFDocument.create();
-  const font = await embedSlipFont(pdfDoc, requiresUnicode);
+  const { font, unicodeEnabled } = await embedSlipFont(pdfDoc, requiresUnicode);
   const layout = await getVoterSlipLayout();
   const tpl = await buildTemplateEmbed(pdfDoc);
 
@@ -430,6 +488,7 @@ export async function buildMassVoterSlipPdfFile(
       page,
       tpl.image,
       font,
+      unicodeEnabled,
       x,
       y,
       cardWidth,
