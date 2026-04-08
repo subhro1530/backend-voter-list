@@ -12,6 +12,7 @@
 import express from "express";
 import path from "path";
 import fs from "fs-extra";
+import AdmZip from "adm-zip";
 import { v4 as uuidv4 } from "uuid";
 import multer from "multer";
 import { query } from "../db.js";
@@ -105,16 +106,21 @@ router.use(adminOnly);
 
 router.post("/manual-entry", async (req, res) => {
   try {
-    const data = req.body || {};
-    const sessionId = data.sessionId || uuidv4();
-    const isUpdate = !!data.sessionId;
-
-    const candidateName = data.candidateName || "";
-    const party = data.party || "";
-    const constituency = data.constituency || data.assemblyConstituency || "";
-    const state = data.state || "";
+    const data = normalizePreviewPayload(req.body || {});
+    const incomingSessionId =
+      req.body?.sessionId ||
+      req.body?.formData?.sessionId ||
+      req.body?.data?.sessionId ||
+      data.sessionId;
+    const sessionId = incomingSessionId || uuidv4();
+    const isUpdate = !!incomingSessionId;
 
     const formData = buildAffidavitFormData(data);
+
+    const candidateName = formData.candidateName || "";
+    const party = formData.party || "";
+    const constituency = formData.constituency || "";
+    const state = formData.state || "";
 
     if (isUpdate) {
       const existing = await query(
@@ -203,6 +209,23 @@ router.post("/manual-entry", async (req, res) => {
       );
     }
 
+    const persisted = await query(
+      `SELECT field_name FROM affidavit_entries WHERE session_id=$1`,
+      [sessionId],
+    );
+    const savedFieldNames = new Set(
+      persisted.rows.map((row) => String(row.field_name)),
+    );
+    const expectedPersistedFieldNames = Object.entries(allFields)
+      .filter(
+        ([, value]) =>
+          value !== undefined && value !== null && String(value) !== "",
+      )
+      .map(([name]) => name);
+    const missingPersistedFields = expectedPersistedFieldNames.filter(
+      (name) => !savedFieldNames.has(name),
+    );
+
     const tables = buildAffidavitTables(formData);
     for (const table of tables) {
       await query(
@@ -230,6 +253,13 @@ router.post("/manual-entry", async (req, res) => {
         ? "Affidavit updated successfully"
         : "Affidavit created successfully",
       exportUrl: `/affidavits/sessions/${sessionId}/export/docx`,
+      dbAudit: {
+        expectedPersistedFieldCount: expectedPersistedFieldNames.length,
+        savedFieldCount: savedFieldNames.size,
+        missingPersistedFieldCount: missingPersistedFields.length,
+        missingPersistedFields,
+        allPersisted: missingPersistedFields.length === 0,
+      },
     });
   } catch (err) {
     console.error("Manual entry error:", err);
@@ -382,111 +412,617 @@ router.patch("/sessions/:id/rename", async (req, res) => {
   }
 });
 
+async function buildMergedForSession(sessionId) {
+  const session = await query("SELECT * FROM affidavit_sessions WHERE id=$1", [
+    sessionId,
+  ]);
+  if (session.rowCount === 0) {
+    return { error: "Session not found", status: 404 };
+  }
+
+  const pages = await query(
+    `SELECT page_number, raw_text, structured_json
+     FROM affidavit_pages WHERE session_id=$1
+     ORDER BY page_number`,
+    [sessionId],
+  );
+
+  const entries = await query(
+    `SELECT field_name, field_value, field_category
+     FROM affidavit_entries WHERE session_id=$1
+     ORDER BY field_category, field_name`,
+    [sessionId],
+  );
+
+  const tables = await query(
+    `SELECT table_title, headers, rows_data, page_number
+     FROM affidavit_tables WHERE session_id=$1
+     ORDER BY page_number`,
+    [sessionId],
+  );
+
+  let merged = {};
+  if (pages.rows.length > 0) {
+    const json =
+      typeof pages.rows[0].structured_json === "string"
+        ? JSON.parse(pages.rows[0].structured_json)
+        : pages.rows[0].structured_json || {};
+    merged = json;
+  }
+
+  if (!merged.fields) merged.fields = {};
+  if (entries.rows.length > 0) {
+    for (const entry of entries.rows) {
+      const key = entry.field_name;
+      const value = entry.field_value;
+      if (value === null || value === undefined || value === "") continue;
+      const parsedValue = isJsonString(value) ? JSON.parse(value) : value;
+      if (String(key).includes(".")) {
+        setNestedValue(merged.fields, key, parsedValue);
+      } else {
+        merged.fields[key] = parsedValue;
+      }
+    }
+  }
+
+  if (!Array.isArray(merged.tables)) merged.tables = [];
+  if (tables.rows.length > 0) {
+    const dbTables = tables.rows.map((t) => ({
+      tableTitle: t.table_title,
+      headers:
+        typeof t.headers === "string" ? JSON.parse(t.headers) : t.headers,
+      rows:
+        typeof t.rows_data === "string" ? JSON.parse(t.rows_data) : t.rows_data,
+    }));
+
+    const byTitle = new Map();
+    for (const table of merged.tables) {
+      const title = String(table?.tableTitle || "")
+        .trim()
+        .toLowerCase();
+      if (!title) continue;
+      byTitle.set(title, table);
+    }
+    for (const table of dbTables) {
+      const title = String(table?.tableTitle || "")
+        .trim()
+        .toLowerCase();
+      if (!title) {
+        merged.tables.push(table);
+        continue;
+      }
+      byTitle.set(title, table);
+    }
+
+    const mergedByTitle = Array.from(byTitle.values());
+    const untitled = dbTables.filter(
+      (t) => !String(t?.tableTitle || "").trim(),
+    );
+    merged.tables = [...mergedByTitle, ...untitled];
+  }
+
+  const sessRow = session.rows[0];
+  if (sessRow.candidate_photo_url && !merged.fields.candidatePhotoUrl) {
+    merged.fields.candidatePhotoUrl = sessRow.candidate_photo_url;
+  }
+  if (sessRow.candidate_signature_url && !merged.fields.candidateSignatureUrl) {
+    merged.fields.candidateSignatureUrl = sessRow.candidate_signature_url;
+  }
+
+  return { session: sessRow, merged };
+}
+
+async function buildDocxBufferFromMerged(merged) {
+  if (!templateExists()) {
+    return {
+      error:
+        "DOCX template file not found. Ensure 'AFFIDAVIT FORMAT WORD.docx' exists in the project root.",
+      status: 500,
+    };
+  }
+  const buffer = await fillAffidavitTemplate(merged);
+  return { buffer };
+}
+
+function isJsonString(value) {
+  if (typeof value !== "string") return false;
+  const t = value.trim();
+  return (
+    (t.startsWith("{") && t.endsWith("}")) ||
+    (t.startsWith("[") && t.endsWith("]"))
+  );
+}
+
+function setNestedValue(target, dottedPath, value) {
+  const parts = String(dottedPath).split(".").filter(Boolean);
+  if (parts.length === 0) return;
+  let cursor = target;
+  for (let i = 0; i < parts.length - 1; i++) {
+    const k = parts[i];
+    if (!cursor[k] || typeof cursor[k] !== "object") cursor[k] = {};
+    cursor = cursor[k];
+  }
+  cursor[parts[parts.length - 1]] = value;
+}
+
+function normalizePreviewPayload(rawInput) {
+  const input = rawInput && typeof rawInput === "object" ? rawInput : {};
+  const source =
+    input.formData && typeof input.formData === "object"
+      ? input.formData
+      : input.data && typeof input.data === "object"
+        ? input.data
+        : input;
+
+  const normalized = {};
+  for (const [key, rawValue] of Object.entries(source)) {
+    const value = isJsonString(rawValue) ? JSON.parse(rawValue) : rawValue;
+    if (String(key).includes(".")) {
+      setNestedValue(normalized, key, value);
+    } else {
+      normalized[key] = value;
+    }
+  }
+
+  return normalized;
+}
+
+function toTrimmedText(value) {
+  if (value === null || value === undefined) return "";
+  return String(value).trim();
+}
+
+function parseJsonObject(value) {
+  if (!value || typeof value !== "string") return value;
+  const trimmed = value.trim();
+  if (!trimmed) return value;
+  if (!trimmed.startsWith("{") && !trimmed.startsWith("[")) return value;
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    return value;
+  }
+}
+
+function pickFirstNonEmpty(fields, aliases) {
+  for (const key of aliases) {
+    const text = toTrimmedText(fields[key]);
+    if (text) return { key, value: text };
+  }
+  return { key: null, value: "" };
+}
+
+function buildSessionFieldValidityReport(merged = {}, session = {}) {
+  const fields =
+    merged.fields && typeof merged.fields === "object" ? merged.fields : {};
+  const checks = [
+    {
+      label: "Candidate Name",
+      aliases: ["candidateName", "candidate_name", "name"],
+      required: true,
+    },
+    {
+      label: "Parent/Spouse Name",
+      aliases: [
+        "fatherMotherHusbandName",
+        "parentSpouseName",
+        "father_name",
+        "spouse_name",
+      ],
+      required: true,
+    },
+    { label: "Age", aliases: ["age"], required: true },
+    { label: "House", aliases: ["houseName", "house_name"], required: true },
+    {
+      label: "Constituency",
+      aliases: [
+        "constituency",
+        "assemblyConstituency",
+        "assembly_constituency",
+      ],
+      required: true,
+    },
+    {
+      label: "Postal Address",
+      aliases: ["postalAddress", "postal_address", "address"],
+      required: true,
+    },
+    {
+      label: "Party",
+      aliases: ["party", "politicalPartyName", "political_party"],
+      required: false,
+    },
+    {
+      label: "Electoral Serial Number",
+      aliases: ["serialNumber", "serial_no", "electoralSerialNo"],
+      required: true,
+    },
+    {
+      label: "Electoral Part Number",
+      aliases: ["partNumber", "part_no", "electoralPartNo"],
+      required: true,
+    },
+    {
+      label: "Telephone",
+      aliases: ["telephone", "contactNumber", "phone"],
+      required: false,
+    },
+    {
+      label: "Email",
+      aliases: ["email", "emailId", "email_id"],
+      required: false,
+    },
+    {
+      label: "Verification Place",
+      aliases: ["verificationPlace", "place"],
+      required: true,
+    },
+    {
+      label: "Verification Date",
+      aliases: ["verificationDate", "date", "verification_date"],
+      required: true,
+    },
+  ];
+
+  const details = [];
+  const missingRequired = [];
+
+  for (const check of checks) {
+    const picked = pickFirstNonEmpty(fields, check.aliases);
+    const hasValue = Boolean(picked.value);
+    details.push({
+      label: check.label,
+      required: check.required,
+      valid: check.required ? hasValue : true,
+      sourceKey: picked.key,
+      valuePreview: hasValue ? picked.value.slice(0, 80) : "",
+    });
+    if (check.required && !hasValue) {
+      missingRequired.push(check.label);
+    }
+  }
+
+  const govAccCandidate =
+    fields.governmentAccommodation || merged.governmentAccommodation || null;
+  const govAcc = parseJsonObject(govAccCandidate);
+  const govAccValid =
+    !!govAcc &&
+    typeof govAcc === "object" &&
+    (toTrimmedText(govAcc.occupied) || toTrimmedText(govAcc.address));
+  details.push({
+    label: "Government Accommodation",
+    required: false,
+    valid: true,
+    sourceKey: toTrimmedText(fields.governmentAccommodation)
+      ? "governmentAccommodation"
+      : merged.governmentAccommodation
+        ? "merged.governmentAccommodation"
+        : null,
+    valuePreview: govAccValid ? "present" : "",
+  });
+
+  const fallbackCandidateName = toTrimmedText(session.candidate_name);
+  if (fallbackCandidateName && missingRequired.includes("Candidate Name")) {
+    const idx = missingRequired.indexOf("Candidate Name");
+    missingRequired.splice(idx, 1);
+  }
+
+  return {
+    valid: missingRequired.length === 0,
+    missingRequired,
+    totalFieldEntries: Object.keys(fields).length,
+    details,
+  };
+}
+
+function decodeXmlEntities(value) {
+  return String(value)
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'");
+}
+
+async function buildTemplatePlacementAudit(merged) {
+  const docxResult = await buildDocxBufferFromMerged(merged);
+  if (docxResult.error) {
+    return {
+      status: "error",
+      error: docxResult.error,
+    };
+  }
+
+  const zip = new AdmZip(docxResult.buffer);
+  const xml = zip.readAsText("word/document.xml");
+  const plainText = decodeXmlEntities(
+    xml
+      .replace(/<w:tab\/?\s*>/g, " ")
+      .replace(/<[^>]+>/g, " ")
+      .replace(/\s+/g, " ")
+      .trim(),
+  );
+  const plainTextLower = plainText.toLowerCase();
+
+  const fields =
+    merged?.fields && typeof merged.fields === "object" ? merged.fields : {};
+  const checks = [
+    {
+      label: "Candidate Name",
+      value: firstValue(
+        fields,
+        ["candidateName", "candidate_name", "name"],
+        "",
+      ),
+    },
+    {
+      label: "Parent/Spouse Name",
+      value: firstValue(
+        fields,
+        [
+          "fatherMotherHusbandName",
+          "parentSpouseName",
+          "father_name",
+          "spouse_name",
+        ],
+        "",
+      ),
+    },
+    { label: "Age", value: firstValue(fields, ["age"], "") },
+    {
+      label: "Postal Address",
+      value: firstValue(
+        fields,
+        ["postalAddress", "address", "postal_address"],
+        "",
+      ),
+    },
+    {
+      label: "Party",
+      value: firstValue(
+        fields,
+        ["party", "politicalPartyName", "political_party"],
+        "",
+      ),
+    },
+    {
+      label: "Enrolled Constituency",
+      value: firstValue(
+        fields,
+        ["enrolledConstituency", "constituency", "assemblyConstituency"],
+        "",
+      ),
+    },
+    {
+      label: "Electoral Serial Number",
+      value: firstValue(
+        fields,
+        ["serialNumber", "serial_no", "electoralSerialNo"],
+        "",
+      ),
+    },
+    {
+      label: "Electoral Part Number",
+      value: firstValue(
+        fields,
+        ["partNumber", "part_no", "electoralPartNo"],
+        "",
+      ),
+    },
+    {
+      label: "Telephone",
+      value: firstValue(fields, ["telephone", "contactNumber", "phone"], ""),
+    },
+    {
+      label: "Email",
+      value: firstValue(fields, ["email", "emailId", "email_id"], ""),
+    },
+    {
+      label: "Education",
+      value: firstValue(
+        fields,
+        ["educationalQualification", "education", "qualification"],
+        "",
+      ),
+    },
+  ];
+
+  const details = checks.map((check) => {
+    const textValue = toTrimmedText(check.value);
+    const valuePresent = !!textValue;
+    const foundInDocument =
+      !valuePresent || plainTextLower.includes(textValue.toLowerCase());
+    return {
+      label: check.label,
+      valuePresent,
+      foundInDocument,
+      valuePreview: valuePresent ? textValue.slice(0, 80) : "",
+    };
+  });
+
+  const missingPlacementLabels = details
+    .filter((item) => item.valuePresent && !item.foundInDocument)
+    .map((item) => item.label);
+
+  const unresolvedHintFragments = [
+    "NAME OF THE HOUSE",
+    "mention full postal address",
+    "Name of the Constituency and the state",
+    "**name of the political party",
+  ].filter((hint) => plainTextLower.includes(hint.toLowerCase()));
+
+  return {
+    status: "ok",
+    valid: missingPlacementLabels.length === 0,
+    missingPlacementLabels,
+    unresolvedHintFragments,
+    details,
+  };
+}
+
+async function sendManualPreviewDocx(req, res) {
+  const data = normalizePreviewPayload(req.body || {});
+  const formData = buildAffidavitFormData(data);
+  const merged = buildMergedStructure(formData);
+
+  const result = await buildDocxBufferFromMerged(merged);
+  if (result.error) {
+    return res.status(result.status || 500).json({ error: result.error });
+  }
+
+  res.setHeader(
+    "Content-Type",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  );
+  res.setHeader(
+    "Content-Disposition",
+    'inline; filename="Affidavit_preview.docx"',
+  );
+  return res.send(result.buffer);
+}
+
+async function sendSessionPreviewDocx(req, res, sessionId, mode = "preview") {
+  const sessionMerged = await buildMergedForSession(sessionId);
+  if (sessionMerged.error) {
+    return res
+      .status(sessionMerged.status || 500)
+      .json({ error: sessionMerged.error });
+  }
+
+  const validity = buildSessionFieldValidityReport(
+    sessionMerged.merged,
+    sessionMerged.session,
+  );
+
+  const docxResult = await buildDocxBufferFromMerged(sessionMerged.merged);
+  if (docxResult.error) {
+    return res
+      .status(docxResult.status || 500)
+      .json({ error: docxResult.error });
+  }
+
+  const safeName = sessionMerged.session.candidate_name
+    ? `Affidavit_${sessionMerged.session.candidate_name.replace(/[^a-zA-Z0-9]/g, "_")}`
+    : `Affidavit_${String(sessionId).slice(0, 8)}`;
+
+  res.setHeader(
+    "Content-Type",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  );
+  res.setHeader("X-Affidavit-Validation", validity.valid ? "valid" : "invalid");
+  if (!validity.valid) {
+    res.setHeader(
+      "X-Affidavit-Missing-Required",
+      validity.missingRequired.join(", "),
+    );
+  }
+  if (mode === "export") {
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename="${safeName}.docx"`,
+    );
+  } else {
+    res.setHeader(
+      "Content-Disposition",
+      `inline; filename="${safeName}_preview.docx"`,
+    );
+  }
+  return res.send(docxResult.buffer);
+}
+
 // ============================================
 // EXPORT AS DOCX (Template-based)
 // ============================================
 
+router.post("/manual-entry/preview/docx", async (req, res) => {
+  try {
+    return await sendManualPreviewDocx(req, res);
+  } catch (err) {
+    console.error("Manual DOCX preview error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.get("/manual-entry/preview/docx", async (req, res) => {
+  try {
+    const sessionId = req.query.sessionId;
+    if (sessionId) {
+      return await sendSessionPreviewDocx(req, res, sessionId, "preview");
+    }
+    return res.status(400).json({
+      error:
+        "sessionId query param is required for GET preview. Use POST for live manual form preview payload.",
+    });
+  } catch (err) {
+    console.error("Manual GET DOCX preview error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.post("/preview/docx", async (req, res) => {
+  try {
+    // Generic alias for frontend integration simplicity.
+    return await sendManualPreviewDocx(req, res);
+  } catch (err) {
+    console.error("Generic DOCX preview error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.get("/sessions/:id/preview/docx", async (req, res) => {
+  try {
+    const { id } = req.params;
+    return await sendSessionPreviewDocx(req, res, id, "preview");
+  } catch (err) {
+    console.error("Session DOCX preview error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 router.get("/sessions/:id/export/docx", async (req, res) => {
   try {
     const { id } = req.params;
-
-    const session = await query(
-      "SELECT * FROM affidavit_sessions WHERE id=$1",
-      [id],
-    );
-    if (session.rowCount === 0)
-      return res.status(404).json({ error: "Session not found" });
-
-    const pages = await query(
-      `SELECT page_number, raw_text, structured_json
-       FROM affidavit_pages WHERE session_id=$1
-       ORDER BY page_number`,
-      [id],
-    );
-
-    const entries = await query(
-      `SELECT field_name, field_value, field_category
-       FROM affidavit_entries WHERE session_id=$1
-       ORDER BY field_category, field_name`,
-      [id],
-    );
-
-    const tables = await query(
-      `SELECT table_title, headers, rows_data, page_number
-       FROM affidavit_tables WHERE session_id=$1
-       ORDER BY page_number`,
-      [id],
-    );
-
-    let merged = {};
-
-    if (pages.rows.length > 0) {
-      const json =
-        typeof pages.rows[0].structured_json === "string"
-          ? JSON.parse(pages.rows[0].structured_json)
-          : pages.rows[0].structured_json || {};
-      merged = json;
-    }
-
-    if (
-      Object.keys(merged.fields || {}).length === 0 &&
-      entries.rows.length > 0
-    ) {
-      merged.fields = {};
-      for (const entry of entries.rows) {
-        merged.fields[entry.field_name] = entry.field_value;
-      }
-    }
-
-    if (
-      (!merged.tables || merged.tables.length === 0) &&
-      tables.rows.length > 0
-    ) {
-      merged.tables = tables.rows.map((t) => ({
-        tableTitle: t.table_title,
-        headers:
-          typeof t.headers === "string" ? JSON.parse(t.headers) : t.headers,
-        rows:
-          typeof t.rows_data === "string"
-            ? JSON.parse(t.rows_data)
-            : t.rows_data,
-      }));
-    }
-
-    // Inject photo/signature URLs from session DB columns into merged fields
-    if (!merged.fields) merged.fields = {};
-    const sessRow = session.rows[0];
-    if (sessRow.candidate_photo_url && !merged.fields.candidatePhotoUrl) {
-      merged.fields.candidatePhotoUrl = sessRow.candidate_photo_url;
-    }
-    if (
-      sessRow.candidate_signature_url &&
-      !merged.fields.candidateSignatureUrl
-    ) {
-      merged.fields.candidateSignatureUrl = sessRow.candidate_signature_url;
-    }
-
-    if (!templateExists()) {
-      return res.status(500).json({
-        error:
-          "DOCX template file not found. Ensure 'AFFIDAVIT FORMAT WORD.docx' exists in the project root.",
-      });
-    }
-
-    const buffer = await fillAffidavitTemplate(merged);
-
-    const filename = session.rows[0].candidate_name
-      ? `Affidavit_${session.rows[0].candidate_name.replace(/[^a-zA-Z0-9]/g, "_")}.docx`
-      : `Affidavit_${id.slice(0, 8)}.docx`;
-
-    res.setHeader(
-      "Content-Type",
-      "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-    );
-    res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
-    res.send(buffer);
+    return await sendSessionPreviewDocx(req, res, id, "export");
   } catch (err) {
     console.error("DOCX export error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.get("/sessions/:id/validation", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const includeTemplateAudit =
+      String(req.query.includeTemplateAudit || "").toLowerCase() === "1" ||
+      String(req.query.includeTemplateAudit || "").toLowerCase() === "true";
+
+    const sessionMerged = await buildMergedForSession(id);
+    if (sessionMerged.error) {
+      return res
+        .status(sessionMerged.status || 500)
+        .json({ error: sessionMerged.error });
+    }
+
+    const validity = buildSessionFieldValidityReport(
+      sessionMerged.merged,
+      sessionMerged.session,
+    );
+
+    let templateAudit = null;
+    if (includeTemplateAudit) {
+      templateAudit = await buildTemplatePlacementAudit(sessionMerged.merged);
+    }
+
+    return res.json({
+      sessionId: id,
+      valid: validity.valid,
+      missingRequired: validity.missingRequired,
+      totalFieldEntries: validity.totalFieldEntries,
+      details: validity.details,
+      templateAudit,
+    });
+  } catch (err) {
+    console.error("Session validation error:", err);
     res.status(500).json({ error: err.message });
   }
 });
@@ -584,119 +1120,312 @@ router.get("/form-schema", async (_req, res) => {
 // HELPERS
 // ============================================
 
+function firstValue(data, keys, fallback = "") {
+  for (const key of keys) {
+    if (!(key in data)) continue;
+    const value = data[key];
+    if (value === null || value === undefined) continue;
+    if (typeof value === "string") {
+      if (!value.trim()) continue;
+      return value;
+    }
+    return value;
+  }
+  return fallback;
+}
+
+function toBooleanLike(value, fallback = false) {
+  if (typeof value === "boolean") return value;
+  if (typeof value === "number") return value !== 0;
+  if (typeof value === "string") {
+    const normalized = value.trim().toLowerCase();
+    if (["true", "1", "yes", "y", "on"].includes(normalized)) return true;
+    if (["false", "0", "no", "n", "off"].includes(normalized)) return false;
+  }
+  return fallback;
+}
+
+function toObjectLike(value, fallback = {}) {
+  if (!value) return fallback;
+  if (typeof value === "object" && !Array.isArray(value)) return value;
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (!trimmed) return fallback;
+    if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+      try {
+        const parsed = JSON.parse(trimmed);
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+          return parsed;
+        }
+      } catch {
+        return fallback;
+      }
+    }
+  }
+  return fallback;
+}
+
+function toArrayLike(value, fallback = []) {
+  if (Array.isArray(value)) return value;
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (!trimmed) return fallback;
+    if (trimmed.startsWith("[") || trimmed.startsWith("{")) {
+      try {
+        const parsed = JSON.parse(trimmed);
+        if (Array.isArray(parsed)) return parsed;
+      } catch {
+        return fallback;
+      }
+    }
+  }
+  return fallback;
+}
+
 function buildAffidavitFormData(data) {
-  return {
-    houseName: data.houseName || "",
-    constituency: data.constituency || data.assemblyConstituency || "",
-    candidateName: data.candidateName || "",
-    fatherMotherHusbandName: data.fatherMotherHusbandName || "",
-    age: data.age || "",
-    postalAddress: data.postalAddress || "",
-    party: data.party || "",
-    isIndependent: data.isIndependent || false,
-    enrolledConstituency: data.enrolledConstituency || "",
-    serialNumber: data.serialNumber || "",
-    partNumber: data.partNumber || "",
-    telephone: data.telephone || "",
-    email: data.email || "",
-    socialMedia1: data.socialMedia1 || "",
-    socialMedia2: data.socialMedia2 || "",
-    socialMedia3: data.socialMedia3 || "",
+  const input = data && typeof data === "object" ? data : {};
+  const governmentAccommodation = toObjectLike(
+    input.governmentAccommodation,
+    {},
+  );
+
+  const formData = {
+    houseName: firstValue(input, ["houseName", "house_name", "house"], ""),
+    constituency: firstValue(
+      input,
+      ["constituency", "assemblyConstituency", "assembly_constituency"],
+      "",
+    ),
+    candidateName: firstValue(
+      input,
+      ["candidateName", "candidate_name", "name"],
+      "",
+    ),
+    fatherMotherHusbandName: firstValue(
+      input,
+      [
+        "fatherMotherHusbandName",
+        "parentSpouseName",
+        "father_name",
+        "spouse_name",
+      ],
+      "",
+    ),
+    age: firstValue(input, ["age"], ""),
+    postalAddress: firstValue(
+      input,
+      ["postalAddress", "address", "postal_address"],
+      "",
+    ),
+    party: firstValue(
+      input,
+      ["party", "politicalPartyName", "political_party"],
+      "",
+    ),
+    isIndependent: toBooleanLike(
+      firstValue(
+        input,
+        ["isIndependent", "independent", "is_independent"],
+        false,
+      ),
+      false,
+    ),
+    enrolledConstituency: firstValue(
+      input,
+      ["enrolledConstituency", "enrolled_constituency"],
+      "",
+    ),
+    serialNumber: firstValue(
+      input,
+      ["serialNumber", "serial_no", "electoralSerialNo"],
+      "",
+    ),
+    partNumber: firstValue(
+      input,
+      ["partNumber", "part_no", "electoralPartNo"],
+      "",
+    ),
+    telephone: firstValue(
+      input,
+      ["telephone", "contactNumber", "phone", "telephoneNumber"],
+      "",
+    ),
+    email: firstValue(input, ["email", "emailId", "email_id"], ""),
+    socialMedia1: firstValue(input, ["socialMedia1", "social_media_1"], ""),
+    socialMedia2: firstValue(input, ["socialMedia2", "social_media_2"], ""),
+    socialMedia3: firstValue(input, ["socialMedia3", "social_media_3"], ""),
 
     // Photo & Signature URLs
-    candidatePhotoUrl: data.candidatePhotoUrl || "",
-    candidateSignatureUrl: data.candidateSignatureUrl || "",
+    candidatePhotoUrl: firstValue(
+      input,
+      ["candidatePhotoUrl", "candidate_photo_url", "photoUrl"],
+      "",
+    ),
+    candidateSignatureUrl: firstValue(
+      input,
+      ["candidateSignatureUrl", "candidate_signature_url", "signatureUrl"],
+      "",
+    ),
 
-    panEntries: data.panEntries || [],
-    hasPendingCases: data.hasPendingCases || "No",
-    pendingCases: data.pendingCases || [],
-    hasConvictions: data.hasConvictions || "No",
-    convictions: data.convictions || [],
-    informedParty: data.informedParty || "",
-    movableAssets: data.movableAssets || {},
-    immovableAssets: data.immovableAssets || {},
-    liabilities: data.liabilities || {},
-    disputedLiabilities: data.disputedLiabilities || "",
-    governmentDues: data.governmentDues || {},
+    panEntries: toArrayLike(input.panEntries, []),
+    hasPendingCases: firstValue(input, ["hasPendingCases"], "No"),
+    pendingCases: toArrayLike(input.pendingCases, []),
+    hasConvictions: firstValue(input, ["hasConvictions"], "No"),
+    convictions: toArrayLike(input.convictions, []),
+    informedParty: firstValue(input, ["informedParty"], ""),
+    movableAssets: toObjectLike(input.movableAssets, {}),
+    immovableAssets: toObjectLike(input.immovableAssets, {}),
+    liabilities: toObjectLike(input.liabilities, {}),
+    disputedLiabilities: firstValue(input, ["disputedLiabilities"], ""),
+    governmentDues: toObjectLike(input.governmentDues, {}),
     governmentAccommodation: {
-      occupied: data.governmentAccommodation?.occupied || "No",
-      address: data.governmentAccommodation?.address || "",
-      noDues: data.governmentAccommodation?.noDues || "Yes",
-      duesDate: data.governmentAccommodation?.duesDate || "",
-      rentDues: data.governmentAccommodation?.rentDues || "",
-      electricityDues: data.governmentAccommodation?.electricityDues || "",
-      waterDues: data.governmentAccommodation?.waterDues || "",
-      telephoneDues: data.governmentAccommodation?.telephoneDues || "",
+      occupied: firstValue(governmentAccommodation, ["occupied"], "No"),
+      address: firstValue(governmentAccommodation, ["address"], ""),
+      noDues: firstValue(governmentAccommodation, ["noDues"], "Yes"),
+      duesDate: firstValue(governmentAccommodation, ["duesDate"], ""),
+      rentDues: firstValue(governmentAccommodation, ["rentDues"], ""),
+      electricityDues: firstValue(
+        governmentAccommodation,
+        ["electricityDues"],
+        "",
+      ),
+      waterDues: firstValue(governmentAccommodation, ["waterDues"], ""),
+      telephoneDues: firstValue(governmentAccommodation, ["telephoneDues"], ""),
     },
-    selfProfession: data.selfProfession || "",
-    spouseProfession: data.spouseProfession || "",
-    selfIncome: data.selfIncome || "",
-    spouseIncome: data.spouseIncome || "",
-    dependentIncome: data.dependentIncome || "",
-    contractsCandidate: data.contractsCandidate || "",
-    contractsSpouse: data.contractsSpouse || "",
-    contractsDependents: data.contractsDependents || "",
-    contractsHUF: data.contractsHUF || "",
-    contractsPartnershipFirms: data.contractsPartnershipFirms || "",
-    contractsPrivateCompanies: data.contractsPrivateCompanies || "",
-    educationalQualification: data.educationalQualification || "",
-    partBOverrides: data.partBOverrides || {},
-    verificationPlace: data.verificationPlace || "",
-    verificationDate: data.verificationDate || data.date || "",
-    state: data.state || "",
-    date: data.date || "",
+    selfProfession: firstValue(input, ["selfProfession", "professionSelf"], ""),
+    spouseProfession: firstValue(
+      input,
+      ["spouseProfession", "professionSpouse"],
+      "",
+    ),
+    selfIncome: firstValue(input, ["selfIncome", "sourceOfIncomeSelf"], ""),
+    spouseIncome: firstValue(
+      input,
+      ["spouseIncome", "sourceOfIncomeSpouse"],
+      "",
+    ),
+    dependentIncome: firstValue(
+      input,
+      ["dependentIncome", "sourceOfIncomeDependents"],
+      "",
+    ),
+    contractsCandidate: firstValue(input, ["contractsCandidate"], ""),
+    contractsSpouse: firstValue(input, ["contractsSpouse"], ""),
+    contractsDependents: firstValue(input, ["contractsDependents"], ""),
+    contractsHUF: firstValue(input, ["contractsHUF"], ""),
+    contractsPartnershipFirms: firstValue(
+      input,
+      ["contractsPartnershipFirms"],
+      "",
+    ),
+    contractsPrivateCompanies: firstValue(
+      input,
+      ["contractsPrivateCompanies"],
+      "",
+    ),
+    educationalQualification: firstValue(
+      input,
+      ["educationalQualification", "education", "qualification"],
+      "",
+    ),
+    partBOverrides: toObjectLike(input.partBOverrides, {}),
+    verificationPlace: firstValue(input, ["verificationPlace", "place"], ""),
+    verificationDate: firstValue(
+      input,
+      ["verificationDate", "date", "verification_date"],
+      "",
+    ),
+    state: firstValue(input, ["state"], ""),
+    date: firstValue(input, ["date", "verificationDate"], ""),
 
     // Oath Commissioner
-    oathCommissionerName: data.oathCommissionerName || "",
-    oathCommissionerDesignation: data.oathCommissionerDesignation || "",
-    oathCommissionerSealNo: data.oathCommissionerSealNo || "",
+    oathCommissionerName: firstValue(
+      input,
+      ["oathCommissionerName", "oath_commissioner_name"],
+      "",
+    ),
+    oathCommissionerDesignation: firstValue(
+      input,
+      ["oathCommissionerDesignation", "oath_commissioner_designation"],
+      "",
+    ),
+    oathCommissionerSealNo: firstValue(
+      input,
+      ["oathCommissionerSealNo", "oath_commissioner_seal_no"],
+      "",
+    ),
   };
+
+  const knownKeys = new Set([
+    ...Object.keys(formData),
+    "house_name",
+    "house",
+    "assembly_constituency",
+    "candidate_name",
+    "name",
+    "parentSpouseName",
+    "father_name",
+    "spouse_name",
+    "address",
+    "postal_address",
+    "politicalPartyName",
+    "political_party",
+    "independent",
+    "is_independent",
+    "enrolled_constituency",
+    "serial_no",
+    "electoralSerialNo",
+    "part_no",
+    "electoralPartNo",
+    "contactNumber",
+    "phone",
+    "telephoneNumber",
+    "emailId",
+    "email_id",
+    "social_media_1",
+    "social_media_2",
+    "social_media_3",
+    "candidate_photo_url",
+    "photoUrl",
+    "candidate_signature_url",
+    "signatureUrl",
+    "professionSelf",
+    "professionSpouse",
+    "sourceOfIncomeSelf",
+    "sourceOfIncomeSpouse",
+    "sourceOfIncomeDependents",
+    "education",
+    "qualification",
+    "verification_date",
+    "oath_commissioner_name",
+    "oath_commissioner_designation",
+    "oath_commissioner_seal_no",
+  ]);
+
+  for (const [key, value] of Object.entries(input)) {
+    if (knownKeys.has(key)) continue;
+    if (value === undefined) continue;
+    formData[key] = value;
+  }
+
+  return formData;
 }
 
 function buildMergedStructure(formData) {
+  const mergedFields = {
+    ...formData,
+    assemblyConstituency: formData.constituency,
+    enrolledConstituency:
+      formData.enrolledConstituency || formData.constituency,
+    date: formData.verificationDate || formData.date,
+  };
+
   const merged = {
     formType: "Form 26",
     documentTitle: "AFFIDAVIT",
     state: formData.state,
     constituency: formData.constituency,
-    fields: {
-      houseName: formData.houseName,
-      candidateName: formData.candidateName,
-      fatherMotherHusbandName: formData.fatherMotherHusbandName,
-      age: formData.age,
-      postalAddress: formData.postalAddress,
-      assemblyConstituency: formData.constituency,
-      enrolledConstituency:
-        formData.enrolledConstituency || formData.constituency,
-      serialNumber: formData.serialNumber,
-      partNumber: formData.partNumber,
-      party: formData.party,
-      telephone: formData.telephone,
-      email: formData.email,
-      socialMedia1: formData.socialMedia1,
-      socialMedia2: formData.socialMedia2,
-      socialMedia3: formData.socialMedia3,
-      selfProfession: formData.selfProfession,
-      spouseProfession: formData.spouseProfession,
-      selfIncome: formData.selfIncome,
-      spouseIncome: formData.spouseIncome,
-      dependentIncome: formData.dependentIncome,
-      contractsCandidate: formData.contractsCandidate,
-      contractsSpouse: formData.contractsSpouse,
-      contractsDependents: formData.contractsDependents,
-      contractsHUF: formData.contractsHUF,
-      contractsPartnershipFirms: formData.contractsPartnershipFirms,
-      contractsPrivateCompanies: formData.contractsPrivateCompanies,
-      educationalQualification: formData.educationalQualification,
-      verificationPlace: formData.verificationPlace,
-      date: formData.verificationDate || formData.date,
-      candidatePhotoUrl: formData.candidatePhotoUrl,
-      candidateSignatureUrl: formData.candidateSignatureUrl,
-      oathCommissionerName: formData.oathCommissionerName,
-      oathCommissionerDesignation: formData.oathCommissionerDesignation,
-      oathCommissionerSealNo: formData.oathCommissionerSealNo,
-      disputedLiabilities: formData.disputedLiabilities,
-    },
+    fields: mergedFields,
     criminalRecord: {
       hasPendingCases: formData.hasPendingCases,
       hasConvictions: formData.hasConvictions,
@@ -1132,68 +1861,59 @@ function buildAffidavitTables(formData) {
 
 function flattenFields(formData) {
   const flat = {};
-  const simpleKeys = [
-    "houseName",
-    "constituency",
-    "candidateName",
-    "fatherMotherHusbandName",
-    "age",
-    "postalAddress",
-    "party",
-    "enrolledConstituency",
-    "serialNumber",
-    "partNumber",
-    "telephone",
-    "email",
-    "socialMedia1",
-    "socialMedia2",
-    "socialMedia3",
-    "selfProfession",
-    "spouseProfession",
-    "selfIncome",
-    "spouseIncome",
-    "dependentIncome",
-    "contractsCandidate",
-    "contractsSpouse",
-    "contractsDependents",
-    "contractsHUF",
-    "contractsPartnershipFirms",
-    "contractsPrivateCompanies",
-    "educationalQualification",
-    "verificationPlace",
-    "verificationDate",
-    "state",
-    "date",
-    "hasPendingCases",
-    "hasConvictions",
-    "informedParty",
-  ];
-  for (const key of simpleKeys) {
-    if (formData[key] !== undefined && formData[key] !== "") {
-      flat[key] = String(formData[key]);
+
+  const saveField = (path, value) => {
+    if (!path) return;
+    if (value === undefined || value === null) return;
+
+    if (typeof value === "string") {
+      if (!value.trim()) return;
+      flat[path] = value;
+      return;
     }
-  }
-  if (formData.movableAssets) {
-    for (const [k, v] of Object.entries(formData.movableAssets)) {
-      if (v) flat[`asset_movable_${k}`] = String(v);
+
+    if (typeof value === "number" || typeof value === "boolean") {
+      flat[path] = String(value);
+      return;
     }
-  }
-  if (
-    formData.immovableAssets &&
-    Object.keys(formData.immovableAssets).length > 0
-  ) {
-    flat["asset_immovable_data"] = JSON.stringify(formData.immovableAssets);
-  }
-  if (formData.liabilities) {
-    for (const [k, v] of Object.entries(formData.liabilities)) {
-      if (v) flat[`liability_${k}`] = String(v);
+
+    if (Array.isArray(value)) {
+      if (value.length === 0) return;
+      flat[path] = JSON.stringify(value);
+      return;
     }
-  }
-  if (formData.governmentDues) {
-    for (const [k, v] of Object.entries(formData.governmentDues)) {
-      if (v) flat[`govDues_${k}`] = String(v);
+
+    if (typeof value === "object") {
+      if (Object.keys(value).length === 0) return;
+      flat[path] = JSON.stringify(value);
     }
-  }
+  };
+
+  const walk = (value, path = "") => {
+    if (value === undefined || value === null) return;
+
+    if (Array.isArray(value)) {
+      if (path) saveField(path, value);
+      value.forEach((item, index) => {
+        const itemPath = path ? `${path}[${index}]` : `[${index}]`;
+        walk(item, itemPath);
+      });
+      return;
+    }
+
+    if (typeof value === "object") {
+      if (path) saveField(path, value);
+      for (const [key, nestedValue] of Object.entries(value)) {
+        const nestedPath = path ? `${path}.${key}` : key;
+        walk(nestedValue, nestedPath);
+      }
+      return;
+    }
+
+    saveField(path, value);
+  };
+
+  walk(formData);
   return flat;
 }
 
