@@ -146,6 +146,17 @@ function replaceDotsAfter(xml, contextBefore, value) {
   return xml;
 }
 
+function replaceSegmentBetween(xml, contextBefore, contextAfter, value) {
+  if (!value) return xml;
+
+  const escBefore = contextBefore.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const escAfter = contextAfter.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const pattern = new RegExp(`(${escBefore})([\\s\\S]*?)(${escAfter})`, "i");
+
+  if (!pattern.test(xml)) return xml;
+  return xml.replace(pattern, `$1 ${escapeXml(value)} $3`);
+}
+
 function findTables(xml) {
   const tables = [];
   let pos = 0;
@@ -314,6 +325,12 @@ function replaceTextPlaceholders(xml, fields) {
       "Father",
       fields.partI_candidateName,
     );
+    xml = replaceDotsBetween(
+      xml,
+      "Candidate's name",
+      "Father",
+      fields.partI_candidateName,
+    );
   }
 
   // "Father's/mother's/husband's name.................His postal" (Part I)
@@ -321,6 +338,12 @@ function replaceTextPlaceholders(xml, fields) {
     xml = replaceDotsBetween(
       xml,
       "husband\u2019s name",
+      "His postal",
+      fields.partI_fatherName,
+    );
+    xml = replaceDotsBetween(
+      xml,
+      "husband's name",
       "His postal",
       fields.partI_fatherName,
     );
@@ -428,11 +451,23 @@ function replaceTextPlaceholders(xml, fields) {
       "Father",
       fields.partII_candidateName,
     );
+    xml = replaceDotsBetween(
+      xml,
+      "Candidate's name",
+      "Father",
+      fields.partII_candidateName,
+    );
   }
   if (fields.partII_fatherName) {
     xml = replaceDotsBetween(
       xml,
       "husband\u2019s name",
+      "His postal",
+      fields.partII_fatherName,
+    );
+    xml = replaceDotsBetween(
+      xml,
+      "husband's name",
       "His postal",
       fields.partII_fatherName,
     );
@@ -763,6 +798,23 @@ function replaceTextPlaceholders(xml, fields) {
     xml = replaceDotsBetween(xml, "on", "(date)", fields.partIV_date, true);
   }
 
+  // "by the *candidate/proposer (Name)." (Part IV)
+  if (fields.partIV_deliveredBy) {
+    xml = replaceDotsBetween(
+      xml,
+      "by the *candidate/proposer",
+      "(Name",
+      fields.partIV_deliveredBy,
+      true,
+    );
+    xml = replaceSegmentBetween(
+      xml,
+      "by the *candidate/proposer",
+      ").",
+      fields.partIV_deliveredBy,
+    );
+  }
+
   // "Date..................."
   if (fields.partIV_roDate) {
     xml = replaceDotsAfter(xml, "Date", fields.partIV_roDate);
@@ -773,6 +825,7 @@ function replaceTextPlaceholders(xml, fields) {
   // Decision text (the dots/ellipsis after "as follows:")
   if (fields.partV_decision) {
     xml = replaceDotsAfter(xml, "as follows:", fields.partV_decision);
+    xml = replaceSegmentBetween(xml, "as follows:", "Date", fields.partV_decision);
   }
 
   // "Date.......... " (Part V)

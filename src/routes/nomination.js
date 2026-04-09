@@ -10,6 +10,7 @@
 import express from "express";
 import { v4 as uuidv4 } from "uuid";
 import multer from "multer";
+import AdmZip from "adm-zip";
 import { query } from "../db.js";
 import { authenticate, adminOnly } from "../auth.js";
 import {
@@ -33,20 +34,26 @@ router.use(adminOnly);
 
 router.post("/manual-entry", async (req, res) => {
   try {
-    const data = req.body || {};
-    const sessionId = data.sessionId || uuidv4();
-    const isUpdate = !!data.sessionId;
-
-    const candidateName = data.candidateName || "";
-    const fatherName = data.fatherMotherHusbandName || "";
-    const postalAddress = data.postalAddress || "";
-    const party = data.party || "";
-    const constituency = data.constituency || "";
-    const state = data.state || "";
+    const data = normalizePreviewPayload(req.body || {});
+    const incomingSessionId =
+      req.body?.sessionId ||
+      req.body?.formData?.sessionId ||
+      req.body?.data?.sessionId ||
+      data.sessionId;
+    const sessionId = incomingSessionId || uuidv4();
+    const isUpdate = !!incomingSessionId;
 
     const formData = buildNominationFormData(data);
-    const candidatePhotoUrl = data.candidatePhotoUrl || "";
-    const candidateSignatureUrl = data.candidateSignatureUrl || "";
+
+    const candidateName = formData.candidateName || "";
+    const fatherName = formData.fatherMotherHusbandName || "";
+    const postalAddress = formData.postalAddress || "";
+    const party = formData.party || "";
+    const constituency = formData.constituency || "";
+    const state = formData.state || "";
+
+    const candidatePhotoUrl = formData.candidatePhotoUrl || "";
+    const candidateSignatureUrl = formData.candidateSignatureUrl || "";
 
     if (isUpdate) {
       const existing = await query(
@@ -99,6 +106,28 @@ router.post("/manual-entry", async (req, res) => {
       );
     }
 
+    const persisted = await query(
+      `SELECT form_data FROM nomination_sessions WHERE id=$1`,
+      [sessionId],
+    );
+    const savedFormData = parseMaybeJson(
+      persisted.rows[0]?.form_data,
+      persisted.rows[0]?.form_data || {},
+    );
+
+    const expectedFlat = flattenScalarFields(formData);
+    const savedFlat = flattenScalarFields(savedFormData);
+    const expectedKeys = Object.keys(expectedFlat);
+    const missingPersistedFields = expectedKeys.filter(
+      (key) => !(key in savedFlat),
+    );
+    const mismatchedPersistedFields = expectedKeys.filter(
+      (key) =>
+        key in savedFlat &&
+        normalizeComparableValue(savedFlat[key]) !==
+          normalizeComparableValue(expectedFlat[key]),
+    );
+
     res.status(isUpdate ? 200 : 201).json({
       sessionId,
       candidateName,
@@ -110,6 +139,19 @@ router.post("/manual-entry", async (req, res) => {
         ? "Nomination updated successfully"
         : "Nomination created successfully",
       exportUrl: `/nominations/sessions/${sessionId}/export/docx`,
+      previewUrl: `/nominations/sessions/${sessionId}/preview/docx`,
+      validationUrl: `/nominations/sessions/${sessionId}/validation`,
+      dbAudit: {
+        expectedPersistedFieldCount: expectedKeys.length,
+        savedFieldCount: Object.keys(savedFlat).length,
+        missingPersistedFieldCount: missingPersistedFields.length,
+        missingPersistedFields,
+        mismatchedPersistedFieldCount: mismatchedPersistedFields.length,
+        mismatchedPersistedFields,
+        allPersisted:
+          missingPersistedFields.length === 0 &&
+          mismatchedPersistedFields.length === 0,
+      },
     });
   } catch (err) {
     console.error("Nomination manual entry error:", err);
@@ -233,46 +275,378 @@ router.patch("/sessions/:id/rename", async (req, res) => {
 // EXPORT AS DOCX (Template-based)
 // ============================================
 
+async function buildNominationForSession(sessionId) {
+  const result = await query("SELECT * FROM nomination_sessions WHERE id=$1", [
+    sessionId,
+  ]);
+  if (result.rowCount === 0) {
+    return { error: "Session not found", status: 404 };
+  }
+
+  const session = result.rows[0];
+  const formData = parseMaybeJson(session.form_data, session.form_data || {});
+  const merged = buildMergedStructure(formData, session);
+  return { session, formData, merged };
+}
+
+async function buildNominationDocxBufferFromMerged(merged) {
+  if (!nominationTemplateExists()) {
+    return {
+      error:
+        "DOCX template file not found. Ensure 'NOMINATION FORM FOR VIDHAN SABHA WORD.docx' exists in the project root.",
+      status: 500,
+    };
+  }
+  const buffer = await fillNominationTemplate(merged);
+  return { buffer };
+}
+
+function buildNominationFieldValidityReport(merged = {}, session = {}) {
+  const fields =
+    merged.fields && typeof merged.fields === "object" ? merged.fields : {};
+  const checks = [
+    {
+      label: "Candidate Name",
+      aliases: [
+        "candidateName",
+        "partI_candidateName",
+        "partII_candidateName",
+        "partVI_candidateName",
+      ],
+      required: true,
+    },
+    {
+      label: "Father/Mother/Husband Name",
+      aliases: [
+        "fatherMotherHusbandName",
+        "partI_fatherName",
+        "partII_fatherName",
+      ],
+      required: true,
+    },
+    {
+      label: "Postal Address",
+      aliases: ["postalAddress", "partI_postalAddress", "partII_postalAddress"],
+      required: true,
+    },
+    {
+      label: "Constituency",
+      aliases: [
+        "constituency",
+        "partI_constituency",
+        "partII_constituency",
+        "partVI_constituency",
+      ],
+      required: true,
+    },
+    { label: "State", aliases: ["state"], required: true },
+  ];
+
+  const details = [];
+  const missingRequired = [];
+  for (const check of checks) {
+    const picked = pickFirstNonEmpty(fields, check.aliases);
+    details.push({
+      label: check.label,
+      required: check.required,
+      valid: check.required ? Boolean(picked.value) : true,
+      sourceKey: picked.key,
+      valuePreview: picked.value ? picked.value.slice(0, 80) : "",
+    });
+    if (check.required && !picked.value) {
+      missingRequired.push(check.label);
+    }
+  }
+
+  const sessionFallback = {
+    candidateName: toTrimmedText(session.candidate_name),
+    fatherName: toTrimmedText(session.father_mother_husband_name),
+    postalAddress: toTrimmedText(session.postal_address),
+    constituency: toTrimmedText(session.constituency),
+    state: toTrimmedText(session.state),
+  };
+  if (sessionFallback.candidateName)
+    removeMissingLabel(missingRequired, "Candidate Name");
+  if (sessionFallback.fatherName)
+    removeMissingLabel(missingRequired, "Father/Mother/Husband Name");
+  if (sessionFallback.postalAddress)
+    removeMissingLabel(missingRequired, "Postal Address");
+  if (sessionFallback.constituency)
+    removeMissingLabel(missingRequired, "Constituency");
+  if (sessionFallback.state) removeMissingLabel(missingRequired, "State");
+
+  const proposerCount = Array.isArray(fields.proposers)
+    ? fields.proposers.length
+    : 0;
+  details.push({
+    label: "Proposers Rows",
+    required: false,
+    valid: true,
+    sourceKey: "proposers",
+    valuePreview: String(proposerCount),
+  });
+
+  return {
+    valid: missingRequired.length === 0,
+    missingRequired,
+    totalFieldEntries: Object.keys(flattenScalarFields(fields)).length,
+    details,
+  };
+}
+
+function decodeXmlEntities(value) {
+  return String(value)
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'");
+}
+
+function shouldCheckTemplateValue(rawValue) {
+  const text = toTrimmedText(rawValue);
+  if (!text) return false;
+  const normalized = text.toLowerCase();
+  if (["yes", "no", "n/a", "na", "none", "nil", "-"].includes(normalized)) {
+    return false;
+  }
+  return normalized.length >= 2;
+}
+
+async function buildNominationTemplatePlacementAudit(merged) {
+  const docxResult = await buildNominationDocxBufferFromMerged(merged);
+  if (docxResult.error) {
+    return { status: "error", error: docxResult.error };
+  }
+
+  const zip = new AdmZip(docxResult.buffer);
+  const xml = zip.readAsText("word/document.xml");
+  const plainText = decodeXmlEntities(
+    xml
+      .replace(/<w:tab\/?\s*>/g, " ")
+      .replace(/<[^>]+>/g, " ")
+      .replace(/\s+/g, " ")
+      .trim(),
+  );
+  const plainTextLower = plainText.toLowerCase();
+
+  const fields =
+    merged?.fields && typeof merged.fields === "object" ? merged.fields : {};
+  const flattened = flattenScalarFields(fields);
+  const details = [];
+  for (const [fieldName, value] of Object.entries(flattened)) {
+    if (!shouldCheckTemplateValue(value)) continue;
+    const normalizedValue = toTrimmedText(value).toLowerCase();
+    details.push({
+      field: fieldName,
+      valuePresent: true,
+      foundInDocument: plainTextLower.includes(normalizedValue),
+      valuePreview: String(value).slice(0, 80),
+    });
+  }
+
+  const missingPlacementFields = details
+    .filter((item) => item.valuePresent && !item.foundInDocument)
+    .map((item) => item.field);
+
+  const unresolvedHintFragments = [
+    "(State)",
+    "(hour)",
+    "(date)",
+    "(Place)",
+    "(name of the language)",
+    "(mention full postal address)",
+  ].filter((fragment) => plainTextLower.includes(fragment.toLowerCase()));
+
+  const dotPlaceholderCount = plainText.match(/\.\.{2,}|…{2,}/g)?.length || 0;
+
+  return {
+    status: "ok",
+    valid: missingPlacementFields.length === 0,
+    missingPlacementFields,
+    unresolvedHintFragments,
+    dotPlaceholderCount,
+    details,
+  };
+}
+
+async function sendNominationManualPreviewDocx(req, res) {
+  const data = normalizePreviewPayload(req.body || {});
+  const formData = buildNominationFormData(data);
+  const merged = buildMergedStructure(formData, {
+    state: formData.state || "",
+    constituency: formData.constituency || "",
+    candidate_photo_url: formData.candidatePhotoUrl || "",
+    candidate_signature_url: formData.candidateSignatureUrl || "",
+  });
+
+  const docxResult = await buildNominationDocxBufferFromMerged(merged);
+  if (docxResult.error) {
+    return res
+      .status(docxResult.status || 500)
+      .json({ error: docxResult.error });
+  }
+
+  res.setHeader(
+    "Content-Type",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  );
+  res.setHeader(
+    "Content-Disposition",
+    'inline; filename="Nomination_preview.docx"',
+  );
+  return res.send(docxResult.buffer);
+}
+
+async function sendNominationSessionDocx(
+  req,
+  res,
+  sessionId,
+  mode = "preview",
+) {
+  const sessionMerged = await buildNominationForSession(sessionId);
+  if (sessionMerged.error) {
+    return res
+      .status(sessionMerged.status || 500)
+      .json({ error: sessionMerged.error });
+  }
+
+  const validity = buildNominationFieldValidityReport(
+    sessionMerged.merged,
+    sessionMerged.session,
+  );
+  const docxResult = await buildNominationDocxBufferFromMerged(
+    sessionMerged.merged,
+  );
+  if (docxResult.error) {
+    return res
+      .status(docxResult.status || 500)
+      .json({ error: docxResult.error });
+  }
+
+  const safeName = sessionMerged.session.candidate_name
+    ? `Nomination_${sessionMerged.session.candidate_name.replace(/[^a-zA-Z0-9]/g, "_")}`
+    : `Nomination_${String(sessionId).slice(0, 8)}`;
+
+  res.setHeader(
+    "Content-Type",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  );
+  res.setHeader(
+    "X-Nomination-Validation",
+    validity.valid ? "valid" : "invalid",
+  );
+  if (!validity.valid) {
+    res.setHeader(
+      "X-Nomination-Missing-Required",
+      validity.missingRequired.join(", "),
+    );
+  }
+
+  if (mode === "export") {
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename="${safeName}.docx"`,
+    );
+  } else {
+    res.setHeader(
+      "Content-Disposition",
+      `inline; filename="${safeName}_preview.docx"`,
+    );
+  }
+
+  return res.send(docxResult.buffer);
+}
+
+router.post("/manual-entry/preview/docx", async (req, res) => {
+  try {
+    return await sendNominationManualPreviewDocx(req, res);
+  } catch (err) {
+    console.error("Nomination manual DOCX preview error:", err);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+router.get("/manual-entry/preview/docx", async (req, res) => {
+  try {
+    const sessionId = req.query.sessionId;
+    if (sessionId) {
+      return await sendNominationSessionDocx(req, res, sessionId, "preview");
+    }
+    return res.status(400).json({
+      error:
+        "sessionId query param is required for GET preview. Use POST for live manual form preview payload.",
+    });
+  } catch (err) {
+    console.error("Nomination GET DOCX preview error:", err);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+router.post("/preview/docx", async (req, res) => {
+  try {
+    return await sendNominationManualPreviewDocx(req, res);
+  } catch (err) {
+    console.error("Nomination generic DOCX preview error:", err);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+router.get("/sessions/:id/preview/docx", async (req, res) => {
+  try {
+    return await sendNominationSessionDocx(req, res, req.params.id, "preview");
+  } catch (err) {
+    console.error("Nomination session DOCX preview error:", err);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
 router.get("/sessions/:id/export/docx", async (req, res) => {
   try {
-    const { id } = req.params;
-
-    const result = await query(
-      "SELECT * FROM nomination_sessions WHERE id=$1",
-      [id],
-    );
-    if (result.rowCount === 0)
-      return res.status(404).json({ error: "Session not found" });
-
-    const session = result.rows[0];
-    const formData =
-      typeof session.form_data === "string"
-        ? JSON.parse(session.form_data)
-        : session.form_data || {};
-
-    if (!nominationTemplateExists()) {
-      return res.status(500).json({
-        error:
-          "DOCX template file not found. Ensure 'NOMINATION FORM FOR VIDHAN SABHA WORD.docx' exists in the project root.",
-      });
-    }
-
-    const merged = buildMergedStructure(formData, session);
-    const buffer = await fillNominationTemplate(merged);
-
-    const filename = session.candidate_name
-      ? `Nomination_${session.candidate_name.replace(/[^a-zA-Z0-9]/g, "_")}.docx`
-      : `Nomination_${id.slice(0, 8)}.docx`;
-
-    res.setHeader(
-      "Content-Type",
-      "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-    );
-    res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
-    res.send(buffer);
+    return await sendNominationSessionDocx(req, res, req.params.id, "export");
   } catch (err) {
     console.error("Nomination DOCX export error:", err);
-    res.status(500).json({ error: err.message });
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+router.get("/sessions/:id/validation", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const includeTemplateAudit =
+      String(req.query.includeTemplateAudit || "").toLowerCase() === "1" ||
+      String(req.query.includeTemplateAudit || "").toLowerCase() === "true";
+
+    const sessionMerged = await buildNominationForSession(id);
+    if (sessionMerged.error) {
+      return res
+        .status(sessionMerged.status || 500)
+        .json({ error: sessionMerged.error });
+    }
+
+    const validity = buildNominationFieldValidityReport(
+      sessionMerged.merged,
+      sessionMerged.session,
+    );
+
+    let templateAudit = null;
+    if (includeTemplateAudit) {
+      templateAudit = await buildNominationTemplatePlacementAudit(
+        sessionMerged.merged,
+      );
+    }
+
+    return res.json({
+      sessionId: id,
+      valid: validity.valid,
+      missingRequired: validity.missingRequired,
+      totalFieldEntries: validity.totalFieldEntries,
+      details: validity.details,
+      templateAudit,
+    });
+  } catch (err) {
+    console.error("Nomination validation error:", err);
+    return res.status(500).json({ error: err.message });
   }
 });
 
@@ -336,134 +710,326 @@ router.get("/form-schema", async (_req, res) => {
 // HELPERS
 // ============================================
 
-function buildNominationFormData(data) {
-  return {
-    // Header
-    state: data.state || "",
-
-    // Photo & Signature URLs
-    candidatePhotoUrl: data.candidatePhotoUrl || "",
-    candidateSignatureUrl: data.candidateSignatureUrl || "",
-
-    // Part I — Recognised party nomination
-    partI_constituency: data.partI_constituency || "",
-    partI_candidateName: data.partI_candidateName || data.candidateName || "",
-    partI_fatherName:
-      data.partI_fatherName || data.fatherMotherHusbandName || "",
-    partI_postalAddress: data.partI_postalAddress || data.postalAddress || "",
-    partI_candidateSlNo: data.partI_candidateSlNo || "",
-    partI_candidatePartNo: data.partI_candidatePartNo || "",
-    partI_candidateConstituency: data.partI_candidateConstituency || "",
-    partI_proposerName: data.partI_proposerName || "",
-    partI_proposerSlNo: data.partI_proposerSlNo || "",
-    partI_proposerPartNo: data.partI_proposerPartNo || "",
-    partI_proposerConstituency: data.partI_proposerConstituency || "",
-    partI_date: data.partI_date || "",
-
-    // Part II — 10 proposers nomination
-    partII_constituency: data.partII_constituency || "",
-    partII_candidateName: data.partII_candidateName || data.candidateName || "",
-    partII_fatherName:
-      data.partII_fatherName || data.fatherMotherHusbandName || "",
-    partII_postalAddress: data.partII_postalAddress || data.postalAddress || "",
-    partII_candidateSlNo: data.partII_candidateSlNo || "",
-    partII_candidatePartNo: data.partII_candidatePartNo || "",
-    partII_candidateConstituency: data.partII_candidateConstituency || "",
-    proposers: data.proposers || [],
-
-    // Part III — Candidate declaration
-    age: data.age || "",
-    recognisedParty: data.recognisedParty || "",
-    unrecognisedParty: data.unrecognisedParty || "",
-    symbol1: data.symbol1 || "",
-    symbol2: data.symbol2 || "",
-    symbol3: data.symbol3 || "",
-    language: data.language || "",
-    casteTribe: data.casteTribe || "",
-    scStState: data.scStState || "",
-    scStArea: data.scStArea || "",
-    assemblyState: data.assemblyState || "",
-    partIII_date: data.partIII_date || "",
-
-    // Part IIIA — Criminal record
-    convicted: data.convicted || "No",
-    criminal_firNos: data.criminal_firNos || "",
-    criminal_policeStation: data.criminal_policeStation || "",
-    criminal_district: data.criminal_district || "",
-    criminal_state: data.criminal_state || "",
-    criminal_sections: data.criminal_sections || "",
-    criminal_convictionDates: data.criminal_convictionDates || "",
-    criminal_courts: data.criminal_courts || "",
-    criminal_punishment: data.criminal_punishment || "",
-    criminal_releaseDates: data.criminal_releaseDates || "",
-    criminal_appealFiled: data.criminal_appealFiled || "",
-    criminal_appealParticulars: data.criminal_appealParticulars || "",
-    criminal_appealCourts: data.criminal_appealCourts || "",
-    criminal_appealStatus: data.criminal_appealStatus || "",
-    criminal_disposalDates: data.criminal_disposalDates || "",
-    criminal_orderNature: data.criminal_orderNature || "",
-
-    officeOfProfit: data.officeOfProfit || "No",
-    officeOfProfit_details: data.officeOfProfit_details || "",
-    insolvency: data.insolvency || "No",
-    insolvency_discharged: data.insolvency_discharged || "",
-    foreignAllegiance: data.foreignAllegiance || "No",
-    foreignAllegiance_details: data.foreignAllegiance_details || "",
-    disqualification_8A: data.disqualification_8A || "No",
-    disqualification_period: data.disqualification_period || "",
-    dismissalForCorruption: data.dismissalForCorruption || "No",
-    dismissal_date: data.dismissal_date || "",
-    govContracts: data.govContracts || "No",
-    govContracts_details: data.govContracts_details || "",
-    managingAgent: data.managingAgent || "No",
-    managingAgent_details: data.managingAgent_details || "",
-    disqualification_10A: data.disqualification_10A || "No",
-    section10A_date: data.section10A_date || "",
-    partIIIA_place: data.partIIIA_place || "",
-    partIIIA_date: data.partIIIA_date || "",
-
-    // Part IV — Returning Officer
-    partIV_serialNo: data.partIV_serialNo || "",
-    partIV_hour: data.partIV_hour || "",
-    partIV_date: data.partIV_date || "",
-    partIV_deliveredBy: data.partIV_deliveredBy || "",
-    partIV_roDate: data.partIV_roDate || "",
-
-    // Part V — Decision
-    partV_decision: data.partV_decision || "",
-    partV_date: data.partV_date || "",
-
-    // Part VI — Receipt
-    partVI_serialNo: data.partVI_serialNo || "",
-    partVI_candidateName: data.partVI_candidateName || data.candidateName || "",
-    partVI_constituency: data.partVI_constituency || "",
-    partVI_hour: data.partVI_hour || "",
-    partVI_date: data.partVI_date || "",
-    partVI_scrutinyHour: data.partVI_scrutinyHour || "",
-    partVI_scrutinyDate: data.partVI_scrutinyDate || "",
-    partVI_scrutinyPlace: data.partVI_scrutinyPlace || "",
-    partVI_roDate: data.partVI_roDate || "",
-  };
+function isJsonString(value) {
+  if (typeof value !== "string") return false;
+  const t = value.trim();
+  return (
+    (t.startsWith("{") && t.endsWith("}")) ||
+    (t.startsWith("[") && t.endsWith("]"))
+  );
 }
 
-function buildMergedStructure(formData, session) {
+function parseMaybeJson(value, fallback) {
+  if (value === null || value === undefined) return fallback;
+  if (typeof value !== "string") return value;
+  const trimmed = value.trim();
+  if (!trimmed) return fallback;
+  if (!isJsonString(trimmed)) return value;
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    return fallback;
+  }
+}
+
+function setNestedValue(target, dottedPath, value) {
+  const parts = String(dottedPath).split(".").filter(Boolean);
+  if (parts.length === 0) return;
+  let cursor = target;
+  for (let i = 0; i < parts.length - 1; i++) {
+    const part = parts[i];
+    if (!cursor[part] || typeof cursor[part] !== "object") {
+      cursor[part] = {};
+    }
+    cursor = cursor[part];
+  }
+  cursor[parts[parts.length - 1]] = value;
+}
+
+function normalizePreviewPayload(rawInput) {
+  const input = rawInput && typeof rawInput === "object" ? rawInput : {};
+  const source =
+    input.formData && typeof input.formData === "object"
+      ? input.formData
+      : input.data && typeof input.data === "object"
+        ? input.data
+        : input;
+
+  const normalized = {};
+  for (const [key, rawValue] of Object.entries(source)) {
+    const value = isJsonString(rawValue) ? JSON.parse(rawValue) : rawValue;
+    if (String(key).includes(".")) {
+      setNestedValue(normalized, key, value);
+    } else {
+      normalized[key] = value;
+    }
+  }
+
+  return normalized;
+}
+
+function toTrimmedText(value) {
+  if (value === null || value === undefined) return "";
+  return String(value).trim();
+}
+
+function firstValue(data, keys, fallback = "") {
+  for (const key of keys) {
+    if (!(key in data)) continue;
+    const value = data[key];
+    if (value === null || value === undefined) continue;
+    if (typeof value === "string") {
+      if (!value.trim()) continue;
+      return value;
+    }
+    return value;
+  }
+  return fallback;
+}
+
+function toArrayLike(value, fallback = []) {
+  if (Array.isArray(value)) return value;
+  if (typeof value === "string") {
+    const parsed = parseMaybeJson(value, fallback);
+    if (Array.isArray(parsed)) return parsed;
+  }
+  return fallback;
+}
+
+function pickFirstNonEmpty(data, aliases) {
+  for (const key of aliases) {
+    const text = toTrimmedText(data[key]);
+    if (text) return { key, value: text };
+  }
+  return { key: null, value: "" };
+}
+
+function removeMissingLabel(list, label) {
+  const index = list.indexOf(label);
+  if (index >= 0) list.splice(index, 1);
+}
+
+function flattenScalarFields(input, prefix = "", out = {}) {
+  if (input === null || input === undefined) return out;
+
+  if (Array.isArray(input)) {
+    input.forEach((item, idx) => {
+      const nextPrefix = prefix ? `${prefix}[${idx}]` : `[${idx}]`;
+      flattenScalarFields(item, nextPrefix, out);
+    });
+    return out;
+  }
+
+  if (typeof input === "object") {
+    for (const [key, value] of Object.entries(input)) {
+      const nextPrefix = prefix ? `${prefix}.${key}` : key;
+      flattenScalarFields(value, nextPrefix, out);
+    }
+    return out;
+  }
+
+  if (!prefix) return out;
+  const text = String(input);
+  if (!text.trim()) return out;
+  out[prefix] = text;
+  return out;
+}
+
+function normalizeComparableValue(value) {
+  return String(value ?? "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function buildNominationFormData(data) {
+  const input = data && typeof data === "object" ? data : {};
+  const get = (...keys) => firstValue(input, keys, "");
+
+  const formData = {
+    // Session-summary level fields
+    state: get("state"),
+    candidateName: get(
+      "candidateName",
+      "partI_candidateName",
+      "partII_candidateName",
+      "partVI_candidateName",
+    ),
+    fatherMotherHusbandName: get(
+      "fatherMotherHusbandName",
+      "partI_fatherName",
+      "partII_fatherName",
+    ),
+    postalAddress: get(
+      "postalAddress",
+      "partI_postalAddress",
+      "partII_postalAddress",
+    ),
+    party: get("party"),
+    constituency: get(
+      "constituency",
+      "partI_constituency",
+      "partII_constituency",
+      "partVI_constituency",
+    ),
+
+    // Photo & signature
+    candidatePhotoUrl: get(
+      "candidatePhotoUrl",
+      "candidate_photo_url",
+      "photoUrl",
+    ),
+    candidateSignatureUrl: get(
+      "candidateSignatureUrl",
+      "candidate_signature_url",
+      "signatureUrl",
+    ),
+
+    // Part I
+    partI_constituency: get("partI_constituency", "constituency"),
+    partI_candidateName: get("partI_candidateName", "candidateName"),
+    partI_fatherName: get("partI_fatherName", "fatherMotherHusbandName"),
+    partI_postalAddress: get("partI_postalAddress", "postalAddress"),
+    partI_candidateSlNo: get("partI_candidateSlNo"),
+    partI_candidatePartNo: get("partI_candidatePartNo"),
+    partI_candidateConstituency: get("partI_candidateConstituency"),
+    partI_proposerName: get("partI_proposerName"),
+    partI_proposerSlNo: get("partI_proposerSlNo"),
+    partI_proposerPartNo: get("partI_proposerPartNo"),
+    partI_proposerConstituency: get("partI_proposerConstituency"),
+    partI_date: get("partI_date"),
+
+    // Part II
+    partII_constituency: get("partII_constituency", "constituency"),
+    partII_candidateName: get("partII_candidateName", "candidateName"),
+    partII_fatherName: get("partII_fatherName", "fatherMotherHusbandName"),
+    partII_postalAddress: get("partII_postalAddress", "postalAddress"),
+    partII_candidateSlNo: get("partII_candidateSlNo"),
+    partII_candidatePartNo: get("partII_candidatePartNo"),
+    partII_candidateConstituency: get("partII_candidateConstituency"),
+    proposers: toArrayLike(input.proposers, []),
+
+    // Part III
+    age: get("age"),
+    recognisedParty: get("recognisedParty"),
+    unrecognisedParty: get("unrecognisedParty"),
+    symbol1: get("symbol1"),
+    symbol2: get("symbol2"),
+    symbol3: get("symbol3"),
+    language: get("language"),
+    casteTribe: get("casteTribe"),
+    scStState: get("scStState"),
+    scStArea: get("scStArea"),
+    assemblyState: get("assemblyState"),
+    partIII_date: get("partIII_date"),
+
+    // Part IIIA
+    convicted: get("convicted") || "No",
+    criminal_firNos: get("criminal_firNos"),
+    criminal_policeStation: get("criminal_policeStation"),
+    criminal_district: get("criminal_district"),
+    criminal_state: get("criminal_state"),
+    criminal_sections: get("criminal_sections"),
+    criminal_convictionDates: get("criminal_convictionDates"),
+    criminal_courts: get("criminal_courts"),
+    criminal_punishment: get("criminal_punishment"),
+    criminal_releaseDates: get("criminal_releaseDates"),
+    criminal_appealFiled: get("criminal_appealFiled"),
+    criminal_appealParticulars: get("criminal_appealParticulars"),
+    criminal_appealCourts: get("criminal_appealCourts"),
+    criminal_appealStatus: get("criminal_appealStatus"),
+    criminal_disposalDates: get("criminal_disposalDates"),
+    criminal_orderNature: get("criminal_orderNature"),
+    officeOfProfit: get("officeOfProfit") || "No",
+    officeOfProfit_details: get("officeOfProfit_details"),
+    insolvency: get("insolvency") || "No",
+    insolvency_discharged: get("insolvency_discharged"),
+    foreignAllegiance: get("foreignAllegiance") || "No",
+    foreignAllegiance_details: get("foreignAllegiance_details"),
+    disqualification_8A: get("disqualification_8A") || "No",
+    disqualification_period: get("disqualification_period"),
+    dismissalForCorruption: get("dismissalForCorruption") || "No",
+    dismissal_date: get("dismissal_date"),
+    govContracts: get("govContracts") || "No",
+    govContracts_details: get("govContracts_details"),
+    managingAgent: get("managingAgent") || "No",
+    managingAgent_details: get("managingAgent_details"),
+    disqualification_10A: get("disqualification_10A") || "No",
+    section10A_date: get("section10A_date"),
+    partIIIA_place: get("partIIIA_place"),
+    partIIIA_date: get("partIIIA_date"),
+
+    // Part IV
+    partIV_serialNo: get("partIV_serialNo"),
+    partIV_hour: get("partIV_hour"),
+    partIV_date: get("partIV_date"),
+    partIV_deliveredBy: get("partIV_deliveredBy"),
+    partIV_roDate: get("partIV_roDate"),
+
+    // Part V
+    partV_decision: get("partV_decision"),
+    partV_date: get("partV_date"),
+
+    // Part VI
+    partVI_serialNo: get("partVI_serialNo"),
+    partVI_candidateName: get("partVI_candidateName", "candidateName"),
+    partVI_constituency: get("partVI_constituency", "constituency"),
+    partVI_hour: get("partVI_hour"),
+    partVI_date: get("partVI_date"),
+    partVI_scrutinyHour: get("partVI_scrutinyHour"),
+    partVI_scrutinyDate: get("partVI_scrutinyDate"),
+    partVI_scrutinyPlace: get("partVI_scrutinyPlace"),
+    partVI_roDate: get("partVI_roDate"),
+  };
+
+  const knownKeys = new Set([
+    ...Object.keys(formData),
+    "candidate_photo_url",
+    "candidate_signature_url",
+    "photoUrl",
+    "signatureUrl",
+    "formData",
+    "data",
+    "sessionId",
+  ]);
+
+  for (const [key, value] of Object.entries(input)) {
+    if (knownKeys.has(key)) continue;
+    if (value === undefined) continue;
+    formData[key] = value;
+  }
+
+  return formData;
+}
+
+function buildMergedStructure(formData, session = {}) {
+  const safeSession = session && typeof session === "object" ? session : {};
+  const normalizedState =
+    toTrimmedText(safeSession.state) || toTrimmedText(formData.state) || "";
+  const normalizedConstituency =
+    toTrimmedText(safeSession.constituency) ||
+    toTrimmedText(formData.constituency) ||
+    toTrimmedText(formData.partI_constituency) ||
+    toTrimmedText(formData.partII_constituency) ||
+    toTrimmedText(formData.partVI_constituency) ||
+    "";
+
   return {
     formType: "Form 2B",
     documentTitle: "NOMINATION PAPER",
     fields: {
       ...formData,
+      state: normalizedState,
+      constituency: normalizedConstituency,
       candidatePhotoUrl:
-        session.candidate_photo_url || formData.candidatePhotoUrl || "",
+        safeSession.candidate_photo_url || formData.candidatePhotoUrl || "",
       candidateSignatureUrl:
-        session.candidate_signature_url || formData.candidateSignatureUrl || "",
+        safeSession.candidate_signature_url ||
+        formData.candidateSignatureUrl ||
+        "",
     },
-    proposers: formData.proposers || [],
-    state: session.state || formData.state || "",
-    constituency:
-      session.constituency ||
-      formData.partI_constituency ||
-      formData.partII_constituency ||
-      "",
+    proposers: toArrayLike(formData.proposers, []),
+    state: normalizedState,
+    constituency: normalizedConstituency,
   };
 }
 
