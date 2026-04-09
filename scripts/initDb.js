@@ -389,6 +389,11 @@ CREATE TABLE IF NOT EXISTS nomination_sessions (
   candidate_signature_url TEXT,
   form_data JSONB DEFAULT '{}',
   status TEXT DEFAULT 'draft',
+  total_pages INT DEFAULT 0,
+  processed_pages INT DEFAULT 0,
+  preview_generated_at TIMESTAMPTZ,
+  exported_at TIMESTAMPTZ,
+  validation_snapshot JSONB DEFAULT '{}',
   created_at TIMESTAMPTZ DEFAULT now(),
   updated_at TIMESTAMPTZ DEFAULT now()
 );
@@ -411,6 +416,36 @@ BEGIN
     WHERE table_name = 'nomination_sessions' AND column_name = 'candidate_signature_url'
   ) THEN
     ALTER TABLE nomination_sessions ADD COLUMN candidate_signature_url TEXT;
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_name = 'nomination_sessions' AND column_name = 'total_pages'
+  ) THEN
+    ALTER TABLE nomination_sessions ADD COLUMN total_pages INT DEFAULT 0;
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_name = 'nomination_sessions' AND column_name = 'processed_pages'
+  ) THEN
+    ALTER TABLE nomination_sessions ADD COLUMN processed_pages INT DEFAULT 0;
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_name = 'nomination_sessions' AND column_name = 'preview_generated_at'
+  ) THEN
+    ALTER TABLE nomination_sessions ADD COLUMN preview_generated_at TIMESTAMPTZ;
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_name = 'nomination_sessions' AND column_name = 'exported_at'
+  ) THEN
+    ALTER TABLE nomination_sessions ADD COLUMN exported_at TIMESTAMPTZ;
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_name = 'nomination_sessions' AND column_name = 'validation_snapshot'
+  ) THEN
+    ALTER TABLE nomination_sessions ADD COLUMN validation_snapshot JSONB DEFAULT '{}'::jsonb;
   END IF;
   IF NOT EXISTS (
     SELECT 1 FROM information_schema.columns

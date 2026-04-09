@@ -25,8 +25,50 @@ const upload = multer({
   limits: { fileSize: 5 * 1024 * 1024 },
 });
 
+let nominationSchemaReadyPromise = null;
+
+async function ensureNominationSessionColumns() {
+  if (nominationSchemaReadyPromise) {
+    return nominationSchemaReadyPromise;
+  }
+
+  nominationSchemaReadyPromise = (async () => {
+    await query(`
+      ALTER TABLE nomination_sessions
+        ADD COLUMN IF NOT EXISTS total_pages INT DEFAULT 0,
+        ADD COLUMN IF NOT EXISTS processed_pages INT DEFAULT 0,
+        ADD COLUMN IF NOT EXISTS preview_generated_at TIMESTAMPTZ,
+        ADD COLUMN IF NOT EXISTS exported_at TIMESTAMPTZ,
+        ADD COLUMN IF NOT EXISTS validation_snapshot JSONB DEFAULT '{}'::jsonb;
+    `);
+  })();
+
+  try {
+    await nominationSchemaReadyPromise;
+  } catch (err) {
+    nominationSchemaReadyPromise = null;
+    throw err;
+  }
+
+  return nominationSchemaReadyPromise;
+}
+
 router.use(authenticate);
 router.use(adminOnly);
+
+// Keep nomination schema in sync even if db:init has not run recently.
+router.use(async (_req, _res, next) => {
+  try {
+    await ensureNominationSessionColumns();
+  } catch (err) {
+    console.warn("Nomination schema ensure skipped:", err.message);
+  }
+  next();
+});
+
+void ensureNominationSessionColumns().catch((err) => {
+  console.warn("Nomination schema prewarm skipped:", err.message);
+});
 
 // ============================================
 // MANUAL ENTRY — Create / Update Nomination
@@ -69,7 +111,10 @@ router.post("/manual-entry", async (req, res) => {
          SET candidate_name=$1, father_mother_husband_name=$2,
              postal_address=$3, party=$4, constituency=$5, state=$6,
              form_data=$7, candidate_photo_url=$8, candidate_signature_url=$9,
-             status='completed', updated_at=now()
+             status='completed',
+             total_pages=COALESCE(total_pages, 0),
+             processed_pages=COALESCE(processed_pages, 0),
+             updated_at=now()
          WHERE id=$10`,
         [
           candidateName,
@@ -89,8 +134,8 @@ router.post("/manual-entry", async (req, res) => {
         `INSERT INTO nomination_sessions
          (id, candidate_name, father_mother_husband_name, postal_address,
           party, constituency, state, form_data, candidate_photo_url,
-          candidate_signature_url, status)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'completed')`,
+          candidate_signature_url, status, total_pages, processed_pages)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'completed', 0, 0)`,
         [
           sessionId,
           candidateName,
@@ -187,7 +232,9 @@ router.get("/sessions", async (_req, res) => {
     const result = await query(
       `SELECT id, candidate_name, father_mother_husband_name,
               postal_address, party, constituency, state,
-              status, created_at, updated_at
+              status, total_pages, processed_pages,
+              preview_generated_at, exported_at,
+              created_at, updated_at
        FROM nomination_sessions
        ORDER BY created_at DESC`,
     );
@@ -413,13 +460,8 @@ function shouldCheckTemplateValue(rawValue) {
   return normalized.length >= 2;
 }
 
-async function buildNominationTemplatePlacementAudit(merged) {
-  const docxResult = await buildNominationDocxBufferFromMerged(merged);
-  if (docxResult.error) {
-    return { status: "error", error: docxResult.error };
-  }
-
-  const zip = new AdmZip(docxResult.buffer);
+function buildNominationTemplatePlacementAuditFromBuffer(merged, docxBuffer) {
+  const zip = new AdmZip(docxBuffer);
   const xml = zip.readAsText("word/document.xml");
   const plainText = decodeXmlEntities(
     xml
@@ -470,6 +512,93 @@ async function buildNominationTemplatePlacementAudit(merged) {
   };
 }
 
+async function buildNominationTemplatePlacementAudit(merged) {
+  const docxResult = await buildNominationDocxBufferFromMerged(merged);
+  if (docxResult.error) {
+    return { status: "error", error: docxResult.error };
+  }
+
+  return buildNominationTemplatePlacementAuditFromBuffer(
+    merged,
+    docxResult.buffer,
+  );
+}
+
+function estimateDocxPageCountFromBuffer(docxBuffer) {
+  try {
+    const zip = new AdmZip(docxBuffer);
+    const xml = zip.readAsText("word/document.xml");
+
+    const explicitPageBreaks = (
+      xml.match(/<w:br[^>]*w:type="page"[^>]*\/?\s*>/g) || []
+    ).length;
+    const renderedPageBreaks = (
+      xml.match(/<w:lastRenderedPageBreak\/?\s*>/g) || []
+    ).length;
+    const sectionProps = (xml.match(/<w:sectPr\b/g) || []).length;
+
+    const byBreaks = Math.max(explicitPageBreaks, renderedPageBreaks) + 1;
+    const bySections = Math.max(sectionProps, 1);
+    return Math.max(1, byBreaks, bySections);
+  } catch {
+    return 1;
+  }
+}
+
+async function persistNominationRenderMetadata(
+  sessionId,
+  mode,
+  pageCount,
+  validity,
+  templateAudit,
+) {
+  if (!sessionId) return;
+
+  const safePageCount = Number.isFinite(pageCount)
+    ? Math.max(1, Math.floor(pageCount))
+    : 1;
+
+  const validationSnapshot = {
+    generatedAt: new Date().toISOString(),
+    mode,
+    requiredValid: Boolean(validity?.valid),
+    missingRequired: Array.isArray(validity?.missingRequired)
+      ? validity.missingRequired
+      : [],
+    templateAuditStatus: templateAudit?.status || "unknown",
+    templateAuditValid: Boolean(templateAudit?.valid),
+    missingPlacementFields: Array.isArray(templateAudit?.missingPlacementFields)
+      ? templateAudit.missingPlacementFields
+      : [],
+    unresolvedHintFragments: Array.isArray(
+      templateAudit?.unresolvedHintFragments,
+    )
+      ? templateAudit.unresolvedHintFragments
+      : [],
+  };
+
+  try {
+    await query(
+      `UPDATE nomination_sessions
+       SET total_pages=$2,
+           processed_pages=$2,
+           preview_generated_at=now(),
+           exported_at=CASE WHEN $3 THEN now() ELSE exported_at END,
+           validation_snapshot=$4::jsonb,
+           updated_at=now()
+       WHERE id=$1`,
+      [
+        sessionId,
+        safePageCount,
+        mode === "export",
+        JSON.stringify(validationSnapshot),
+      ],
+    );
+  } catch (err) {
+    console.warn("Nomination metadata update skipped:", err.message);
+  }
+}
+
 async function sendNominationManualPreviewDocx(req, res) {
   const data = normalizePreviewPayload(req.body || {});
   const formData = buildNominationFormData(data);
@@ -487,10 +616,45 @@ async function sendNominationManualPreviewDocx(req, res) {
       .json({ error: docxResult.error });
   }
 
+  const validity = buildNominationFieldValidityReport(merged, {});
+  const templateAudit = buildNominationTemplatePlacementAuditFromBuffer(
+    merged,
+    docxResult.buffer,
+  );
+  const pageCount = estimateDocxPageCountFromBuffer(docxResult.buffer);
+  const templateAuditHeader =
+    templateAudit.status === "ok"
+      ? templateAudit.valid
+        ? "valid"
+        : "invalid"
+      : "error";
+
   res.setHeader(
     "Content-Type",
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
   );
+  res.setHeader(
+    "X-Nomination-Validation",
+    validity.valid ? "valid" : "invalid",
+  );
+  res.setHeader("X-Nomination-Template-Audit", templateAuditHeader);
+  res.setHeader("X-Nomination-Page-Count", String(pageCount));
+  if (!validity.valid) {
+    res.setHeader(
+      "X-Nomination-Missing-Required",
+      validity.missingRequired.join(", "),
+    );
+  }
+  if (
+    templateAudit.status === "ok" &&
+    !templateAudit.valid &&
+    templateAudit.missingPlacementFields.length > 0
+  ) {
+    res.setHeader(
+      "X-Nomination-Template-Missing",
+      templateAudit.missingPlacementFields.slice(0, 25).join(", "),
+    );
+  }
   res.setHeader(
     "Content-Disposition",
     'inline; filename="Nomination_preview.docx"',
@@ -524,6 +688,50 @@ async function sendNominationSessionDocx(
       .json({ error: docxResult.error });
   }
 
+  const templateAudit = buildNominationTemplatePlacementAuditFromBuffer(
+    sessionMerged.merged,
+    docxResult.buffer,
+  );
+  const pageCount = estimateDocxPageCountFromBuffer(docxResult.buffer);
+
+  await persistNominationRenderMetadata(
+    sessionId,
+    mode,
+    pageCount,
+    validity,
+    templateAudit,
+  );
+
+  const strictTemplateAudit = String(
+    req.query.strictTemplateAudit || req.query.strict || "",
+  )
+    .toLowerCase()
+    .trim();
+  const requireTemplatePass = ["1", "true", "yes", "strict"].includes(
+    strictTemplateAudit,
+  );
+  if (
+    mode === "export" &&
+    requireTemplatePass &&
+    templateAudit.status === "ok" &&
+    !templateAudit.valid
+  ) {
+    return res.status(422).json({
+      error:
+        "Template placement audit failed. Some provided values were not found in generated DOCX.",
+      missingPlacementFields: templateAudit.missingPlacementFields,
+      validation: validity,
+      templateAudit,
+    });
+  }
+
+  const templateAuditHeader =
+    templateAudit.status === "ok"
+      ? templateAudit.valid
+        ? "valid"
+        : "invalid"
+      : "error";
+
   const safeName = sessionMerged.session.candidate_name
     ? `Nomination_${sessionMerged.session.candidate_name.replace(/[^a-zA-Z0-9]/g, "_")}`
     : `Nomination_${String(sessionId).slice(0, 8)}`;
@@ -536,10 +744,22 @@ async function sendNominationSessionDocx(
     "X-Nomination-Validation",
     validity.valid ? "valid" : "invalid",
   );
+  res.setHeader("X-Nomination-Template-Audit", templateAuditHeader);
+  res.setHeader("X-Nomination-Page-Count", String(pageCount));
   if (!validity.valid) {
     res.setHeader(
       "X-Nomination-Missing-Required",
       validity.missingRequired.join(", "),
+    );
+  }
+  if (
+    templateAudit.status === "ok" &&
+    !templateAudit.valid &&
+    templateAudit.missingPlacementFields.length > 0
+  ) {
+    res.setHeader(
+      "X-Nomination-Template-Missing",
+      templateAudit.missingPlacementFields.slice(0, 25).join(", "),
     );
   }
 
@@ -641,11 +861,71 @@ router.get("/sessions/:id/validation", async (req, res) => {
       valid: validity.valid,
       missingRequired: validity.missingRequired,
       totalFieldEntries: validity.totalFieldEntries,
+      previewState: {
+        totalPages: Number(sessionMerged.session.total_pages || 0),
+        processedPages: Number(sessionMerged.session.processed_pages || 0),
+        previewGeneratedAt: sessionMerged.session.preview_generated_at || null,
+        exportedAt: sessionMerged.session.exported_at || null,
+      },
+      validationSnapshot: parseMaybeJson(
+        sessionMerged.session.validation_snapshot,
+        sessionMerged.session.validation_snapshot || {},
+      ),
       details: validity.details,
       templateAudit,
     });
   } catch (err) {
     console.error("Nomination validation error:", err);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+router.get("/sessions/:id/preview/metadata", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const includeTemplateAudit =
+      String(req.query.includeTemplateAudit || "").toLowerCase() === "1" ||
+      String(req.query.includeTemplateAudit || "").toLowerCase() === "true";
+
+    const sessionMerged = await buildNominationForSession(id);
+    if (sessionMerged.error) {
+      return res
+        .status(sessionMerged.status || 500)
+        .json({ error: sessionMerged.error });
+    }
+
+    const validity = buildNominationFieldValidityReport(
+      sessionMerged.merged,
+      sessionMerged.session,
+    );
+
+    let templateAudit = null;
+    if (includeTemplateAudit) {
+      templateAudit = await buildNominationTemplatePlacementAudit(
+        sessionMerged.merged,
+      );
+    }
+
+    return res.json({
+      sessionId: id,
+      previewState: {
+        totalPages: Number(sessionMerged.session.total_pages || 0),
+        processedPages: Number(sessionMerged.session.processed_pages || 0),
+        previewGeneratedAt: sessionMerged.session.preview_generated_at || null,
+        exportedAt: sessionMerged.session.exported_at || null,
+      },
+      validationSnapshot: parseMaybeJson(
+        sessionMerged.session.validation_snapshot,
+        sessionMerged.session.validation_snapshot || {},
+      ),
+      validation: {
+        valid: validity.valid,
+        missingRequired: validity.missingRequired,
+      },
+      templateAudit,
+    });
+  } catch (err) {
+    console.error("Nomination preview metadata error:", err);
     return res.status(500).json({ error: err.message });
   }
 });
@@ -755,13 +1035,24 @@ function normalizePreviewPayload(rawInput) {
         ? input.data
         : input;
 
+  const sourceCandidates = [source];
+  if (source?.fields && typeof source.fields === "object") {
+    sourceCandidates.push(source.fields);
+  }
+  if (source?.values && typeof source.values === "object") {
+    sourceCandidates.push(source.values);
+  }
+
   const normalized = {};
-  for (const [key, rawValue] of Object.entries(source)) {
-    const value = isJsonString(rawValue) ? JSON.parse(rawValue) : rawValue;
-    if (String(key).includes(".")) {
-      setNestedValue(normalized, key, value);
-    } else {
-      normalized[key] = value;
+  for (const candidate of sourceCandidates) {
+    if (!candidate || typeof candidate !== "object") continue;
+    for (const [key, rawValue] of Object.entries(candidate)) {
+      const value = isJsonString(rawValue) ? JSON.parse(rawValue) : rawValue;
+      if (String(key).includes(".")) {
+        setNestedValue(normalized, key, value);
+      } else {
+        normalized[key] = value;
+      }
     }
   }
 
@@ -782,6 +1073,18 @@ function firstValue(data, keys, fallback = "") {
       if (!value.trim()) continue;
       return value;
     }
+    if (Array.isArray(value)) continue;
+    if (value && typeof value === "object") continue;
+    return value;
+  }
+  return fallback;
+}
+
+function pickRawValue(data, keys, fallback = undefined) {
+  for (const key of keys) {
+    if (!(key in data)) continue;
+    const value = data[key];
+    if (value === null || value === undefined) continue;
     return value;
   }
   return fallback;
@@ -793,7 +1096,79 @@ function toArrayLike(value, fallback = []) {
     const parsed = parseMaybeJson(value, fallback);
     if (Array.isArray(parsed)) return parsed;
   }
+  if (value && typeof value === "object") {
+    if (Array.isArray(value.rows)) return value.rows;
+    const numericKeys = Object.keys(value)
+      .filter((k) => /^\d+$/.test(k))
+      .sort((a, b) => Number(a) - Number(b));
+    if (numericKeys.length > 0) {
+      return numericKeys.map((k) => value[k]);
+    }
+  }
   return fallback;
+}
+
+function flattenLookupValues(input, prefix = "", out = {}) {
+  if (input === null || input === undefined) return out;
+
+  if (Array.isArray(input)) {
+    if (prefix) out[prefix] = input;
+    input.forEach((item, idx) => {
+      const nextPrefix = `${prefix}[${idx}]`;
+      flattenLookupValues(item, nextPrefix, out);
+    });
+    return out;
+  }
+
+  if (typeof input === "object") {
+    if (prefix) out[prefix] = input;
+    for (const [key, value] of Object.entries(input)) {
+      const nextPrefix = prefix ? `${prefix}.${key}` : key;
+      flattenLookupValues(value, nextPrefix, out);
+    }
+    return out;
+  }
+
+  if (prefix) out[prefix] = input;
+  return out;
+}
+
+function buildFieldLookup(input) {
+  const lookup = input && typeof input === "object" ? { ...input } : {};
+
+  const flattened = flattenLookupValues(input, "", {});
+  for (const [key, value] of Object.entries(flattened)) {
+    if (!(key in lookup)) lookup[key] = value;
+    const underscored = key.replace(/\./g, "_");
+    if (!(underscored in lookup)) lookup[underscored] = value;
+  }
+
+  return lookup;
+}
+
+function expandLookupKeys(keys = []) {
+  const expanded = [];
+  const seen = new Set();
+
+  for (const key of keys) {
+    if (!key) continue;
+    const variants = [key];
+
+    if (key.includes("_")) {
+      variants.push(key.replace(/_/g, "."));
+    }
+    if (key.includes(".")) {
+      variants.push(key.replace(/\./g, "_"));
+    }
+
+    for (const variant of variants) {
+      if (seen.has(variant)) continue;
+      seen.add(variant);
+      expanded.push(variant);
+    }
+  }
+
+  return expanded;
 }
 
 function pickFirstNonEmpty(data, aliases) {
@@ -843,7 +1218,8 @@ function normalizeComparableValue(value) {
 
 function buildNominationFormData(data) {
   const input = data && typeof data === "object" ? data : {};
-  const get = (...keys) => firstValue(input, keys, "");
+  const lookup = buildFieldLookup(input);
+  const get = (...keys) => firstValue(lookup, expandLookupKeys(keys), "");
 
   const formData = {
     // Session-summary level fields
@@ -906,7 +1282,10 @@ function buildNominationFormData(data) {
     partII_candidateSlNo: get("partII_candidateSlNo"),
     partII_candidatePartNo: get("partII_candidatePartNo"),
     partII_candidateConstituency: get("partII_candidateConstituency"),
-    proposers: toArrayLike(input.proposers, []),
+    proposers: toArrayLike(
+      pickRawValue(lookup, expandLookupKeys(["proposers"]), []),
+      [],
+    ),
 
     // Part III
     age: get("age"),
