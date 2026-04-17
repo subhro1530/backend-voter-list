@@ -306,6 +306,7 @@ function mapRowToSlipVoter(row) {
     houseNumber: row.house_number,
     age: row.age,
     gender: row.gender,
+    underAdjudication: row.under_adjudication === true,
   };
 }
 
@@ -314,6 +315,7 @@ async function getVoterForSlipByParam(idParam) {
   const result = await query(
     `SELECT v.id, v.session_id, v.part_number, v.section, v.serial_number, v.name,
             v.relation_name, v.house_number, v.age, v.gender, v.voter_id,
+            v.under_adjudication,
             s.booth_no, s.booth_name
      FROM session_voters v
      LEFT JOIN sessions s ON s.id = v.session_id
@@ -365,11 +367,12 @@ async function getMassSlipVoters(filters) {
 
   const sql = `
     SELECT v.id, v.session_id, v.part_number, v.section, v.serial_number, v.name,
-           v.relation_name, v.house_number, v.age, v.gender,
+           v.relation_name, v.house_number, v.age, v.gender, v.under_adjudication,
            s.booth_no, s.booth_name
     FROM session_voters v
     LEFT JOIN sessions s ON s.id = v.session_id
     WHERE ${where.join(" AND ")}
+      AND COALESCE(v.under_adjudication, FALSE) = FALSE
     ORDER BY ${formatSerialSortSql("v")};
   `;
 
@@ -771,11 +774,17 @@ router.post("/voters/:id/print", async (req, res) => {
 
     // Get voter first
     const voterCheck = await query(
-      `SELECT id, is_printed FROM session_voters WHERE ${column} = $1 LIMIT 1`,
+      `SELECT id, is_printed, under_adjudication FROM session_voters WHERE ${column} = $1 LIMIT 1`,
       [value],
     );
     if (voterCheck.rowCount === 0) {
       return res.status(404).json({ error: "Voter not found" });
+    }
+
+    if (voterCheck.rows[0].under_adjudication === true) {
+      return res.status(403).json({
+        error: "Voter slip cannot be printed for voters under adjudication",
+      });
     }
 
     const dbId = voterCheck.rows[0].id;
@@ -807,7 +816,8 @@ router.get("/voters/:id/print-data", async (req, res) => {
     const { column, value } = resolveVoterIdParam(req.params.id);
     const result = await query(
       `SELECT id, assembly, part_number, section, serial_number, voter_id, name, 
-              relation_type, relation_name, house_number, age, gender, photo_url
+              relation_type, relation_name, house_number, age, gender, photo_url,
+              under_adjudication
        FROM session_voters 
        WHERE ${column} = $1
        LIMIT 1`,
@@ -819,6 +829,11 @@ router.get("/voters/:id/print-data", async (req, res) => {
     }
 
     const voter = result.rows[0];
+    if (voter.under_adjudication === true) {
+      return res.status(403).json({
+        error: "Voter slip cannot be printed for voters under adjudication",
+      });
+    }
 
     // Format data for printing
     const printData = {
@@ -872,6 +887,12 @@ async function sendSingleVoterSlip(req, res, idParam) {
     const voter = await getVoterForSlipByParam(idValue);
     if (!voter) {
       return res.status(404).json({ error: "Voter not found" });
+    }
+
+    if (voter.underAdjudication === true) {
+      return res.status(403).json({
+        error: "Voter slip cannot be printed for voters under adjudication",
+      });
     }
 
     const pdfBytes = await buildSingleVoterSlipPdf(voter);

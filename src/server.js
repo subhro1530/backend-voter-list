@@ -1,4 +1,5 @@
 import "dotenv/config";
+import "express-async-errors";
 import express from "express";
 import cors from "cors";
 import multer from "multer";
@@ -18,7 +19,7 @@ import {
   getAllowedDispatchModes,
 } from "./gemini.js";
 import { parseGeminiStructured } from "./parser.js";
-import { pool, query } from "./db.js";
+import { pool, query, isTransientDbError } from "./db.js";
 import { authenticate, adminOnly } from "./auth.js";
 import {
   processAgentQuery,
@@ -102,6 +103,19 @@ function toNullableInt(value) {
   if (value === null || value === "") return null;
   const parsed = Number.parseInt(String(value), 10);
   return Number.isNaN(parsed) ? undefined : parsed;
+}
+
+function sendRouteError(res, err) {
+  if (isTransientDbError(err)) {
+    return res.status(503).json({
+      error: "Database temporarily unavailable. Please retry.",
+      code: err.code || "DB_TRANSIENT",
+    });
+  }
+
+  return res
+    .status(500)
+    .json({ error: err.message || "Internal server error" });
 }
 
 function buildAllowedVoterUpdates(
@@ -1038,7 +1052,8 @@ app.post(
 
 // Sessions list - Admin only
 app.get("/sessions", authenticate, adminOnly, async (_req, res) => {
-  const sql = `
+  try {
+    const sql = `
       SELECT s.id, s.original_filename, s.status, s.total_pages, s.processed_pages,
         s.assembly_name, s.booth_no, s.booth_name,
         s.created_at, s.updated_at,
@@ -1050,80 +1065,91 @@ app.get("/sessions", authenticate, adminOnly, async (_req, res) => {
     GROUP BY s.id
     ORDER BY s.created_at DESC;
   `;
-  const result = await query(sql);
-  res.json({ sessions: result.rows });
+    const result = await query(sql);
+    return res.json({ sessions: result.rows });
+  } catch (err) {
+    return sendRouteError(res, err);
+  }
 });
 
 // Session status - Admin only
 app.get("/sessions/:id/status", authenticate, adminOnly, async (req, res) => {
-  const { id } = req.params;
-  const session = await query(
-    "SELECT id, status, total_pages, processed_pages, created_at, updated_at FROM sessions WHERE id=$1",
-    [id],
-  );
-  if (session.rowCount === 0) {
-    return res.status(404).json({ error: "Session not found" });
+  try {
+    const { id } = req.params;
+    const session = await query(
+      "SELECT id, status, total_pages, processed_pages, created_at, updated_at FROM sessions WHERE id=$1",
+      [id],
+    );
+    if (session.rowCount === 0) {
+      return res.status(404).json({ error: "Session not found" });
+    }
+
+    const pages = await query(
+      "SELECT COUNT(*)::int AS pages_done, COALESCE(MAX(page_number), 0) AS last_page FROM session_pages WHERE session_id=$1",
+      [id],
+    );
+    const voters = await query(
+      "SELECT COUNT(*)::int AS voter_count FROM session_voters WHERE session_id=$1",
+      [id],
+    );
+
+    const { status, total_pages, processed_pages, created_at, updated_at } =
+      session.rows[0];
+    const pages_done = pages.rows[0].pages_done;
+    const last_page_processed = pages.rows[0].last_page;
+    const voter_count = voters.rows[0].voter_count;
+    const current_page =
+      status === "processing" && total_pages
+        ? Math.min(processed_pages + 1, total_pages)
+        : null;
+    const dispatchStatus = getApiKeyStatuses();
+
+    return res.json({
+      sessionId: id,
+      status,
+      total_pages,
+      processed_pages,
+      pages_done,
+      last_page_processed,
+      current_page,
+      voter_count,
+      activeDispatchTier: dispatchStatus.activeDispatchTier,
+      paidFallbackActive: dispatchStatus.activeDispatchTier === "paid",
+      created_at,
+      updated_at,
+    });
+  } catch (err) {
+    return sendRouteError(res, err);
   }
-
-  const pages = await query(
-    "SELECT COUNT(*)::int AS pages_done, COALESCE(MAX(page_number), 0) AS last_page FROM session_pages WHERE session_id=$1",
-    [id],
-  );
-  const voters = await query(
-    "SELECT COUNT(*)::int AS voter_count FROM session_voters WHERE session_id=$1",
-    [id],
-  );
-
-  const { status, total_pages, processed_pages, created_at, updated_at } =
-    session.rows[0];
-  const pages_done = pages.rows[0].pages_done;
-  const last_page_processed = pages.rows[0].last_page;
-  const voter_count = voters.rows[0].voter_count;
-  const current_page =
-    status === "processing" && total_pages
-      ? Math.min(processed_pages + 1, total_pages)
-      : null;
-  const dispatchStatus = getApiKeyStatuses();
-
-  res.json({
-    sessionId: id,
-    status,
-    total_pages,
-    processed_pages,
-    pages_done,
-    last_page_processed,
-    current_page,
-    voter_count,
-    activeDispatchTier: dispatchStatus.activeDispatchTier,
-    paidFallbackActive: dispatchStatus.activeDispatchTier === "paid",
-    created_at,
-    updated_at,
-  });
 });
 
 // Session detail - Admin only
 app.get("/sessions/:id", authenticate, adminOnly, async (req, res) => {
-  const { id } = req.params;
-  const session = await query("SELECT * FROM sessions WHERE id=$1", [id]);
-  if (session.rowCount === 0) {
-    return res.status(404).json({ error: "Session not found" });
+  try {
+    const { id } = req.params;
+    const session = await query("SELECT * FROM sessions WHERE id=$1", [id]);
+    if (session.rowCount === 0) {
+      return res.status(404).json({ error: "Session not found" });
+    }
+
+    const pages = await query(
+      "SELECT page_number, page_path, raw_text, structured_json, created_at FROM session_pages WHERE session_id=$1 ORDER BY page_number ASC",
+      [id],
+    );
+
+    const voters = await query(
+      "SELECT id, page_number, assembly, part_number, section, serial_number, voter_id, name, relation_type, relation_name, house_number, age, gender, religion, under_adjudication, photo_url, is_printed, printed_at, created_at FROM session_voters WHERE session_id=$1 ORDER BY page_number, serial_number",
+      [id],
+    );
+
+    return res.json({
+      session: session.rows[0],
+      pages: pages.rows,
+      voters: voters.rows,
+    });
+  } catch (err) {
+    return sendRouteError(res, err);
   }
-
-  const pages = await query(
-    "SELECT page_number, page_path, raw_text, structured_json, created_at FROM session_pages WHERE session_id=$1 ORDER BY page_number ASC",
-    [id],
-  );
-
-  const voters = await query(
-    "SELECT id, page_number, assembly, part_number, section, serial_number, voter_id, name, relation_type, relation_name, house_number, age, gender, religion, under_adjudication, photo_url, is_printed, printed_at, created_at FROM session_voters WHERE session_id=$1 ORDER BY page_number, serial_number",
-    [id],
-  );
-
-  res.json({
-    session: session.rows[0],
-    pages: pages.rows,
-    voters: voters.rows,
-  });
 });
 
 // Session metadata correction - Admin only

@@ -43,6 +43,61 @@ function detectAdjudicationFromText(value) {
   return /\badjudication\b/i.test(value);
 }
 
+function detectExcludedVoterFromText(value) {
+  if (typeof value !== "string") return false;
+
+  const text = value.trim();
+  if (!text) return false;
+
+  if (/\bdeleted\b/i.test(text)) return true;
+  if (/\bunder\s+jurisdiction\b/i.test(text)) return true;
+  if (/\bdeleted\s+after\s+adjudication\b/i.test(text)) return true;
+
+  // OCR sometimes spells "officers" as "officiers/officier".
+  return (
+    /\badjudicat(?:ion|ed)\b/i.test(text) &&
+    /\bjudicial\b/i.test(text) &&
+    /\boffic(?:er|ers|ier|iers)\b/i.test(text)
+  );
+}
+
+function shouldExcludeVoter(voter) {
+  const safeVoter = voter && typeof voter === "object" ? voter : {};
+
+  const explicitDeletedFlag =
+    parseBooleanish(safeVoter.deleted) ??
+    parseBooleanish(safeVoter.isDeleted) ??
+    parseBooleanish(safeVoter.is_deleted) ??
+    parseBooleanish(safeVoter.exclude) ??
+    parseBooleanish(safeVoter.excluded);
+
+  if (explicitDeletedFlag === true) return true;
+
+  const textSignals = [
+    safeVoter.status,
+    safeVoter.remarks,
+    safeVoter.note,
+    safeVoter.name,
+    safeVoter.relationName,
+    safeVoter.relation_name,
+    safeVoter.houseNumber,
+    safeVoter.house_number,
+    safeVoter.adjudicationText,
+    safeVoter.rawText,
+    safeVoter.raw_text,
+  ];
+
+  return textSignals.some(detectExcludedVoterFromText);
+}
+
+function normalizeAndFilterVoters(voters) {
+  if (!Array.isArray(voters)) return [];
+
+  return voters
+    .map(normalizeVoter)
+    .filter((voter) => !shouldExcludeVoter(voter));
+}
+
 function normalizeVoter(voter) {
   const safeVoter = voter && typeof voter === "object" ? voter : {};
 
@@ -107,6 +162,7 @@ function parseVoterBlock(block) {
     age,
     gender,
     underAdjudication,
+    rawText: block,
   };
 }
 
@@ -117,9 +173,11 @@ function parseFromPlainText(text) {
   const boothName = pullValue(/(?:Polling Station|Booth)[^:]*:\s*(.+)/i, text);
 
   const blocks = parseBlocks(text);
-  const voters = blocks
-    .map(parseVoterBlock)
-    .filter((v) => v.name || v.voterId || v.serialNumber);
+  const voters = normalizeAndFilterVoters(
+    blocks
+      .map(parseVoterBlock)
+      .filter((v) => v.name || v.voterId || v.serialNumber),
+  );
 
   return { assembly, partNumber, section, boothName, voters };
 }
@@ -143,9 +201,7 @@ export function parseGeminiStructured(text) {
       section: parsed.section || "",
       boothName:
         parsed.boothName || parsed.booth_name || parsed.pollingStation || "",
-      voters: Array.isArray(parsed.voters)
-        ? parsed.voters.map(normalizeVoter)
-        : [],
+      voters: normalizeAndFilterVoters(parsed.voters),
     };
   } catch (err) {
     return parseFromPlainText(text);
