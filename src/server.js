@@ -81,6 +81,80 @@ function normalizeUnderAdjudication(value) {
   return /\badjudication\b/i.test(value);
 }
 
+function normalizeSerialNumberForLookup(value) {
+  if (value === undefined || value === null) return null;
+  const text = String(value).trim();
+  if (!/^\d+$/.test(text)) return null;
+  const parsed = Number.parseInt(text, 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) return null;
+  return String(parsed);
+}
+
+function splitSerialTokens(value) {
+  if (value === undefined || value === null) return [];
+  if (typeof value === "number") return [String(value)];
+  if (typeof value === "string") {
+    return value
+      .split(/[\s,;|]+/g)
+      .map((token) => token.trim())
+      .filter(Boolean);
+  }
+  return [String(value)];
+}
+
+function parseBulkSerialPayload(body) {
+  let sourceValue;
+
+  if (Array.isArray(body)) {
+    sourceValue = body;
+  } else if (body && typeof body === "object") {
+    sourceValue =
+      body.serialNumbers ??
+      body.serials ??
+      body.serialNos ??
+      body.slNos ??
+      body.slNumbers ??
+      body.slNoList ??
+      body.serialNumber ??
+      body.serialNo ??
+      body.slNo ??
+      body.sl_no ??
+      body.serialInput ??
+      body.slInput ??
+      body.text;
+  } else {
+    sourceValue = body;
+  }
+
+  const sourceList = Array.isArray(sourceValue)
+    ? sourceValue
+    : sourceValue === undefined || sourceValue === null
+      ? []
+      : [sourceValue];
+  const rawSerialSet = new Set();
+  const normalizedSerialSet = new Set();
+  const invalidTokens = [];
+
+  for (const sourceItem of sourceList) {
+    const tokens = splitSerialTokens(sourceItem);
+    for (const token of tokens) {
+      const normalized = normalizeSerialNumberForLookup(token);
+      if (!normalized) {
+        invalidTokens.push(token);
+        continue;
+      }
+      rawSerialSet.add(String(token).trim());
+      normalizedSerialSet.add(normalized);
+    }
+  }
+
+  return {
+    rawSerials: [...rawSerialSet],
+    normalizedSerials: [...normalizedSerialSet],
+    invalidTokens,
+  };
+}
+
 function parseVoterBulkPayload(body) {
   if (Array.isArray(body)) return body;
   if (Array.isArray(body?.updates)) return body.updates;
@@ -1492,6 +1566,126 @@ app.patch(
       });
     } catch (err) {
       return res.status(500).json({ error: err.message });
+    }
+  },
+);
+
+// Bulk adjudication by voter serial numbers (SL No) - Admin only
+app.patch(
+  "/sessions/:id/voters/adjudication/by-serial",
+  authenticate,
+  adminOnly,
+  async (req, res) => {
+    const { id } = req.params;
+
+    try {
+      const meta = await getSessionBoothMeta(id);
+      if (!meta) {
+        return res.status(404).json({ error: "Session not found" });
+      }
+
+      const { rawSerials, normalizedSerials, invalidTokens } =
+        parseBulkSerialPayload(req.body || {});
+
+      if (normalizedSerials.length === 0) {
+        return res.status(400).json({
+          error: "Provide at least one valid serial number",
+          invalidTokens,
+        });
+      }
+
+      const partNumber = toNullableText(
+        req.body?.partNumber ?? req.body?.partNo ?? req.body?.part_number,
+      );
+      const hasPartFilter = partNumber !== undefined && partNumber !== null;
+
+      const boothNoInput =
+        req.body?.boothNo ?? req.body?.booth_no ?? req.body?.booth;
+      const hasBoothFilter = boothNoInput !== undefined;
+      const requestedBoothNo = hasBoothFilter
+        ? normalizeBoothNo(boothNoInput)
+        : null;
+
+      if (hasBoothFilter && !requestedBoothNo) {
+        return res.status(400).json({
+          error:
+            "Invalid boothNo. Expected digits with optional suffix (e.g. 7, 45A)",
+        });
+      }
+
+      if (hasBoothFilter && meta.boothNo !== requestedBoothNo) {
+        return res.status(400).json({
+          error: "boothNo does not match this session",
+          sessionBoothNo: meta.boothNo || null,
+          requestedBoothNo,
+        });
+      }
+
+      const matcherSql = [
+        "session_id = $1",
+        "(TRIM(COALESCE(serial_number, '')) = ANY($2::text[]) OR COALESCE(NULLIF(regexp_replace(TRIM(COALESCE(serial_number, '')), '^0+', ''), ''), '0') = ANY($3::text[]))",
+      ];
+      const matcherValues = [id, rawSerials, normalizedSerials];
+
+      if (hasPartFilter) {
+        matcherSql.push(
+          `TRIM(COALESCE(part_number, '')) = $${matcherValues.length + 1}`,
+        );
+        matcherValues.push(partNumber);
+      }
+
+      const matchedResult = await query(
+        `SELECT id, serial_number, part_number, under_adjudication
+         FROM session_voters
+         WHERE ${matcherSql.join(" AND ")}`,
+        matcherValues,
+      );
+
+      const matchedVoters = matchedResult.rows;
+      const matchedSerialSet = new Set();
+
+      for (const voter of matchedVoters) {
+        const normalized = normalizeSerialNumberForLookup(voter.serial_number);
+        if (normalized) {
+          matchedSerialSet.add(normalized);
+        }
+      }
+
+      const ignoredSerialNumbers = normalizedSerials.filter(
+        (serial) => !matchedSerialSet.has(serial),
+      );
+
+      const idsToUpdate = matchedVoters
+        .filter((voter) => voter.under_adjudication !== true)
+        .map((voter) => voter.id);
+
+      let updatedRows = [];
+      if (idsToUpdate.length > 0) {
+        const updated = await query(
+          `UPDATE session_voters
+           SET under_adjudication = TRUE
+           WHERE session_id = $1 AND id = ANY($2::bigint[])
+           RETURNING id, session_id, part_number, serial_number, under_adjudication`,
+          [id, idsToUpdate],
+        );
+        updatedRows = updated.rows;
+      }
+
+      return res.json({
+        message: "Bulk adjudication by serial numbers completed",
+        boothNo: meta.boothNo || null,
+        partNumber: hasPartFilter ? partNumber : null,
+        requestedSerialCount: normalizedSerials.length,
+        matchedCount: matchedVoters.length,
+        updatedCount: updatedRows.length,
+        alreadyUnderAdjudicationCount:
+          matchedVoters.length - idsToUpdate.length,
+        ignoredSerialNumbers,
+        invalidTokens,
+        voters: updatedRows,
+      });
+    } catch (err) {
+      return sendRouteError(res, err);
     }
   },
 );
