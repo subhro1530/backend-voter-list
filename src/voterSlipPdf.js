@@ -421,7 +421,7 @@ function formatBoothFilename(boothNo) {
 
 export function buildMassSlipFilename(boothNo) {
   const safeBooth = formatBoothFilename(boothNo);
-  return `voterslips-booth-${safeBooth || "unknown"}.pdf`;
+  return `voterslip-booth-${safeBooth || "unknown"}.pdf`;
 }
 
 export async function buildMassVoterSlipPdfFile(

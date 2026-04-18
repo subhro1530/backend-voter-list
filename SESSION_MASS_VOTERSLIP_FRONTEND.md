@@ -67,6 +67,7 @@ Important:
 
 - Download each booth PDF as soon as that booth job completes.
 - Backend removes artifact after successful download; do not retry same download blindly.
+- Expected downloaded filename format: voterslip-booth-<booth-no>.pdf
 
 ## Required Timing Control
 
