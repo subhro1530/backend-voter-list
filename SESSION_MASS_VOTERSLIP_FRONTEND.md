@@ -1,149 +1,205 @@
-# Session Page + Mass Voter Slip Frontend Prompt
+# Sessions Page Frontend Prompt: Sequential Booth Range Auto Download
 
-Use this in the frontend repo to implement session listing performance fixes, pagination, and production-safe voter-slip UX for Unicode errors.
+Use this in the frontend repository only.
 
-## Mission
+This file includes only the new change requested:
 
-Improve session browsing UX and speed by defaulting to recent data, add practical filters (including booth number), and prevent silent voter-slip failures by handling Unicode-related backend errors cleanly on UI.
+- Do not generate one big ZIP for booth range.
+- Generate and download one booth PDF at a time.
+- Move to next booth only after current download completes.
+- Wait 15 seconds before starting the next booth.
 
-## Scope
+## Why This Change
 
-Implement all items below on the Sessions page and Mass Voter Slip flow.
+The previous high-load pattern can overload DB and memory during large range processing. We need to reduce concurrent load and avoid very large in-memory artifacts.
 
-## Requirements
+Observed high-load failures to prevent:
 
-### 1) Sessions Filters (mandatory)
+- transient DB failures (example code 08P01)
+- large file/memory write failure:
+  - RangeError [ERR_OUT_OF_RANGE]: The value of "length" is out of range
 
-Add a filter bar on Sessions page with at least:
+## New Flow (Frontend Orchestration Only)
 
-- Booth No
-- Assembly
-- Voter List
-- Section
-- Date range (from/to)
-- Status (if available)
+For booth range input like 1-50:
 
-Behavior:
+1. Resolve booth list in range.
+2. For each booth in order:
+3. Find matching session for that booth.
+4. Start single-booth mass PDF job.
+5. Poll until completed or failed.
+6. If completed, download that booth PDF immediately.
+7. Wait exactly 15 seconds.
+8. Continue to next booth.
 
-- Filters must be server-driven (send query params to sessions list API).
-- Debounce text input fields (300-500ms).
-- Reset page to 1 whenever filters change.
-- Keep filters in URL query string for shareable state.
+Rules:
 
-Example query format:
+- Concurrency must be 1 (strictly sequential).
+- Never start next booth before current booth is done.
+- Keep process resumable after failures.
 
-- `/sessions?boothNo=123&assembly=Barasat&voterList=all&section=A&page=1&limit=10&sort=createdAt:desc`
+## APIs To Use
 
-### 2) Pagination: 10 Per Page + Next/Prev
+Use existing APIs only.
 
-Sessions list must:
+### Start Job For One Booth Session
 
-- Show exactly 10 rows per page.
-- Include Previous and Next controls.
-- Disable Previous on first page.
-- Disable Next when no more data.
-- Show page indicator (example: `Page 2`).
+- Method: POST
+- URL: /user/voterslips/mass/sessions/:sessionId/start
 
-API assumptions:
+Alternative supported (if your UI already stores current session id):
 
-- Use server pagination (`page`, `limit=10`).
-- If API returns total count, compute `hasNext` from total.
-- If no total count, infer `hasNext` when returned row count is 10.
+- Method: POST
+- URL: /user/voterslips/mass/current-session/start
+- Body: { "sessionId": "uuid" }
 
-### 3) Initial Load Optimization (only recent 10)
+### Poll Job
 
-On initial Sessions page load:
+- Method: GET
+- URL: /user/voterslips/mass/jobs/:jobId
 
-- Fetch only the latest 10 sessions sorted by newest first.
-- Do not prefetch older pages until user clicks Next.
-- Use skeleton loaders only for visible rows.
-- Keep last successful page response in local state cache to avoid refetch on quick back/next.
+### Download Completed PDF
 
-Performance goals:
-
-- Time-to-first-list render should improve by avoiding full history fetch.
-- API calls should be minimal and deterministic.
-
-### 4) Mass Voter Slip Unicode Error UX (production issue)
-
-Current backend error example:
-
-- `PDF generation failed due to font encoding on backend. Please use a Unicode-capable embedded font...`
-
-Frontend must:
-
-- Detect this error string (or backend error code if provided).
-- Show a clear actionable message in job status panel.
-- Expose details in expandable technical panel.
-- Keep `Restart with Previous Filters` CTA visible.
-
-### 5) Frontend Data Sanitization Before Submit
-
-Before sending voter-slip generation payload:
-
-- Normalize text fields to NFC.
-- Remove control characters except newline/tab.
-- Trim repeated whitespace.
-- If sanitization changes user input, show non-blocking warning:
-  - `Some unsupported characters were removed to make PDF generation safer.`
+- Method: GET
+- URL: /user/voterslips/mass/jobs/:jobId/download
 
 Important:
 
-- Do not strip valid Bengali or other Unicode letters.
-- Do not mutate display labels; sanitize request payload values used by backend PDF generator.
+- Download each booth PDF as soon as that booth job completes.
+- Backend removes artifact after successful download; do not retry same download blindly.
 
-### 6) Resilience + Retry
+## Required Timing Control
 
-For voter-slip job polling:
+Set frontend constant:
 
-- Retry transient polling failures with exponential backoff (max 3 retries).
-- Stop polling on terminal states: completed, failed, cancelled.
-- Preserve last known progress UI even if polling request fails once.
+- NEXT_BOOTH_DELAY_MS = 15000
 
-## Suggested Frontend Types
+Behavior:
+
+- After a booth download success: wait 15000 ms, then start next booth.
+- After a booth failure: wait 15000 ms, then continue or retry based on retry policy.
+
+## Retry Policy (Load-Safe)
+
+Per booth:
+
+- max 2 retries for start or polling failures
+- exponential backoff for transient errors
+- still keep 15s gap before next attempt
+
+Treat as transient/load-related:
+
+- 503 responses
+- DB transient hints in message/code (for example 08P01)
+- network timeout/reset
+
+Do not retry more than configured max. Mark booth failed and continue.
+
+## Sessions Page UX Update
+
+### Input
+
+- Booth Range input accepts:
+  - 1-50
+  - 5 to 20
+  - 12
+
+### Queue View (Per Booth)
+
+Show one row per booth with status:
+
+- pending
+- processing
+- downloaded
+- failed
+- skipped
+
+For each booth row show:
+
+- booth number
+- session id (if resolved)
+- job id
+- attempt count
+- status text
+- error (if any)
+
+### Global Progress
+
+Show:
+
+- total booths in range
+- completed downloads count
+- failed count
+- current booth
+- next booth ETA (15s cooldown timer)
+
+### Control Buttons
+
+- Start Auto Download
+- Pause
+- Resume
+- Stop
+- Retry Failed Booths
+
+## Critical Business Rule (Still Required)
+
+Part No displayed in generated mass slips is booth-context driven in backend mass flow.
+
+Frontend must:
+
+- display current booth clearly during sequential run
+- avoid mixing booth identity across queue items
+
+## Error Handling Matrix
+
+- 400 on start: invalid input/session issue -> mark booth failed
+- 404 on start: booth/session/voters not found -> mark booth skipped/failed
+- 409 on download: job not completed -> continue polling
+- 410 on download: already removed -> mark as downloaded-if-previously-successful else failed
+- 500/503: transient retry with capped attempts
+
+## Suggested Frontend State Shape
 
 ```ts
-type SessionFilterState = {
-  boothNo?: string;
-  assembly?: string;
-  voterList?: string;
-  section?: string;
-  status?: string;
-  fromDate?: string;
-  toDate?: string;
+type BoothRunItem = {
+  boothNo: string;
+  sessionId: string | null;
+  jobId: string | null;
+  status: "pending" | "processing" | "downloaded" | "failed" | "skipped";
+  attempts: number;
+  error: string | null;
 };
 
-type SessionListQuery = SessionFilterState & {
-  page: number;
-  limit: 10;
-  sort: "createdAt:desc";
-};
-
-type SanitizationResult = {
-  value: string;
-  changed: boolean;
+type BoothRangeAutoDownloadState = {
+  rangeInput: string;
+  isRunning: boolean;
+  isPaused: boolean;
+  currentBooth: string | null;
+  cooldownMsRemaining: number;
+  items: BoothRunItem[];
+  totals: {
+    total: number;
+    downloaded: number;
+    failed: number;
+    skipped: number;
+  };
 };
 ```
 
 ## Acceptance Checklist
 
-1. Sessions page loads only 10 latest records initially.
-2. Filters include booth number and are reflected in URL.
-3. Pagination works with Next/Previous and 10 rows per page.
-4. Changing any filter resets to page 1.
-5. Unicode backend failure is shown with a clear actionable UI message.
-6. Payload sanitization runs before submit and shows warning when data changes.
-7. Polling remains stable under temporary network failures.
+1. Range 1-50 is processed booth by booth in strict sequence.
+2. Each completed booth PDF downloads immediately.
+3. Next booth starts only after 15 second wait.
+4. No parallel booth job starts at any time.
+5. Transient failures retry with cap and do not block full run.
+6. UI clearly shows per-booth status and global progress.
+7. Flow reduces DB pressure versus previous bulk strategy.
 
 ## QA Scenarios
 
-1. Apply booth filter, reload page, verify same filter persists from URL.
-2. Navigate to page 2 and back to page 1, verify no duplicate flicker and preserved state.
-3. Trigger Unicode backend failure and verify user sees actionable error + technical details.
-4. Submit input containing hidden control chars, verify warning appears and request succeeds.
-5. Verify Bengali names remain intact after sanitization.
-
-## Non-Goals
-
-- No backend schema changes in this task.
-- No redesign of unrelated pages.
+1. Run 1-5 and verify five separate booth PDFs download sequentially.
+2. Confirm 15 second gap between booth completions and next booth start.
+3. Simulate transient API failure and verify capped retry + continue behavior.
+4. Include a booth with no session and verify skipped/failed handling without stopping run.
+5. Pause/resume mid-run and verify queue state remains consistent.

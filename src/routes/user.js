@@ -1,6 +1,7 @@
 import express from "express";
 import path from "path";
 import fs from "fs-extra";
+import AdmZip from "adm-zip";
 import { execFile } from "child_process";
 import { promisify } from "util";
 import { v4 as uuidv4 } from "uuid";
@@ -58,6 +59,22 @@ const voterSlipJobsRoot = path.join(
   "voter-slips",
   "jobs",
 );
+const boothRangeMaxSpan = Math.max(
+  Number(process.env.VOTER_SLIP_RANGE_MAX_SPAN || 200),
+  1,
+);
+const boothRangePerSlipPauseMs = Math.max(
+  Number(process.env.VOTER_SLIP_RANGE_FILE_PAUSE_MS || 40),
+  0,
+);
+const boothRangePerBoothPauseMs = Math.max(
+  Number(process.env.VOTER_SLIP_RANGE_BOOTH_PAUSE_MS || 250),
+  0,
+);
+
+function sleepMs(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 async function cleanupVoterSlipJobsOnStartup() {
   await fs.remove(voterSlipJobsRoot).catch(() => null);
@@ -107,6 +124,7 @@ function makeMassJobPublicView(job) {
 
   return {
     id: job.id,
+    jobType: job.jobType || "mass-pdf",
     status: job.status,
     total: job.total,
     processed: job.processed,
@@ -114,7 +132,10 @@ function makeMassJobPublicView(job) {
     finishedAt: job.finishedAt,
     error: job.error,
     filters: job.filters,
+    boothRange: job.boothRange || null,
+    progress: job.progress || null,
     fileName: job.fileName,
+    contentType: job.contentType || "application/pdf",
     downloadedAt: job.downloadedAt || null,
     downloadUrl: canDownload
       ? `/user/voterslips/mass/jobs/${job.id}/download`
@@ -125,6 +146,125 @@ function makeMassJobPublicView(job) {
 function normalizeText(value) {
   if (value === null || value === undefined) return "";
   return String(value).trim();
+}
+
+function sanitizeFilenameToken(value, fallback = "unknown") {
+  const text = normalizeText(value);
+  if (!text) return fallback;
+
+  const cleaned = text
+    .replace(/[^a-zA-Z0-9_-]+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .toLowerCase();
+
+  return cleaned || fallback;
+}
+
+function parseBoothNumber(value) {
+  const normalized = normalizeBoothNo(value);
+  if (!normalized) return null;
+
+  const digits = normalized.match(/\d+/)?.[0];
+  if (!digits) return null;
+
+  const parsed = Number.parseInt(digits, 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) return null;
+  return parsed;
+}
+
+function resolveSessionBoothNo(sessionLike) {
+  const fromSession = normalizeBoothNo(sessionLike?.booth_no || "");
+  if (fromSession) return fromSession;
+
+  const fromFilename = normalizeBoothNo(
+    extractBoothNoFromFilename(sessionLike?.original_filename || ""),
+  );
+  if (fromFilename) return fromFilename;
+
+  return "";
+}
+
+function parseBoothRangePayload(body) {
+  const source = body && typeof body === "object" ? body : {};
+
+  let fromBoothNo = parseBoothNumber(
+    source.fromBoothNo ?? source.from ?? source.start,
+  );
+  let toBoothNo = parseBoothNumber(source.toBoothNo ?? source.to ?? source.end);
+
+  const rangeText = normalizeText(
+    source.boothRange ?? source.range ?? source.boothNoRange,
+  );
+
+  if (rangeText && (fromBoothNo === null || toBoothNo === null)) {
+    const rangeMatch = rangeText.match(/^(\d{1,4})\s*(?:-|to|:)\s*(\d{1,4})$/i);
+    if (rangeMatch) {
+      fromBoothNo = Number.parseInt(rangeMatch[1], 10);
+      toBoothNo = Number.parseInt(rangeMatch[2], 10);
+    } else {
+      const singleBoothNo = parseBoothNumber(rangeText);
+      if (singleBoothNo !== null) {
+        fromBoothNo = singleBoothNo;
+        toBoothNo = singleBoothNo;
+      }
+    }
+  }
+
+  if (fromBoothNo === null || toBoothNo === null) {
+    return {
+      error:
+        "Invalid booth range. Provide boothRange like '1-50' or fromBoothNo/toBoothNo",
+    };
+  }
+
+  if (fromBoothNo > toBoothNo) {
+    [fromBoothNo, toBoothNo] = [toBoothNo, fromBoothNo];
+  }
+
+  const span = toBoothNo - fromBoothNo + 1;
+  if (span > boothRangeMaxSpan) {
+    return {
+      error: `Booth range too large. Maximum allowed span is ${boothRangeMaxSpan}`,
+      maxSpan: boothRangeMaxSpan,
+    };
+  }
+
+  return {
+    fromBoothNo,
+    toBoothNo,
+    span,
+  };
+}
+
+function buildBoothRangeZipFilename(fromBoothNo, toBoothNo) {
+  const fromToken = sanitizeFilenameToken(fromBoothNo, "from");
+  const toToken = sanitizeFilenameToken(toBoothNo, "to");
+  return `voterslips-booths-${fromToken}-${toToken}.zip`;
+}
+
+function withBoothPartNo(voter, boothNo) {
+  const resolvedBoothNo =
+    normalizeBoothNo(boothNo) ||
+    normalizeBoothNo(voter?.boothNo) ||
+    normalizeBoothNo(voter?.partNumber) ||
+    normalizeText(boothNo);
+
+  if (!resolvedBoothNo) return voter;
+
+  return {
+    ...voter,
+    boothNo: resolvedBoothNo,
+    partNumber: resolvedBoothNo,
+  };
+}
+
+function buildRangeZipEntryName({ boothNo, voter, index }) {
+  const safeBooth = sanitizeFilenameToken(boothNo, "unknown");
+  const safeSerial = sanitizeFilenameToken(voter?.serialNumber, "na");
+  const safeVoterId = sanitizeFilenameToken(voter?.id || index + 1, "voter");
+
+  return `booth-${safeBooth}/voterslip-booth-${safeBooth}-serial-${safeSerial}-voter-${safeVoterId}.pdf`;
 }
 
 function isUuidLike(value) {
@@ -410,20 +550,36 @@ async function queueMassVoterSlipJob({
   filters,
   requestedBy,
   boothNoForName,
+  partNoOverride,
 }) {
-  const fileName = buildMassSlipFilename(boothNoForName);
+  const resolvedBoothNo =
+    normalizeBoothNo(boothNoForName || "") || normalizeText(boothNoForName);
+  const resolvedPartNo =
+    normalizeBoothNo(partNoOverride || "") || normalizeText(partNoOverride);
+  const votersForPdf = resolvedPartNo
+    ? voters.map((voter) => withBoothPartNo(voter, resolvedPartNo))
+    : voters;
+
+  const fileName = buildMassSlipFilename(
+    resolvedBoothNo || resolvedPartNo || "unknown",
+  );
   const jobId = uuidv4();
   const filePath = path.join(voterSlipJobsRoot, jobId, fileName);
 
   const job = {
     id: jobId,
+    jobType: "mass-pdf",
+    contentType: "application/pdf",
     status: "queued",
-    total: voters.length,
+    total: votersForPdf.length,
     processed: 0,
     startedAt: new Date().toISOString(),
     finishedAt: null,
     error: null,
-    filters,
+    filters: {
+      ...filters,
+      partNoOverride: resolvedPartNo || null,
+    },
     fileName,
     filePath,
     downloadedAt: null,
@@ -435,7 +591,7 @@ async function queueMassVoterSlipJob({
   setImmediate(async () => {
     try {
       job.status = "processing";
-      await buildMassVoterSlipPdfFile(voters, filePath, {
+      await buildMassVoterSlipPdfFile(votersForPdf, filePath, {
         onProgress: (processed, total) => {
           job.processed = processed;
           job.total = total;
@@ -447,6 +603,198 @@ async function queueMassVoterSlipJob({
       job.status = "failed";
       job.error = error.message || "Mass slip generation failed";
       job.finishedAt = new Date().toISOString();
+    }
+  });
+
+  return job;
+}
+
+async function getLatestSessionsForBoothRange({ fromBoothNo, toBoothNo }) {
+  const result = await query(
+    `SELECT id, status, booth_no, booth_name, assembly_name, original_filename,
+            created_at, updated_at
+     FROM sessions
+     ORDER BY COALESCE(updated_at, created_at) DESC`,
+  );
+
+  const sessionByBooth = new Map();
+
+  for (const row of result.rows) {
+    const resolvedBoothNo = resolveSessionBoothNo(row);
+    const numericBoothNo = parseBoothNumber(resolvedBoothNo);
+    if (numericBoothNo === null) continue;
+    if (numericBoothNo < fromBoothNo || numericBoothNo > toBoothNo) continue;
+
+    // Keep the latest session only per booth.
+    if (sessionByBooth.has(numericBoothNo)) continue;
+
+    sessionByBooth.set(numericBoothNo, {
+      ...row,
+      resolvedBoothNo,
+      numericBoothNo,
+    });
+  }
+
+  const sessions = [];
+  const missingBooths = [];
+
+  for (let boothNo = fromBoothNo; boothNo <= toBoothNo; boothNo += 1) {
+    const found = sessionByBooth.get(boothNo);
+    if (found) {
+      sessions.push(found);
+    } else {
+      missingBooths.push(String(boothNo));
+    }
+  }
+
+  return {
+    sessions,
+    missingBooths,
+  };
+}
+
+async function getSessionVoterCountsBySessionIds(sessionIds) {
+  const counts = new Map();
+  if (!Array.isArray(sessionIds) || sessionIds.length === 0) {
+    return counts;
+  }
+
+  const result = await query(
+    `SELECT session_id, COUNT(*)::int AS voter_count
+     FROM session_voters
+     WHERE session_id = ANY($1::uuid[])
+       AND COALESCE(under_adjudication, FALSE) = FALSE
+     GROUP BY session_id`,
+    [sessionIds],
+  );
+
+  for (const row of result.rows) {
+    counts.set(row.session_id, Number(row.voter_count || 0));
+  }
+
+  return counts;
+}
+
+async function queueBoothRangeZipJob({
+  boothRange,
+  boothSessions,
+  missingBooths,
+  requestedBy,
+  filters,
+  voterCountsBySessionId,
+}) {
+  const fileName = buildBoothRangeZipFilename(
+    boothRange.fromBoothNo,
+    boothRange.toBoothNo,
+  );
+  const jobId = uuidv4();
+  const filePath = path.join(voterSlipJobsRoot, jobId, fileName);
+  const requestedBooths = boothRange.toBoothNo - boothRange.fromBoothNo + 1;
+  const totalFiles = boothSessions.reduce(
+    (sum, session) => sum + (voterCountsBySessionId.get(session.id) || 0),
+    0,
+  );
+
+  const job = {
+    id: jobId,
+    jobType: "booth-range-zip",
+    contentType: "application/zip",
+    status: "queued",
+    total: totalFiles,
+    processed: 0,
+    startedAt: new Date().toISOString(),
+    finishedAt: null,
+    error: null,
+    filters,
+    boothRange,
+    progress: {
+      requestedBooths,
+      matchedBooths: boothSessions.length,
+      missingBooths,
+      processedBooths: 0,
+      currentBooth: null,
+      totalFiles,
+      processedFiles: 0,
+      generatedFiles: 0,
+      boothsWithNoVoters: [],
+    },
+    fileName,
+    filePath,
+    downloadedAt: null,
+    downloadFailedAt: null,
+    requestedBy,
+  };
+
+  voterSlipJobs.set(jobId, job);
+
+  setImmediate(async () => {
+    const zip = new AdmZip();
+
+    try {
+      job.status = "processing";
+
+      for (const boothSession of boothSessions) {
+        const boothNo =
+          normalizeBoothNo(boothSession.resolvedBoothNo || "") ||
+          String(boothSession.numericBoothNo || "");
+        job.progress.currentBooth = boothNo || null;
+
+        const voters = await getMassSlipVoters(
+          buildSessionMassFilters(boothSession.id),
+        );
+        const votersForBooth = voters.map((voter) =>
+          withBoothPartNo(voter, boothNo),
+        );
+
+        if (!votersForBooth.length) {
+          job.progress.boothsWithNoVoters.push(boothNo || "unknown");
+          job.progress.processedBooths += 1;
+          if (boothRangePerBoothPauseMs > 0) {
+            await sleepMs(boothRangePerBoothPauseMs);
+          }
+          continue;
+        }
+
+        for (let i = 0; i < votersForBooth.length; i += 1) {
+          const voter = votersForBooth[i];
+          const pdfBytes = await buildSingleVoterSlipPdf(voter);
+          const entryName = buildRangeZipEntryName({
+            boothNo,
+            voter,
+            index: job.progress.generatedFiles,
+          });
+
+          zip.addFile(entryName, Buffer.from(pdfBytes));
+
+          job.processed += 1;
+          job.progress.processedFiles = job.processed;
+          job.progress.generatedFiles += 1;
+
+          if (boothRangePerSlipPauseMs > 0) {
+            await sleepMs(boothRangePerSlipPauseMs);
+          }
+
+          if (job.progress.generatedFiles % 20 === 0) {
+            await new Promise((resolve) => setImmediate(resolve));
+          }
+        }
+
+        job.progress.processedBooths += 1;
+
+        if (boothRangePerBoothPauseMs > 0) {
+          await sleepMs(boothRangePerBoothPauseMs);
+        }
+      }
+
+      job.progress.currentBooth = null;
+      await fs.outputFile(filePath, zip.toBuffer());
+      job.status = "completed";
+      job.finishedAt = new Date().toISOString();
+    } catch (error) {
+      job.status = "failed";
+      job.error = error.message || "Booth-range zip generation failed";
+      job.finishedAt = new Date().toISOString();
+      job.progress.currentBooth = null;
     }
   });
 
@@ -504,6 +852,7 @@ async function startMassVoterSlipBySession(req, res, sessionIdInput) {
     filters,
     requestedBy: req.user.id,
     boothNoForName,
+    partNoOverride: boothNoForName,
   });
 
   return res.status(202).json({
@@ -1413,11 +1762,19 @@ router.post("/voterslips/mass/start", async (req, res) => {
 
     const boothNoForName =
       filters.boothNo || filters.partNumber || voters[0].boothNo;
+    const shouldOverridePartNo = Boolean(
+      filters.sessionId || filters.boothNo || filters.partNumber,
+    );
+    const partNoOverride = shouldOverridePartNo
+      ? normalizeBoothNo(boothNoForName || "") || normalizeText(boothNoForName)
+      : "";
+
     const job = await queueMassVoterSlipJob({
       voters,
       filters,
       requestedBy: req.user.id,
       boothNoForName,
+      partNoOverride,
     });
 
     return res.status(202).json({
@@ -1454,6 +1811,92 @@ router.post("/voterslips/mass/current-session/start", async (req, res) => {
 });
 
 /**
+ * Start async booth-range generation of individual voter slips in one ZIP.
+ * Body example: { boothRange: "1-50" }
+ */
+router.post("/voterslips/mass/booth-range/start", async (req, res) => {
+  try {
+    await cleanupOldVoterSlipJobs();
+
+    const hasTemplate = await ensureVoterSlipTemplateExists();
+    if (!hasTemplate) {
+      return res.status(500).json({
+        error: "Voter slip template not found",
+        expectedPath: getVoterSlipTemplatePublicHint(),
+      });
+    }
+
+    const parsedRange = parseBoothRangePayload(req.body);
+    if (parsedRange.error) {
+      return res.status(400).json({
+        error: parsedRange.error,
+        maxSpan: parsedRange.maxSpan || boothRangeMaxSpan,
+        example: {
+          boothRange: "1-50",
+        },
+      });
+    }
+
+    const { sessions: boothSessions, missingBooths } =
+      await getLatestSessionsForBoothRange(parsedRange);
+    if (!boothSessions.length) {
+      return res.status(404).json({
+        error: "No sessions found in booth range",
+        boothRange: `${parsedRange.fromBoothNo}-${parsedRange.toBoothNo}`,
+        missingBooths,
+      });
+    }
+
+    const voterCountsBySessionId = await getSessionVoterCountsBySessionIds(
+      boothSessions.map((session) => session.id),
+    );
+    const totalVoters = boothSessions.reduce(
+      (sum, session) => sum + (voterCountsBySessionId.get(session.id) || 0),
+      0,
+    );
+
+    if (totalVoters === 0) {
+      return res.status(404).json({
+        error: "No voters found for selected booth range",
+        boothRange: `${parsedRange.fromBoothNo}-${parsedRange.toBoothNo}`,
+      });
+    }
+
+    const filters = {
+      fromBoothNo: String(parsedRange.fromBoothNo),
+      toBoothNo: String(parsedRange.toBoothNo),
+      boothRange: `${parsedRange.fromBoothNo}-${parsedRange.toBoothNo}`,
+    };
+
+    const job = await queueBoothRangeZipJob({
+      boothRange: {
+        fromBoothNo: parsedRange.fromBoothNo,
+        toBoothNo: parsedRange.toBoothNo,
+      },
+      boothSessions,
+      missingBooths,
+      requestedBy: req.user.id,
+      filters,
+      voterCountsBySessionId,
+    });
+
+    return res.status(202).json({
+      message: "Booth-range voter slip ZIP generation started",
+      summary: {
+        boothRange: `${parsedRange.fromBoothNo}-${parsedRange.toBoothNo}`,
+        requestedBooths: parsedRange.span,
+        matchedBooths: boothSessions.length,
+        missingBooths,
+        totalVoters,
+      },
+      job: makeMassJobPublicView(job),
+    });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+/**
  * Poll status for mass generation jobs.
  */
 router.get("/voterslips/mass/jobs/:jobId", async (req, res) => {
@@ -1476,7 +1919,7 @@ router.get("/voterslips/mass/jobs/:jobId", async (req, res) => {
 });
 
 /**
- * Download completed mass generation output PDF.
+ * Download completed mass generation output file.
  */
 router.get("/voterslips/mass/jobs/:jobId/download", async (req, res) => {
   try {
@@ -1500,7 +1943,7 @@ router.get("/voterslips/mass/jobs/:jobId/download", async (req, res) => {
 
     if (job.downloadedAt) {
       return res.status(410).json({
-        error: "This generated PDF was already downloaded and removed",
+        error: "This generated file was already downloaded and removed",
         job: makeMassJobPublicView(job),
       });
     }
@@ -1512,7 +1955,15 @@ router.get("/voterslips/mass/jobs/:jobId/download", async (req, res) => {
       });
     }
 
-    res.setHeader("Content-Type", "application/pdf");
+    const contentType =
+      job.contentType ||
+      (String(job.fileName || "")
+        .toLowerCase()
+        .endsWith(".zip")
+        ? "application/zip"
+        : "application/pdf");
+
+    res.setHeader("Content-Type", contentType);
     res.setHeader(
       "Content-Disposition",
       `attachment; filename="${job.fileName}"`,
