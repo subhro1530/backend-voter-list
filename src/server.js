@@ -478,6 +478,21 @@ async function syncSessionProcessedPages(sessionId) {
   return pagesDone;
 }
 
+async function syncSessionTotalPages(sessionId) {
+  const maxPageRes = await query(
+    "SELECT COALESCE(MAX(page_number), 0)::int AS max_page FROM session_pages WHERE session_id=$1",
+    [sessionId],
+  );
+  const maxPage = maxPageRes.rows[0]?.max_page || 0;
+
+  await query(
+    "UPDATE sessions SET total_pages = GREATEST(COALESCE(total_pages, 0), $1), updated_at=now() WHERE id=$2",
+    [maxPage, sessionId],
+  );
+
+  return maxPage;
+}
+
 // CORS configuration with proper origin validation for production
 const corsConfig = {
   origin: function (origin, callback) {
@@ -549,6 +564,43 @@ function getBulkFieldCounts(reqFiles) {
   return counts;
 }
 
+const additionalUploadAllowedMimeTypes = new Set([
+  "application/pdf",
+  "image/png",
+  "image/jpeg",
+  "image/jpg",
+]);
+const additionalUploadAllowedExtensions = new Set([
+  ".pdf",
+  ".png",
+  ".jpg",
+  ".jpeg",
+]);
+
+function isAcceptedAdditionalUploadFile(file) {
+  const mime = String(file?.mimetype || "")
+    .trim()
+    .toLowerCase();
+  if (additionalUploadAllowedMimeTypes.has(mime)) {
+    return true;
+  }
+
+  const ext = path.extname(String(file?.originalname || "")).toLowerCase();
+  return additionalUploadAllowedExtensions.has(ext);
+}
+
+function isImageAdditionalUpload(inputMimeType, fileNameOrPath = "") {
+  const normalizedMime = String(inputMimeType || "")
+    .trim()
+    .toLowerCase();
+  if (normalizedMime.startsWith("image/")) {
+    return true;
+  }
+
+  const ext = path.extname(String(fileNameOrPath || "")).toLowerCase();
+  return ext === ".png" || ext === ".jpg" || ext === ".jpeg";
+}
+
 const upload = multer({
   storage: multer.diskStorage({
     destination: (req, _file, cb) => {
@@ -598,6 +650,47 @@ const bulkUpload = multer({
   fileFilter: (_req, file, cb) => {
     if (file.mimetype !== "application/pdf") {
       cb(new Error("Only PDF uploads are allowed"));
+    } else {
+      cb(null, true);
+    }
+  },
+  limits: { fileSize: maxUploadBytes },
+});
+
+const additionalVoterUpload = multer({
+  storage: multer.diskStorage({
+    destination: async (req, _file, cb) => {
+      try {
+        const sessionId = String(req.params?.id || "").trim();
+        if (!sessionId) {
+          cb(new Error("Session id is required for additional voter upload"));
+          return;
+        }
+
+        const uploadId = uuidv4();
+        req.additionalUploadId = uploadId;
+        const dest = path.join(
+          storageRoot,
+          sessionId,
+          "additional",
+          uploadId,
+          "uploads",
+        );
+        await fs.ensureDir(dest);
+        cb(null, dest);
+      } catch (err) {
+        cb(err);
+      }
+    },
+    filename: (_req, file, cb) => {
+      const safeBaseName = path.basename(file.originalname || "upload.pdf");
+      const uniquePrefix = `${Date.now()}-${Math.round(Math.random() * 1e9)}`;
+      cb(null, `${uniquePrefix}-${safeBaseName}`);
+    },
+  }),
+  fileFilter: (_req, file, cb) => {
+    if (!isAcceptedAdditionalUploadFile(file)) {
+      cb(new Error("Only PDF, PNG, JPG, JPEG uploads are allowed"));
     } else {
       cb(null, true);
     }
@@ -892,6 +985,385 @@ async function processUploadedSessionFile({
   }
 }
 
+async function processAdditionalVotersForSession({
+  sessionId,
+  pdfPath,
+  originalName,
+  inputMimeType,
+  apiKey,
+  dispatchMode,
+  uploadId,
+}) {
+  let previousStatus = null;
+
+  try {
+    const sessionRes = await query(
+      "SELECT id, status FROM sessions WHERE id=$1",
+      [sessionId],
+    );
+    if (sessionRes.rowCount === 0) {
+      return {
+        statusCode: 404,
+        payload: {
+          error: "Session not found",
+          sessionId,
+        },
+      };
+    }
+
+    previousStatus = sessionRes.rows[0]?.status || "completed";
+    if (previousStatus === "processing") {
+      return {
+        statusCode: 409,
+        payload: {
+          error:
+            "Session is currently processing. Try again after it completes.",
+          sessionId,
+          status: previousStatus,
+        },
+      };
+    }
+
+    await query(
+      "UPDATE sessions SET status='processing', updated_at=now() WHERE id=$1",
+      [sessionId],
+    );
+
+    const nextPageRes = await query(
+      "SELECT COALESCE(MAX(page_number), 0)::int AS max_page FROM session_pages WHERE session_id=$1",
+      [sessionId],
+    );
+    const basePageNumber = nextPageRes.rows[0]?.max_page || 0;
+
+    const pageDir = path.join(
+      storageRoot,
+      sessionId,
+      "additional",
+      String(uploadId || uuidv4()),
+      "pages",
+    );
+    await fs.ensureDir(pageDir);
+
+    const singleInputIsImage = isImageAdditionalUpload(
+      inputMimeType,
+      originalName || pdfPath,
+    );
+
+    let pagePaths = [];
+    if (singleInputIsImage) {
+      const sourceExt = path
+        .extname(String(originalName || pdfPath))
+        .toLowerCase();
+      const safeExt =
+        sourceExt === ".jpg" || sourceExt === ".jpeg" ? ".jpg" : ".png";
+      const persistedImagePath = path.join(pageDir, `page-1${safeExt}`);
+      await fs.copy(pdfPath, persistedImagePath, { overwrite: true });
+      pagePaths = [persistedImagePath];
+    } else {
+      pagePaths = await splitPdfToPages(pdfPath, pageDir);
+    }
+
+    if (pagePaths.length === 0) {
+      await query(
+        "UPDATE sessions SET status=$1, updated_at=now() WHERE id=$2",
+        [previousStatus, sessionId],
+      );
+      return {
+        statusCode: 400,
+        payload: {
+          error: "No pages found in uploaded PDF",
+          sessionId,
+        },
+      };
+    }
+
+    const pagePathToNumber = new Map(
+      pagePaths.map((pagePath, idx) => [pagePath, basePageNumber + idx + 1]),
+    );
+
+    const existingSerialRows = await query(
+      "SELECT serial_number FROM session_voters WHERE session_id=$1",
+      [sessionId],
+    );
+    const existingSerialSet = new Set();
+
+    for (const row of existingSerialRows.rows) {
+      const normalized = normalizeSerialNumberForLookup(row.serial_number);
+      if (normalized) existingSerialSet.add(normalized);
+    }
+
+    const uploadSerialSet = new Set();
+
+    let extractedCount = 0;
+    let insertedCount = 0;
+    let skippedExistingCount = 0;
+    let skippedDuplicateInUploadCount = 0;
+    let skippedInvalidCount = 0;
+    let errorCount = 0;
+    let keySwitchCount = 0;
+    let lastKeyUsed = null;
+
+    const insertedVoters = [];
+    const skippedExistingSerialNumbers = [];
+    const skippedDuplicateInUploadSerialNumbers = [];
+    const skippedInvalidSerialNumbers = [];
+
+    const savePageToDatabase = async (pagePath, result) => {
+      const pageNumber = pagePathToNumber.get(pagePath);
+      if (!pageNumber) return;
+
+      const existingPage = await query(
+        "SELECT id FROM session_pages WHERE session_id=$1 AND page_number=$2 LIMIT 1",
+        [sessionId, pageNumber],
+      );
+      if (existingPage.rowCount > 0) {
+        await syncSessionProcessedPages(sessionId);
+        return;
+      }
+
+      const { text, keyUsed } = result;
+      if (lastKeyUsed && keyUsed && keyUsed !== lastKeyUsed) {
+        keySwitchCount++;
+      }
+      if (keyUsed) {
+        lastKeyUsed = keyUsed;
+      }
+
+      const structured = parseGeminiStructured(text);
+
+      const pageRes = await query(
+        "INSERT INTO session_pages (session_id, page_number, page_path, raw_text, structured_json) VALUES ($1, $2, $3, $4, $5) RETURNING id",
+        [sessionId, pageNumber, pagePath, text, structured],
+      );
+
+      const pageId = pageRes.rows[0].id;
+      const assembly = structured.assembly || "";
+      const partNumber = structured.partNumber || "";
+      const section = structured.section || "";
+      const voters = Array.isArray(structured.voters) ? structured.voters : [];
+
+      let religions = [];
+      if (enableReligionClassification && voters.length > 0) {
+        const religionResult = await classifyReligionByNames(voters, apiKey, {
+          dispatchMode,
+        });
+        religions = religionResult.religions;
+      }
+
+      for (let i = 0; i < voters.length; i++) {
+        extractedCount++;
+
+        const voter = voters[i] || {};
+        const serialText = String(
+          voter.serialNumber ??
+            voter.serial_number ??
+            voter.slNo ??
+            voter.sl_no ??
+            "",
+        ).trim();
+        const normalizedSerial = normalizeSerialNumberForLookup(serialText);
+
+        if (!normalizedSerial) {
+          skippedInvalidCount++;
+          skippedInvalidSerialNumbers.push(serialText || "(missing)");
+          continue;
+        }
+
+        if (uploadSerialSet.has(normalizedSerial)) {
+          skippedDuplicateInUploadCount++;
+          skippedDuplicateInUploadSerialNumbers.push(
+            serialText || normalizedSerial,
+          );
+          continue;
+        }
+
+        if (existingSerialSet.has(normalizedSerial)) {
+          skippedExistingCount++;
+          skippedExistingSerialNumbers.push(serialText || normalizedSerial);
+          uploadSerialSet.add(normalizedSerial);
+          continue;
+        }
+
+        uploadSerialSet.add(normalizedSerial);
+        existingSerialSet.add(normalizedSerial);
+
+        const religion = religions[i] || "Other";
+        const ageValue = voter.age ? Number.parseInt(voter.age, 10) : null;
+        const age = Number.isNaN(ageValue) ? null : ageValue;
+        const photoUrl = resolvePlaceholderPhotoUrl();
+        const cleanVoterId = sanitizeVoterId(voter.voterId);
+        const underAdjudication = normalizeUnderAdjudication(
+          voter.underAdjudication ??
+            voter.under_adjudication ??
+            voter.isUnderAdjudication ??
+            voter.adjudication,
+        );
+
+        const inserted = await query(
+          "INSERT INTO session_voters (session_id, page_id, page_number, assembly, part_number, section, serial_number, voter_id, name, relation_type, relation_name, house_number, age, gender, religion, under_adjudication, photo_url) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17) RETURNING id, session_id, page_number, serial_number, voter_id, name",
+          [
+            sessionId,
+            pageId,
+            pageNumber,
+            assembly,
+            partNumber,
+            section,
+            serialText,
+            cleanVoterId,
+            voter.name || "",
+            voter.relationType || voter.relation_type || "",
+            voter.relationName || voter.relation_name || "",
+            voter.houseNumber || voter.house_number || "",
+            age,
+            voter.gender || "",
+            religion,
+            underAdjudication,
+            photoUrl,
+          ],
+        );
+
+        insertedCount++;
+        insertedVoters.push(inserted.rows[0]);
+      }
+
+      await syncSessionProcessedPages(sessionId);
+    };
+
+    await processPagesBatch(
+      pagePaths,
+      0,
+      async (progress) => {
+        if (progress.type === "page_complete" && progress.result) {
+          try {
+            await savePageToDatabase(progress.pagePath, progress.result);
+          } catch (err) {
+            console.error(
+              `Failed to save additional upload page for session ${sessionId}:`,
+              err.message,
+            );
+            errorCount++;
+          }
+        }
+      },
+      { dispatchMode },
+    );
+
+    let remainingPagePaths = await getPendingPagePaths(
+      sessionId,
+      pagePaths,
+      pagePathToNumber,
+    );
+    let roundsDone = 0;
+
+    while (remainingPagePaths.length > 0 && roundsDone < autoResumeRounds) {
+      roundsDone++;
+
+      await sleep(autoResumeDelayMs);
+
+      await processPagesBatch(
+        remainingPagePaths,
+        0,
+        async (progress) => {
+          if (progress.type === "page_complete" && progress.result) {
+            try {
+              await savePageToDatabase(progress.pagePath, progress.result);
+            } catch (err) {
+              console.error(
+                `Retry save failed for additional upload page in session ${sessionId}:`,
+                err.message,
+              );
+              errorCount++;
+            }
+          }
+        },
+        { dispatchMode },
+      );
+
+      remainingPagePaths = await getPendingPagePaths(
+        sessionId,
+        pagePaths,
+        pagePathToNumber,
+      );
+    }
+
+    await syncSessionTotalPages(sessionId);
+    await syncSessionProcessedPages(sessionId);
+
+    const firstNewPageNumber = basePageNumber + 1;
+    const lastNewPageNumber = basePageNumber + pagePaths.length;
+    const savedAdditionalPagesRes = await query(
+      `SELECT COUNT(*)::int AS pages_saved
+       FROM session_pages
+       WHERE session_id=$1 AND page_number BETWEEN $2 AND $3`,
+      [sessionId, firstNewPageNumber, lastNewPageNumber],
+    );
+    const pagesSaved = savedAdditionalPagesRes.rows[0]?.pages_saved || 0;
+    const fullyCompleted = pagesSaved === pagePaths.length;
+
+    await query("UPDATE sessions SET status=$1, updated_at=now() WHERE id=$2", [
+      previousStatus,
+      sessionId,
+    ]);
+
+    const payload = {
+      message: fullyCompleted
+        ? "Additional voters processed"
+        : "Additional voters partially processed",
+      sessionId,
+      status: fullyCompleted ? "completed" : "partial",
+      originalFilename: originalName,
+      summary: {
+        pagesProcessed: pagesSaved,
+        extractedCount,
+        insertedCount,
+        skippedExistingCount,
+        skippedDuplicateInUploadCount,
+        skippedInvalidCount,
+      },
+      insertedVoters,
+      skippedSerialNumbers: [
+        ...skippedExistingSerialNumbers,
+        ...skippedDuplicateInUploadSerialNumbers,
+        ...skippedInvalidSerialNumbers,
+      ],
+      skipped: {
+        existing: skippedExistingSerialNumbers,
+        duplicateInUpload: skippedDuplicateInUploadSerialNumbers,
+        invalid: skippedInvalidSerialNumbers,
+      },
+      keySwitchCount,
+      automaticRetryRounds: roundsDone,
+      errorPages: errorCount,
+      dispatchMode: dispatchMode || getGlobalDispatchMode(),
+      apiKeyStatus: getApiKeyStatuses(),
+    };
+
+    return {
+      statusCode: fullyCompleted ? 200 : 207,
+      payload,
+    };
+  } catch (err) {
+    if (previousStatus) {
+      await query(
+        "UPDATE sessions SET status=$1, updated_at=now() WHERE id=$2",
+        [previousStatus, sessionId],
+      ).catch(() => {});
+    }
+
+    console.error("Additional voter upload failed:", err.message);
+    return {
+      statusCode: 500,
+      payload: {
+        sessionId,
+        status: "failed",
+        error: "Additional voter upload failed",
+        details: err.message,
+        apiKeyStatus: getApiKeyStatuses(),
+      },
+    };
+  }
+}
+
 function buildVoterFilter(params, startIndex = 1) {
   return buildVoterFilterClause(params, { startIndex });
 }
@@ -937,6 +1409,192 @@ async function getSessionBoothMeta(sessionId) {
     assembly,
     boothNo,
     normalizedAssembly: normalizeAssemblyName(assembly),
+  };
+}
+
+function parseSessionNavigationOrder(value) {
+  const normalized = String(value || "")
+    .trim()
+    .toLowerCase();
+  return normalized === "desc" ? "desc" : "asc";
+}
+
+function toSortTimestamp(value) {
+  const ts = new Date(value || 0).getTime();
+  return Number.isFinite(ts) ? ts : 0;
+}
+
+function parseBoothSortParts(value) {
+  const normalizedBooth = normalizeBoothNo(value || "") || "";
+  const raw = String(normalizedBooth || value || "")
+    .trim()
+    .toUpperCase();
+
+  if (!raw) {
+    return {
+      hasNumber: false,
+      number: 0,
+      suffix: "",
+      raw: "",
+    };
+  }
+
+  const exact = raw.match(/^(\d+)([A-Z]*)$/i);
+  if (exact) {
+    return {
+      hasNumber: true,
+      number: Number.parseInt(exact[1], 10) || 0,
+      suffix: (exact[2] || "").toUpperCase(),
+      raw,
+    };
+  }
+
+  const firstDigits = raw.match(/(\d+)/);
+  if (firstDigits) {
+    return {
+      hasNumber: true,
+      number: Number.parseInt(firstDigits[1], 10) || 0,
+      suffix: raw.replace(/^\d+/, "").replace(/[^A-Z]/g, ""),
+      raw,
+    };
+  }
+
+  return {
+    hasNumber: false,
+    number: 0,
+    suffix: "",
+    raw,
+  };
+}
+
+function compareSessionRowsForNavigation(a, b, order = "asc") {
+  const direction = order === "desc" ? -1 : 1;
+
+  const aBooth = parseBoothSortParts(a.boothNo);
+  const bBooth = parseBoothSortParts(b.boothNo);
+
+  if (aBooth.hasNumber !== bBooth.hasNumber) {
+    return aBooth.hasNumber ? -1 : 1;
+  }
+
+  if (aBooth.number !== bBooth.number) {
+    return (aBooth.number - bBooth.number) * direction;
+  }
+
+  const suffixCmp = aBooth.suffix.localeCompare(bBooth.suffix, undefined, {
+    numeric: true,
+    sensitivity: "base",
+  });
+  if (suffixCmp !== 0) {
+    return suffixCmp * direction;
+  }
+
+  const rawCmp = String(a.boothNo || "").localeCompare(
+    String(b.boothNo || ""),
+    undefined,
+    {
+      numeric: true,
+      sensitivity: "base",
+    },
+  );
+  if (rawCmp !== 0) {
+    return rawCmp * direction;
+  }
+
+  const createdCmp =
+    toSortTimestamp(a.created_at) - toSortTimestamp(b.created_at);
+  if (createdCmp !== 0) {
+    return createdCmp * direction;
+  }
+
+  return (
+    String(a.id).localeCompare(String(b.id), undefined, {
+      numeric: true,
+      sensitivity: "base",
+    }) * direction
+  );
+}
+
+function toSessionNavigationItem(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    originalFilename: row.original_filename || "",
+    status: row.status || "",
+    boothNo: row.boothNo || "",
+    boothName: row.booth_name || "",
+    assemblyName: row.assemblyName || "",
+    created_at: row.created_at,
+    updated_at: row.updated_at,
+  };
+}
+
+async function getSessionNavigationContext(sessionId, { order = "asc" } = {}) {
+  const result = await query(
+    `SELECT s.id,
+            s.original_filename,
+            s.status,
+            s.created_at,
+            s.updated_at,
+            s.assembly_name,
+            s.booth_no,
+            s.booth_name,
+            sv.part_number AS fallback_booth,
+            sv.assembly AS fallback_assembly
+     FROM sessions s
+     LEFT JOIN LATERAL (
+       SELECT v.part_number, v.assembly
+       FROM session_voters v
+       WHERE v.session_id = s.id
+       ORDER BY v.page_number ASC, v.id ASC
+       LIMIT 1
+     ) sv ON true`,
+  );
+
+  if (result.rowCount === 0) {
+    return null;
+  }
+
+  const normalizedRows = result.rows.map((row) => {
+    const boothFromFilename = extractBoothNoFromFilename(row.original_filename);
+    const boothNo = normalizeBoothNo(
+      row.booth_no || row.fallback_booth || boothFromFilename || "",
+    );
+    const assemblyName =
+      row.assembly_name ||
+      row.fallback_assembly ||
+      extractAssemblyNameFromFilename(row.original_filename) ||
+      "";
+
+    return {
+      ...row,
+      boothNo: boothNo || "",
+      assemblyName,
+    };
+  });
+
+  const sortedRows = normalizedRows.sort((a, b) =>
+    compareSessionRowsForNavigation(a, b, order),
+  );
+
+  const currentIndex = sortedRows.findIndex((row) => row.id === sessionId);
+  if (currentIndex < 0) {
+    return null;
+  }
+
+  return {
+    order,
+    totalSessions: sortedRows.length,
+    currentIndex: currentIndex + 1,
+    currentSession: toSessionNavigationItem(sortedRows[currentIndex]),
+    previousSession:
+      currentIndex > 0
+        ? toSessionNavigationItem(sortedRows[currentIndex - 1])
+        : null,
+    nextSession:
+      currentIndex < sortedRows.length - 1
+        ? toSessionNavigationItem(sortedRows[currentIndex + 1])
+        : null,
   };
 }
 
@@ -1124,6 +1782,53 @@ app.post(
   },
 );
 
+// Append additional voters to an existing session - Admin only
+app.post(
+  "/sessions/:id/voters/additional/upload",
+  authenticate,
+  adminOnly,
+  additionalVoterUpload.single("file"),
+  async (req, res) => {
+    const { id: sessionId } = req.params;
+    const pdfPath = req.file?.path;
+    const originalName = req.file?.originalname || "additional-upload.pdf";
+    const inputMimeType = req.file?.mimetype || "";
+    const apiKey = req.body?.apiKey || req.body?.geminiApiKey;
+    const requestedDispatchMode = req.body?.dispatchMode;
+    const dispatchMode = requestedDispatchMode
+      ? parseDispatchMode(requestedDispatchMode)
+      : null;
+
+    if (requestedDispatchMode && !dispatchMode) {
+      return res.status(400).json({
+        error: `Invalid dispatchMode. Allowed: ${getAllowedDispatchModes().join(", ")}`,
+      });
+    }
+
+    if (!pdfPath) {
+      return res.status(400).json({
+        error: "PDF or image file is required",
+      });
+    }
+
+    try {
+      const result = await processAdditionalVotersForSession({
+        sessionId,
+        pdfPath,
+        originalName,
+        inputMimeType,
+        apiKey,
+        dispatchMode,
+        uploadId: req.additionalUploadId,
+      });
+
+      return res.status(result.statusCode).json(result.payload);
+    } finally {
+      await fs.remove(pdfPath).catch(() => {});
+    }
+  },
+);
+
 // Sessions list - Admin only
 app.get("/sessions", authenticate, adminOnly, async (_req, res) => {
   try {
@@ -1197,29 +1902,62 @@ app.get("/sessions/:id/status", authenticate, adminOnly, async (req, res) => {
   }
 });
 
+// Session navigation context for fast previous/next traversal - Admin only
+app.get(
+  "/sessions/:id/navigation",
+  authenticate,
+  adminOnly,
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+      const order = parseSessionNavigationOrder(
+        req.query.order ?? req.query.sortOrder ?? req.query.boothOrder,
+      );
+
+      const navigation = await getSessionNavigationContext(id, { order });
+      if (!navigation) {
+        return res.status(404).json({ error: "Session not found" });
+      }
+
+      return res.json({
+        sessionId: id,
+        ...navigation,
+      });
+    } catch (err) {
+      return sendRouteError(res, err);
+    }
+  },
+);
+
 // Session detail - Admin only
 app.get("/sessions/:id", authenticate, adminOnly, async (req, res) => {
   try {
     const { id } = req.params;
+    const order = parseSessionNavigationOrder(
+      req.query.order ?? req.query.sortOrder ?? req.query.boothOrder,
+    );
     const session = await query("SELECT * FROM sessions WHERE id=$1", [id]);
     if (session.rowCount === 0) {
       return res.status(404).json({ error: "Session not found" });
     }
 
-    const pages = await query(
-      "SELECT page_number, page_path, raw_text, structured_json, created_at FROM session_pages WHERE session_id=$1 ORDER BY page_number ASC",
-      [id],
-    );
-
-    const voters = await query(
-      "SELECT id, page_number, assembly, part_number, section, serial_number, voter_id, name, relation_type, relation_name, house_number, age, gender, religion, under_adjudication, photo_url, is_printed, printed_at, created_at FROM session_voters WHERE session_id=$1 ORDER BY page_number, serial_number",
-      [id],
-    );
+    const [pages, voters, navigation] = await Promise.all([
+      query(
+        "SELECT page_number, page_path, raw_text, structured_json, created_at FROM session_pages WHERE session_id=$1 ORDER BY page_number ASC",
+        [id],
+      ),
+      query(
+        "SELECT id, page_number, assembly, part_number, section, serial_number, voter_id, name, relation_type, relation_name, house_number, age, gender, religion, under_adjudication, photo_url, is_printed, printed_at, created_at FROM session_voters WHERE session_id=$1 ORDER BY page_number, serial_number",
+        [id],
+      ),
+      getSessionNavigationContext(id, { order }),
+    ]);
 
     return res.json({
       session: session.rows[0],
       pages: pages.rows,
       voters: voters.rows,
+      navigation,
     });
   } catch (err) {
     return sendRouteError(res, err);
