@@ -301,8 +301,15 @@ CREATE INDEX IF NOT EXISTS idx_session_voters_under_adjudication ON session_vote
 CREATE INDEX IF NOT EXISTS idx_session_voters_is_printed ON session_voters(is_printed);
 CREATE INDEX IF NOT EXISTS idx_session_voters_session_page_serial ON session_voters(session_id, page_number, serial_number);
 CREATE INDEX IF NOT EXISTS idx_session_voters_session_first_row ON session_voters(session_id, page_number, id);
+CREATE INDEX IF NOT EXISTS idx_session_voters_session_id_non_adjudicated ON session_voters(session_id)
+  WHERE COALESCE(under_adjudication, FALSE) = FALSE;
 CREATE INDEX IF NOT EXISTS idx_sessions_assembly_name ON sessions(assembly_name);
 CREATE INDEX IF NOT EXISTS idx_sessions_booth_no ON sessions(booth_no);
+CREATE INDEX IF NOT EXISTS idx_sessions_booth_no_numeric ON sessions(
+  (NULLIF(regexp_replace(COALESCE(NULLIF(booth_no, ''), ''), '[^0-9]', '', 'g'), '')::INT)
+)
+  WHERE booth_no IS NOT NULL AND booth_no <> '';
+CREATE INDEX IF NOT EXISTS idx_sessions_updated_created ON sessions(updated_at DESC, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_election_sessions_election_year ON election_sessions(election_year);
 
 -- ============================================

@@ -13,14 +13,10 @@ const localFontPath = path.join(
   process.cwd(),
   "storage",
   "fonts",
-  "solaimanlipi_20-04-07.ttf",
+  "SutonnyBanglaOMJ.ttf",
 );
 
-const repoFontPath = path.join(
-  process.cwd(),
-  "fonts",
-  "solaimanlipi_20-04-07.ttf",
-);
+const repoFontPath = path.join(process.cwd(), "fonts", "SutonnyBanglaOMJ.ttf");
 
 let templateBytesPromise = null;
 let templateBytesPath = null;
@@ -184,16 +180,13 @@ async function embedSlipFont(pdfDoc, requiresUnicode = false) {
   return { font, unicodeEnabled: false };
 }
 
-function wrapTextToWidth(
-  font,
-  text,
-  fontSize,
-  maxWidth,
-  maxLines,
-  unicodeEnabled = true,
-) {
-  const safeText = unicodeEnabled ? normalizeText(text) : toAsciiSafeText(text);
+function wrapTextToWidth(font, text, fontSize, maxWidth, maxLines) {
+  const safeText = normalizeText(text);
   if (!safeText) return [];
+
+  if (maxLines <= 1) {
+    return [safeText];
+  }
 
   const words = safeText.split(" ");
   const lines = [];
@@ -225,6 +218,69 @@ function wrapTextToWidth(
   return lines.slice(0, maxLines);
 }
 
+function measureTextBlock(font, text, fontSize, maxWidth, maxLines, maxHeight) {
+  const lines = wrapTextToWidth(font, text, fontSize, maxWidth, maxLines);
+  const lineHeight = fontSize * 1.18;
+  const totalHeight = lines.length * lineHeight;
+  const widestLine = lines.reduce(
+    (max, line) => Math.max(max, font.widthOfTextAtSize(line, fontSize)),
+    0,
+  );
+
+  return {
+    lines,
+    lineHeight,
+    fits: totalHeight <= maxHeight && widestLine <= maxWidth,
+  };
+}
+
+function pickBestFittingText(font, text, options) {
+  const { minFontSize, maxFontSize, maxLines, contentWidth, contentHeight } =
+    options;
+
+  const minSize = Math.max(1, Math.floor(minFontSize));
+  const maxSize = Math.max(minSize, Math.floor(maxFontSize));
+
+  let low = minSize;
+  let high = maxSize;
+
+  let bestSize = minSize;
+  let bestMeasure = measureTextBlock(
+    font,
+    text,
+    minSize,
+    contentWidth,
+    maxLines,
+    contentHeight,
+  );
+
+  while (low <= high) {
+    const mid = Math.floor((low + high) / 2);
+    const measured = measureTextBlock(
+      font,
+      text,
+      mid,
+      contentWidth,
+      maxLines,
+      contentHeight,
+    );
+
+    if (measured.fits) {
+      bestSize = mid;
+      bestMeasure = measured;
+      low = mid + 1;
+    } else {
+      high = mid - 1;
+    }
+  }
+
+  return {
+    fontSize: bestSize,
+    lines: bestMeasure.lines,
+    lineHeight: bestMeasure.lineHeight,
+  };
+}
+
 function drawTextInBox(page, text, options) {
   const {
     font,
@@ -248,33 +304,17 @@ function drawTextInBox(page, text, options) {
   const contentWidth = Math.max(1, width - paddingX * 2);
   const contentHeight = Math.max(1, height - paddingY * 2);
 
-  let fontSize = Math.max(minFontSize, maxFontSize);
-  let lines = [];
+  const fitted = pickBestFittingText(font, safeText, {
+    minFontSize,
+    maxFontSize,
+    maxLines,
+    contentWidth,
+    contentHeight,
+  });
 
-  while (fontSize >= minFontSize) {
-    lines = wrapTextToWidth(
-      font,
-      safeText,
-      fontSize,
-      contentWidth,
-      maxLines,
-      unicodeEnabled,
-    );
-    const lineHeight = fontSize * 1.18;
-    const totalHeight = lines.length * lineHeight;
-    const widestLine = lines.reduce(
-      (max, line) => Math.max(max, font.widthOfTextAtSize(line, fontSize)),
-      0,
-    );
-
-    if (totalHeight <= contentHeight && widestLine <= contentWidth) {
-      break;
-    }
-
-    fontSize -= 1;
-  }
-
-  const finalLineHeight = fontSize * 1.18;
+  const fontSize = fitted.fontSize;
+  const lines = fitted.lines;
+  const finalLineHeight = fitted.lineHeight;
   const usedHeight = lines.length * finalLineHeight;
   let baselineY =
     y + height - paddingY - (contentHeight - usedHeight) / 2 - fontSize;

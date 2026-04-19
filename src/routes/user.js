@@ -1,8 +1,9 @@
 import express from "express";
 import path from "path";
+import os from "os";
 import fs from "fs-extra";
 import AdmZip from "adm-zip";
-import { execFile } from "child_process";
+import { execFile, fork } from "child_process";
 import { promisify } from "util";
 import { v4 as uuidv4 } from "uuid";
 import { query } from "../db.js";
@@ -10,7 +11,6 @@ import { authenticate } from "../auth.js";
 import {
   ensureVoterSlipTemplateExists,
   buildSingleVoterSlipPdf,
-  buildMassVoterSlipPdfFile,
   buildMassSlipFilename,
 } from "../voterSlipPdf.js";
 import {
@@ -64,12 +64,35 @@ const boothRangeMaxSpan = Math.max(
   1,
 );
 const boothRangePerSlipPauseMs = Math.max(
-  Number(process.env.VOTER_SLIP_RANGE_FILE_PAUSE_MS || 40),
+  Number(process.env.VOTER_SLIP_RANGE_FILE_PAUSE_MS || 0),
   0,
 );
 const boothRangePerBoothPauseMs = Math.max(
-  Number(process.env.VOTER_SLIP_RANGE_BOOTH_PAUSE_MS || 250),
+  Number(process.env.VOTER_SLIP_RANGE_BOOTH_PAUSE_MS || 0),
   0,
+);
+const massSlipWorkerScriptPath = path.join(
+  process.cwd(),
+  "src",
+  "workers",
+  "massVoterSlipWorker.js",
+);
+const massSlipJobQueue = [];
+let activeMassSlipWorkers = 0;
+
+function parsePositiveInt(value, fallback) {
+  const parsed = Number.parseInt(String(value || ""), 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
+  return parsed;
+}
+
+const massSlipJobConcurrency = parsePositiveInt(
+  process.env.VOTER_SLIP_MASS_JOB_CONCURRENCY,
+  Math.max(1, Math.min(2, os.cpus()?.length || 1)),
+);
+const massSlipProgressStep = parsePositiveInt(
+  process.env.VOTER_SLIP_MASS_PROGRESS_STEP,
+  20,
 );
 
 function sleepMs(ms) {
@@ -97,6 +120,15 @@ async function deleteMassJobArtifacts(job) {
   await fs.remove(jobDir).catch(() => null);
 }
 
+async function deleteMassJobPayload(job) {
+  if (!job?.payloadPath) return;
+
+  const payloadPath = job.payloadPath;
+  job.payloadPath = null;
+
+  await fs.remove(payloadPath).catch(() => null);
+}
+
 async function cleanupOldVoterSlipJobs() {
   const now = Date.now();
   const ttlMs = Number(
@@ -116,6 +148,10 @@ async function cleanupOldVoterSlipJobs() {
 }
 
 function makeMassJobPublicView(job) {
+  const queuePosition =
+    job.status === "queued"
+      ? massSlipJobQueue.findIndex((queuedJob) => queuedJob.id === job.id) + 1
+      : null;
   const canDownload =
     job.status === "completed" &&
     !job.downloadedAt &&
@@ -134,6 +170,7 @@ function makeMassJobPublicView(job) {
     filters: job.filters,
     boothRange: job.boothRange || null,
     progress: job.progress || null,
+    queuePosition: queuePosition > 0 ? queuePosition : null,
     fileName: job.fileName,
     contentType: job.contentType || "application/pdf",
     downloadedAt: job.downloadedAt || null,
@@ -512,12 +549,43 @@ async function getMassSlipVoters(filters) {
     FROM session_voters v
     LEFT JOIN sessions s ON s.id = v.session_id
     WHERE ${where.join(" AND ")}
-      AND COALESCE(v.under_adjudication, FALSE) = FALSE
-    ORDER BY ${formatSerialSortSql("v")};
+      AND COALESCE(v.under_adjudication, FALSE) = FALSE;
   `;
 
   const result = await query(sql, values);
   return result.rows.map(mapRowToSlipVoter);
+}
+
+async function getMassSlipVotersBySessionIds(sessionIds) {
+  const votersBySession = new Map();
+  if (!Array.isArray(sessionIds) || sessionIds.length === 0) {
+    return votersBySession;
+  }
+
+  const result = await query(
+    `SELECT v.id, v.session_id, v.part_number, v.section, v.serial_number, v.name,
+            v.relation_name, v.house_number, v.age, v.gender, v.under_adjudication,
+            s.booth_no, s.booth_name
+     FROM session_voters v
+     LEFT JOIN sessions s ON s.id = v.session_id
+     WHERE v.session_id = ANY($1::uuid[])
+       AND COALESCE(v.under_adjudication, FALSE) = FALSE
+     ORDER BY v.session_id, ${formatSerialSortSql("v")};`,
+    [sessionIds],
+  );
+
+  for (const row of result.rows) {
+    const voter = mapRowToSlipVoter(row);
+    const existing = votersBySession.get(voter.sessionId);
+    if (existing) {
+      existing.push(voter);
+      continue;
+    }
+
+    votersBySession.set(voter.sessionId, [voter]);
+  }
+
+  return votersBySession;
 }
 
 async function getSessionForMassSlip(sessionId) {
@@ -545,6 +613,121 @@ function buildSessionMassFilters(sessionId) {
   };
 }
 
+function scheduleMassSlipWorkers() {
+  while (
+    activeMassSlipWorkers < massSlipJobConcurrency &&
+    massSlipJobQueue.length > 0
+  ) {
+    const nextJob = massSlipJobQueue.shift();
+    if (!nextJob) break;
+    void runMassSlipWorkerJob(nextJob);
+  }
+}
+
+function runMassSlipWorkerProcess(job) {
+  return new Promise((resolve, reject) => {
+    const worker = fork(massSlipWorkerScriptPath, [], {
+      cwd: process.cwd(),
+      env: process.env,
+      stdio: ["ignore", "ignore", "ignore", "ipc"],
+    });
+
+    let settled = false;
+
+    const finishResolve = () => {
+      if (settled) return;
+      settled = true;
+      resolve();
+    };
+
+    const finishReject = (error) => {
+      if (settled) return;
+      settled = true;
+      reject(error);
+    };
+
+    worker.on("message", (message) => {
+      const type = message?.type;
+
+      if (type === "progress") {
+        const processed = Number(message?.processed);
+        const total = Number(message?.total);
+
+        if (Number.isFinite(processed)) {
+          job.processed = Math.max(0, Math.trunc(processed));
+        }
+        if (Number.isFinite(total)) {
+          job.total = Math.max(0, Math.trunc(total));
+        }
+        return;
+      }
+
+      if (type === "completed") {
+        const total = Number(message?.total);
+        if (Number.isFinite(total)) {
+          job.total = Math.max(0, Math.trunc(total));
+        }
+        job.processed = job.total;
+        finishResolve();
+        return;
+      }
+
+      if (type === "failed") {
+        finishReject(
+          new Error(message?.error || "Mass slip generation worker failed"),
+        );
+      }
+    });
+
+    worker.on("error", (error) => {
+      finishReject(error);
+    });
+
+    worker.on("exit", (code, signal) => {
+      if (settled) return;
+
+      if (code === 0) {
+        finishResolve();
+        return;
+      }
+
+      const signalText = signal ? ` signal=${signal}` : "";
+      finishReject(
+        new Error(
+          `Mass slip worker exited with code=${code ?? "unknown"}${signalText}`,
+        ),
+      );
+    });
+
+    worker.send({
+      type: "start",
+      payloadPath: job.payloadPath,
+      outputPath: job.filePath,
+      progressStep: massSlipProgressStep,
+    });
+  });
+}
+
+async function runMassSlipWorkerJob(job) {
+  activeMassSlipWorkers += 1;
+
+  try {
+    job.status = "processing";
+    await runMassSlipWorkerProcess(job);
+    job.status = "completed";
+    job.error = null;
+    job.finishedAt = new Date().toISOString();
+  } catch (error) {
+    job.status = "failed";
+    job.error = error?.message || "Mass slip generation failed";
+    job.finishedAt = new Date().toISOString();
+  } finally {
+    await deleteMassJobPayload(job);
+    activeMassSlipWorkers = Math.max(0, activeMassSlipWorkers - 1);
+    scheduleMassSlipWorkers();
+  }
+}
+
 async function queueMassVoterSlipJob({
   voters,
   filters,
@@ -565,6 +748,7 @@ async function queueMassVoterSlipJob({
   );
   const jobId = uuidv4();
   const filePath = path.join(voterSlipJobsRoot, jobId, fileName);
+  const payloadPath = path.join(voterSlipJobsRoot, jobId, "payload.json");
 
   const job = {
     id: jobId,
@@ -582,57 +766,110 @@ async function queueMassVoterSlipJob({
     },
     fileName,
     filePath,
+    payloadPath,
     downloadedAt: null,
     downloadFailedAt: null,
     requestedBy,
   };
   voterSlipJobs.set(jobId, job);
 
-  setImmediate(async () => {
-    try {
-      job.status = "processing";
-      await buildMassVoterSlipPdfFile(votersForPdf, filePath, {
-        onProgress: (processed, total) => {
-          job.processed = processed;
-          job.total = total;
-        },
-      });
-      job.status = "completed";
-      job.finishedAt = new Date().toISOString();
-    } catch (error) {
-      job.status = "failed";
-      job.error = error.message || "Mass slip generation failed";
-      job.finishedAt = new Date().toISOString();
-    }
-  });
+  try {
+    await fs.outputJson(payloadPath, {
+      voters: votersForPdf,
+    });
+  } catch (error) {
+    voterSlipJobs.delete(jobId);
+    throw error;
+  }
+
+  massSlipJobQueue.push(job);
+  scheduleMassSlipWorkers();
 
   return job;
 }
 
 async function getLatestSessionsForBoothRange({ fromBoothNo, toBoothNo }) {
   const result = await query(
-    `SELECT id, status, booth_no, booth_name, assembly_name, original_filename,
-            created_at, updated_at
-     FROM sessions
-     ORDER BY COALESCE(updated_at, created_at) DESC`,
+    `WITH normalized AS (
+       SELECT s.id,
+              s.status,
+              s.booth_no,
+              s.booth_name,
+              s.assembly_name,
+              s.original_filename,
+              s.created_at,
+              s.updated_at,
+              NULLIF(
+                regexp_replace(COALESCE(NULLIF(s.booth_no, ''), ''), '[^0-9]', '', 'g'),
+                ''
+              )::INT AS numeric_booth_no
+       FROM sessions s
+     ),
+     ranked AS (
+       SELECT *,
+              ROW_NUMBER() OVER (
+                PARTITION BY numeric_booth_no
+                ORDER BY COALESCE(updated_at, created_at) DESC, id DESC
+              ) AS booth_rank
+       FROM normalized
+       WHERE numeric_booth_no BETWEEN $1 AND $2
+     )
+     SELECT id, status, booth_no, booth_name, assembly_name, original_filename,
+            created_at, updated_at, numeric_booth_no
+     FROM ranked
+     WHERE booth_rank = 1
+     ORDER BY numeric_booth_no ASC`,
+    [fromBoothNo, toBoothNo],
   );
 
   const sessionByBooth = new Map();
 
   for (const row of result.rows) {
-    const resolvedBoothNo = resolveSessionBoothNo(row);
-    const numericBoothNo = parseBoothNumber(resolvedBoothNo);
-    if (numericBoothNo === null) continue;
-    if (numericBoothNo < fromBoothNo || numericBoothNo > toBoothNo) continue;
+    const numericBoothNo = Number(row.numeric_booth_no);
+    if (!Number.isFinite(numericBoothNo)) continue;
 
-    // Keep the latest session only per booth.
-    if (sessionByBooth.has(numericBoothNo)) continue;
+    const resolvedBoothNo =
+      normalizeBoothNo(row.booth_no || "") || String(numericBoothNo);
 
     sessionByBooth.set(numericBoothNo, {
       ...row,
       resolvedBoothNo,
       numericBoothNo,
     });
+  }
+
+  const missingBoothSet = new Set();
+  for (let boothNo = fromBoothNo; boothNo <= toBoothNo; boothNo += 1) {
+    if (!sessionByBooth.has(boothNo)) {
+      missingBoothSet.add(boothNo);
+    }
+  }
+
+  // Fallback for legacy rows where booth number exists only in filename.
+  if (missingBoothSet.size > 0) {
+    const fallbackResult = await query(
+      `SELECT id, status, booth_no, booth_name, assembly_name, original_filename,
+              created_at, updated_at
+       FROM sessions
+       WHERE booth_no IS NULL OR booth_no = ''
+       ORDER BY COALESCE(updated_at, created_at) DESC`,
+    );
+
+    for (const row of fallbackResult.rows) {
+      const resolvedBoothNo = resolveSessionBoothNo(row);
+      const numericBoothNo = parseBoothNumber(resolvedBoothNo);
+      if (numericBoothNo === null) continue;
+      if (!missingBoothSet.has(numericBoothNo)) continue;
+
+      sessionByBooth.set(numericBoothNo, {
+        ...row,
+        resolvedBoothNo,
+        numericBoothNo,
+      });
+      missingBoothSet.delete(numericBoothNo);
+
+      if (missingBoothSet.size === 0) break;
+    }
   }
 
   const sessions = [];
@@ -733,15 +970,17 @@ async function queueBoothRangeZipJob({
     try {
       job.status = "processing";
 
+      const votersBySessionId = await getMassSlipVotersBySessionIds(
+        boothSessions.map((session) => session.id),
+      );
+
       for (const boothSession of boothSessions) {
         const boothNo =
           normalizeBoothNo(boothSession.resolvedBoothNo || "") ||
           String(boothSession.numericBoothNo || "");
         job.progress.currentBooth = boothNo || null;
 
-        const voters = await getMassSlipVoters(
-          buildSessionMassFilters(boothSession.id),
-        );
+        const voters = votersBySessionId.get(boothSession.id) || [];
         const votersForBooth = voters.map((voter) =>
           withBoothPartNo(voter, boothNo),
         );
