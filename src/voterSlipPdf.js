@@ -13,13 +13,13 @@ const localFontPath = path.join(
   process.cwd(),
   "storage",
   "fonts",
-  "NotoSansBengali-Regular.ttf",
+  "solaimanlipi_20-04-07.ttf",
 );
 
 const repoFontPath = path.join(
   process.cwd(),
   "fonts",
-  "NotoSansBengali-Regular.ttf",
+  "solaimanlipi_20-04-07.ttf",
 );
 
 let templateBytesPromise = null;
@@ -168,7 +168,7 @@ async function embedSlipFont(pdfDoc, requiresUnicode = false) {
 
     if (strictUnicodeFont) {
       throw new Error(
-        "Unicode font not found for Bengali text. Set VOTER_SLIP_FONT_PATH or place NotoSansBengali-Regular.ttf in storage/fonts.",
+        "Unicode font not found for Bengali text. Set VOTER_SLIP_FONT_PATH or place solaimanlipi_20-04-07.ttf in fonts or storage/fonts.",
       );
     }
 
