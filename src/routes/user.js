@@ -2,12 +2,16 @@ import express from "express";
 import path from "path";
 import os from "os";
 import fs from "fs-extra";
+import multer from "multer";
 import AdmZip from "adm-zip";
 import { execFile, fork } from "child_process";
 import { promisify } from "util";
 import { v4 as uuidv4 } from "uuid";
 import { query } from "../db.js";
 import { authenticate } from "../auth.js";
+import { splitPdfToPages } from "../pdf.js";
+import { callGeminiWithFile, getGlobalDispatchMode } from "../gemini.js";
+import { parseGeminiStructured } from "../parser.js";
 import {
   ensureVoterSlipTemplateExists,
   buildSingleVoterSlipPdf,
@@ -94,10 +98,147 @@ const massSlipProgressStep = parsePositiveInt(
   process.env.VOTER_SLIP_MASS_PROGRESS_STEP,
   20,
 );
+const maxUploadMb = Math.max(Number(process.env.MAX_UPLOAD_MB || 150), 10);
+const maxUploadBytes = maxUploadMb * 1024 * 1024;
+
+const specificVoterSlipUploadRoot = path.join(
+  process.cwd(),
+  "storage",
+  "voter-slips",
+  "specific-uploads",
+);
+const specificUploadAllowedMimeTypes = new Set([
+  "application/pdf",
+  "image/png",
+  "image/jpeg",
+  "image/jpg",
+]);
+const specificUploadAllowedExtensions = new Set([
+  ".pdf",
+  ".png",
+  ".jpg",
+  ".jpeg",
+]);
 
 function sleepMs(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
+
+function sanitizeVoterId(rawId) {
+  const trimmed = normalizeText(rawId);
+  if (!trimmed) return "";
+  if (trimmed.includes("/")) return "";
+  return trimmed;
+}
+
+function normalizeUnderAdjudication(value) {
+  if (typeof value === "boolean") return value;
+  if (typeof value === "number") return value !== 0;
+  if (typeof value !== "string") return false;
+
+  const normalized = value.trim().toLowerCase();
+  if (!normalized) return false;
+  if (["true", "yes", "y", "1", "under adjudication"].includes(normalized)) {
+    return true;
+  }
+  if (
+    ["false", "no", "n", "0", "not under adjudication"].includes(normalized)
+  ) {
+    return false;
+  }
+
+  return /\badjudication\b/i.test(value);
+}
+
+function normalizeSerialNumberForLookup(value) {
+  if (value === undefined || value === null) return null;
+  const text = String(value).trim();
+  if (!/^\d+$/.test(text)) return null;
+  const parsed = Number.parseInt(text, 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) return null;
+  return String(parsed);
+}
+
+function isAcceptedSpecificUploadFieldName(fieldName) {
+  const normalized = String(fieldName || "")
+    .trim()
+    .toLowerCase();
+  return (
+    normalized === "files" ||
+    normalized === "file" ||
+    /^files\[\d*\]$/.test(normalized)
+  );
+}
+
+function getSpecificUploadFieldCounts(reqFiles) {
+  const counts = {};
+  for (const item of reqFiles || []) {
+    const key = String(item?.fieldname || "");
+    if (!key) continue;
+    counts[key] = (counts[key] || 0) + 1;
+  }
+  return counts;
+}
+
+function isAcceptedSpecificUploadFile(file) {
+  const mime = String(file?.mimetype || "")
+    .trim()
+    .toLowerCase();
+  if (specificUploadAllowedMimeTypes.has(mime)) {
+    return true;
+  }
+
+  const ext = path.extname(String(file?.originalname || "")).toLowerCase();
+  return specificUploadAllowedExtensions.has(ext);
+}
+
+function isImageSpecificUpload(inputMimeType, fileNameOrPath = "") {
+  const normalizedMime = String(inputMimeType || "")
+    .trim()
+    .toLowerCase();
+  if (normalizedMime.startsWith("image/")) {
+    return true;
+  }
+
+  const ext = path.extname(String(fileNameOrPath || "")).toLowerCase();
+  return ext === ".png" || ext === ".jpg" || ext === ".jpeg";
+}
+
+const specificVoterSlipUpload = multer({
+  storage: multer.diskStorage({
+    destination: async (req, _file, cb) => {
+      try {
+        const uploadId = req.specificSlipUploadId || uuidv4();
+        req.specificSlipUploadId = uploadId;
+        const dest = path.join(
+          specificVoterSlipUploadRoot,
+          uploadId,
+          "uploads",
+        );
+        await fs.ensureDir(dest);
+        cb(null, dest);
+      } catch (err) {
+        cb(err);
+      }
+    },
+    filename: (_req, file, cb) => {
+      const safeBaseName = path.basename(file.originalname || "upload.pdf");
+      const uniquePrefix = `${Date.now()}-${Math.round(Math.random() * 1e9)}`;
+      cb(null, `${uniquePrefix}-${safeBaseName}`);
+    },
+  }),
+  fileFilter: (_req, file, cb) => {
+    if (!isAcceptedSpecificUploadFile(file)) {
+      cb(new Error("Only PDF, PNG, JPG, JPEG uploads are allowed"));
+      return;
+    }
+    cb(null, true);
+  },
+  limits: {
+    fileSize: maxUploadBytes,
+    files: 80,
+  },
+});
 
 async function cleanupVoterSlipJobsOnStartup() {
   await fs.remove(voterSlipJobsRoot).catch(() => null);
@@ -734,6 +875,7 @@ async function queueMassVoterSlipJob({
   requestedBy,
   boothNoForName,
   partNoOverride,
+  jobType = "mass-pdf",
 }) {
   const resolvedBoothNo =
     normalizeBoothNo(boothNoForName || "") || normalizeText(boothNoForName);
@@ -752,7 +894,7 @@ async function queueMassVoterSlipJob({
 
   const job = {
     id: jobId,
-    jobType: "mass-pdf",
+    jobType,
     contentType: "application/pdf",
     status: "queued",
     total: votersForPdf.length,
@@ -1109,6 +1251,239 @@ async function startMassVoterSlipBySession(req, res, sessionIdInput) {
     },
     job: makeMassJobPublicView(job),
   });
+}
+
+function buildSpecificSlipDedupeKey(voter) {
+  const serialKey = normalizeSerialNumberForLookup(voter?.serialNumber);
+  if (serialKey) return `serial:${serialKey}`;
+
+  const voterIdKey = sanitizeVoterId(voter?.voterId).toUpperCase();
+  if (voterIdKey) return `voter-id:${voterIdKey}`;
+
+  const name = normalizeText(voter?.name).toLowerCase();
+  if (!name) return null;
+
+  const relationName = normalizeText(voter?.relationName).toLowerCase();
+  const houseNumber = normalizeText(voter?.houseNumber).toLowerCase();
+  const section = normalizeText(voter?.section).toLowerCase();
+  return `name:${name}|relation:${relationName}|house:${houseNumber}|section:${section}`;
+}
+
+function dedupeSpecificSlipVoters(voters) {
+  const deduped = [];
+  const seen = new Set();
+  let duplicateCount = 0;
+
+  for (const voter of voters) {
+    const key = buildSpecificSlipDedupeKey(voter);
+    if (!key) {
+      deduped.push(voter);
+      continue;
+    }
+
+    if (seen.has(key)) {
+      duplicateCount += 1;
+      continue;
+    }
+
+    seen.add(key);
+    deduped.push(voter);
+  }
+
+  return {
+    voters: deduped,
+    duplicateCount,
+  };
+}
+
+function buildSpecificSlipVoterFromOcr({
+  voter,
+  structured,
+  requiredPartNo,
+  sourceFileName,
+  sourcePageNumber,
+  sequenceNo,
+}) {
+  const rawVoter = voter && typeof voter === "object" ? voter : {};
+
+  const serialNumber = normalizeText(
+    rawVoter.serialNumber ||
+      rawVoter.serial_number ||
+      rawVoter.slNo ||
+      rawVoter.sl_no ||
+      "",
+  );
+  const voterId = sanitizeVoterId(rawVoter.voterId || rawVoter.voter_id || "");
+  const name = normalizeText(rawVoter.name || rawVoter.voterName || "");
+  const relationName = normalizeText(
+    rawVoter.relationName || rawVoter.relation_name || "",
+  );
+  const houseNumber = normalizeText(
+    rawVoter.houseNumber || rawVoter.house_number || "",
+  );
+  const gender = normalizeText(rawVoter.gender || "");
+  const ageText = normalizeText(rawVoter.age || "");
+  const ageValue = ageText ? Number.parseInt(ageText, 10) : Number.NaN;
+  const age = Number.isNaN(ageValue) ? ageText : ageValue;
+
+  if (!serialNumber && !voterId && !name) {
+    return null;
+  }
+
+  const partNumber =
+    normalizeBoothNo(requiredPartNo) || normalizeText(requiredPartNo);
+
+  const underAdjudication = normalizeUnderAdjudication(
+    rawVoter.underAdjudication ??
+      rawVoter.under_adjudication ??
+      rawVoter.isUnderAdjudication ??
+      rawVoter.adjudication,
+  );
+
+  return {
+    id: `specific-ocr-${sequenceNo}`,
+    partNumber,
+    boothNo: partNumber,
+    boothName: normalizeText(structured?.boothName || ""),
+    section: normalizeText(structured?.section || rawVoter.section || ""),
+    serialNumber,
+    voterId,
+    name,
+    relationName,
+    houseNumber,
+    age,
+    gender,
+    underAdjudication,
+    sourceFileName,
+    sourcePageNumber,
+  };
+}
+
+function buildSpecificSlipTableRows(voters) {
+  return voters.map((voter, index) => ({
+    rowNo: index + 1,
+    serialNumber: normalizeText(voter.serialNumber),
+    voterId: normalizeText(voter.voterId),
+    name: normalizeText(voter.name),
+    relationName: normalizeText(voter.relationName),
+    houseNumber: normalizeText(voter.houseNumber),
+    age: voter.age ?? "",
+    gender: normalizeText(voter.gender),
+    section: normalizeText(voter.section),
+    partNumber: normalizeText(voter.partNumber),
+    sourceFileName: normalizeText(voter.sourceFileName),
+    sourcePageNumber: voter.sourcePageNumber || null,
+  }));
+}
+
+async function extractSpecificSlipVotersFromUploads({
+  files,
+  requiredPartNo,
+  apiKey,
+}) {
+  const collectedVoters = [];
+  const failedPages = [];
+
+  let pagesProcessed = 0;
+  let extractedCount = 0;
+  let skippedUnderAdjudicationCount = 0;
+  let sequenceNo = 1;
+
+  for (const file of files) {
+    const sourceFileName = path.basename(
+      file.originalname || file.filename || "upload.pdf",
+    );
+    const inputIsImage = isImageSpecificUpload(file.mimetype, sourceFileName);
+
+    let pagePaths = [];
+    let tempPageDir = "";
+
+    try {
+      if (inputIsImage) {
+        pagePaths = [file.path];
+      } else {
+        const fileToken = sanitizeFilenameToken(
+          path.parse(file.filename || sourceFileName).name,
+          "file",
+        );
+        tempPageDir = path.join(path.dirname(file.path), `${fileToken}-pages`);
+        pagePaths = await splitPdfToPages(file.path, tempPageDir);
+      }
+
+      if (!pagePaths.length) {
+        failedPages.push({
+          fileName: sourceFileName,
+          pageNumber: null,
+          error: "No pages found in uploaded file",
+        });
+        continue;
+      }
+
+      for (let pageIndex = 0; pageIndex < pagePaths.length; pageIndex += 1) {
+        const pagePath = pagePaths[pageIndex];
+        const sourcePageNumber = pageIndex + 1;
+
+        try {
+          const ocrResult = await callGeminiWithFile(
+            pagePath,
+            apiKey || undefined,
+          );
+          const structured = parseGeminiStructured(ocrResult?.text || "");
+          const voters = Array.isArray(structured?.voters)
+            ? structured.voters
+            : [];
+
+          extractedCount += voters.length;
+
+          for (const voter of voters) {
+            const normalizedVoter = buildSpecificSlipVoterFromOcr({
+              voter,
+              structured,
+              requiredPartNo,
+              sourceFileName,
+              sourcePageNumber,
+              sequenceNo,
+            });
+
+            if (!normalizedVoter) continue;
+
+            sequenceNo += 1;
+
+            if (normalizedVoter.underAdjudication) {
+              skippedUnderAdjudicationCount += 1;
+              continue;
+            }
+
+            collectedVoters.push(normalizedVoter);
+          }
+
+          pagesProcessed += 1;
+        } catch (err) {
+          failedPages.push({
+            fileName: sourceFileName,
+            pageNumber: sourcePageNumber,
+            error: err?.message || "OCR failed for page",
+          });
+        }
+      }
+    } finally {
+      if (tempPageDir) {
+        await fs.remove(tempPageDir).catch(() => null);
+      }
+    }
+  }
+
+  const deduped = dedupeSpecificSlipVoters(collectedVoters);
+
+  return {
+    voters: deduped.voters,
+    pagesProcessed,
+    extractedCount,
+    acceptedBeforeDedupeCount: collectedVoters.length,
+    duplicateCount: deduped.duplicateCount,
+    skippedUnderAdjudicationCount,
+    failedPages,
+  };
 }
 
 // All user routes require authentication
@@ -2024,6 +2399,168 @@ router.post("/voterslips/mass/start", async (req, res) => {
     return res.status(500).json({ error: err.message });
   }
 });
+
+/**
+ * Start async generation for a specific set of voters extracted from
+ * uploaded screenshots/PDF snippets using Gemini OCR.
+ * Body (multipart/form-data):
+ * - partNo/partNumber/boothNo: required user-provided part number
+ * - files/file: one or many image/PDF files (required)
+ * - apiKey or geminiApiKey: optional API key override
+ */
+router.post(
+  "/voterslips/specific/start",
+  specificVoterSlipUpload.any(),
+  async (req, res) => {
+    const uploadId = normalizeText(req.specificSlipUploadId);
+
+    try {
+      await cleanupOldVoterSlipJobs();
+
+      const hasTemplate = await ensureVoterSlipTemplateExists();
+      if (!hasTemplate) {
+        return res.status(500).json({
+          error: "Voter slip template not found",
+          expectedPath: getVoterSlipTemplatePublicHint(),
+        });
+      }
+
+      const partNo =
+        normalizeBoothNo(
+          req.body?.partNo || req.body?.partNumber || req.body?.boothNo || "",
+        ) ||
+        normalizeText(
+          req.body?.partNo || req.body?.partNumber || req.body?.boothNo,
+        );
+      if (!partNo) {
+        return res.status(400).json({
+          error: "partNo (or partNumber/boothNo) is required",
+          example: {
+            partNo: "42",
+            files: "<multiple screenshots/pdfs>",
+          },
+        });
+      }
+
+      const partDisplay = normalizeText(partNo);
+      const uploadedFiles = Array.isArray(req.files) ? req.files : [];
+      const acceptedFiles = uploadedFiles.filter((file) =>
+        isAcceptedSpecificUploadFieldName(file?.fieldname),
+      );
+
+      if (!acceptedFiles.length) {
+        return res.status(400).json({
+          error:
+            "No files received. Use multipart field name 'files' (or 'file') for screenshot uploads.",
+          fieldCounts: getSpecificUploadFieldCounts(uploadedFiles),
+        });
+      }
+
+      const apiKey = normalizeText(req.body?.apiKey || req.body?.geminiApiKey);
+      const ocr = await extractSpecificSlipVotersFromUploads({
+        files: acceptedFiles,
+        requiredPartNo: partNo,
+        apiKey,
+      });
+
+      const tableRows = buildSpecificSlipTableRows(ocr.voters);
+
+      if (!ocr.voters.length) {
+        return res.status(404).json({
+          error: "No voters could be extracted from uploaded files",
+          partNo: partDisplay,
+          ocr: {
+            uploadId: uploadId || null,
+            filesReceived: uploadedFiles.length,
+            filesAccepted: acceptedFiles.length,
+            pagesProcessed: ocr.pagesProcessed,
+            extractedCount: ocr.extractedCount,
+            acceptedCount: 0,
+            skippedUnderAdjudicationCount: ocr.skippedUnderAdjudicationCount,
+            duplicateRowsSkipped: ocr.duplicateCount,
+            failedPages: ocr.failedPages.length,
+            dispatchMode: getGlobalDispatchMode(),
+            tableColumns: [
+              "rowNo",
+              "serialNumber",
+              "voterId",
+              "name",
+              "relationName",
+              "houseNumber",
+              "age",
+              "gender",
+              "section",
+              "partNumber",
+              "sourceFileName",
+              "sourcePageNumber",
+            ],
+            tableRows,
+          },
+          failedPages: ocr.failedPages,
+        });
+      }
+
+      const job = await queueMassVoterSlipJob({
+        voters: ocr.voters,
+        filters: {
+          mode: "specific-ocr",
+          partNo: partDisplay,
+          uploadId: uploadId || null,
+          filesAccepted: acceptedFiles.length,
+          extractedCount: ocr.extractedCount,
+          acceptedBeforeDedupeCount: ocr.acceptedBeforeDedupeCount,
+        },
+        requestedBy: req.user.id,
+        boothNoForName: partDisplay,
+        partNoOverride: partDisplay,
+        jobType: "specific-ocr-pdf",
+      });
+
+      return res.status(202).json({
+        message: "Specific voter slip generation started",
+        partNo: partDisplay,
+        ocr: {
+          uploadId: uploadId || null,
+          filesReceived: uploadedFiles.length,
+          filesAccepted: acceptedFiles.length,
+          pagesProcessed: ocr.pagesProcessed,
+          extractedCount: ocr.extractedCount,
+          acceptedBeforeDedupeCount: ocr.acceptedBeforeDedupeCount,
+          acceptedCount: ocr.voters.length,
+          skippedUnderAdjudicationCount: ocr.skippedUnderAdjudicationCount,
+          duplicateRowsSkipped: ocr.duplicateCount,
+          failedPages: ocr.failedPages.length,
+          dispatchMode: getGlobalDispatchMode(),
+          tableColumns: [
+            "rowNo",
+            "serialNumber",
+            "voterId",
+            "name",
+            "relationName",
+            "houseNumber",
+            "age",
+            "gender",
+            "section",
+            "partNumber",
+            "sourceFileName",
+            "sourcePageNumber",
+          ],
+          tableRows,
+        },
+        failedPages: ocr.failedPages,
+        job: makeMassJobPublicView(job),
+      });
+    } catch (err) {
+      return res.status(500).json({ error: err.message });
+    } finally {
+      if (uploadId) {
+        await fs
+          .remove(path.join(specificVoterSlipUploadRoot, uploadId))
+          .catch(() => null);
+      }
+    }
+  },
+);
 
 /**
  * Start async mass generation for an exact voter-list session.
